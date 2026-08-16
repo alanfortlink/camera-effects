@@ -8,8 +8,6 @@
 #include <opencv2/imgproc.hpp>
 #include <thread>
 
-#include "effects.hpp"  // coverFit
-
 namespace {
 double monoNow() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 }
@@ -45,18 +43,23 @@ void BlockFeed::drawCard(cv::Mat& m) {
   cv::putText(m, text, cv::Point((W - ts.width) / 2, c.y + r + (int)(H * 0.09) + ts.height), cv::FONT_HERSHEY_SIMPLEX, fs, ink, fth, cv::LINE_AA);
 }
 
-void BlockFeed::open(const std::string& source, const cv::Size& out, int fps) {
-  if (active_ && source == source_ && out == out_ && fps == fps_) return;
+void BlockFeed::open(const std::string& source, const cv::Size& out, int fps, const Framing& framing) {
+  if (active_ && source == source_ && out == out_ && fps == fps_) {
+    if (framing != framing_) {
+      framing_ = framing;
+      if (!image_.empty()) range_ = fitFrame(image_, still_, out_, framing_).range;  // the video re-fits per frame
+    }
+    return;
+  }
   close();
-  source_ = source; out_ = out; fps_ = fps;
+  source_ = source; out_ = out; fps_ = fps; framing_ = framing;
   period_ = 1.0 / std::max(1, fps);
   next_ = monoNow();
   active_ = true;
   error_.clear();
   if (!source.empty()) {
-    cv::Mat img;
-    try { img = cv::imread(source, cv::IMREAD_COLOR); } catch (const std::exception&) { img.release(); }
-    if (!img.empty()) { coverFit(img, still_, out); return; }
+    try { image_ = cv::imread(source, cv::IMREAD_COLOR); } catch (const std::exception&) { image_.release(); }
+    if (!image_.empty()) { range_ = fitFrame(image_, still_, out, framing_).range; return; }
     std::string err;
     if (cap_.open(source, fps, &err)) { video_ = true; return; }
     error_ = "block source not readable";
@@ -68,7 +71,8 @@ void BlockFeed::open(const std::string& source, const cv::Size& out, int fps) {
 void BlockFeed::close() {
   cap_.close();
   active_ = video_ = false;
-  still_.release(); frame_.release();
+  image_.release(); still_.release(); frame_.release();
+  range_ = cv::Point2f();
   source_.clear(); error_.clear();
 }
 
@@ -79,8 +83,13 @@ const cv::Mat& BlockFeed::next() {
     bool ok = false;
     try { ok = cap_.grab(raw_, 0) && !raw_.empty(); } catch (const std::exception&) { ok = false; }
     if (ok) {
-      if (raw_.size() == out_) frame_ = raw_;
-      else coverFit(raw_, frame_, out_);
+      FrameGeom g = frameGeometry(raw_.size(), out_, framing_);
+      range_ = g.range;
+      if (g.passthrough(raw_.size(), out_)) frame_ = raw_;
+      else {
+        if (frame_.data == raw_.data) frame_.release();  // was a passthrough alias: never resize raw_ onto itself
+        fitFrame(raw_, frame_, out_, framing_);
+      }
     } else if (frame_.empty()) {
       std::this_thread::sleep_for(std::chrono::duration<double>(period_));
       frame_.create(out_, CV_8UC3); drawCard(frame_);

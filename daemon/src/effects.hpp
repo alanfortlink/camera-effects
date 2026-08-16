@@ -23,24 +23,60 @@ struct Settings {
   std::string backgroundColor = "#1e1e2e";
   bool reactions = true;            // gesture-triggered reactions
   bool mirror = false;
+  int rotate = 0;                   // 0 | 90 | 180 | 270 (clockwise), applied before everything else
   std::string filter = "none";      // colour filter, one of filterNames()
   std::string fun = "none";         // face accessory, one of funNames()
+  // Manual framing (see Framing): how the source is fitted, zoom, pan. With
+  // Center Stage on, zoom is the minimum zoom and pan is automatic.
+  std::string fit = "cover";
+  float zoom = 1;                   // 1..4
+  float panX = 0, panY = 0;         // -1..1
   bool operator==(const Settings& o) const {
     return centerStage == o.centerStage && portrait == o.portrait && portraitIntensity == o.portraitIntensity &&
            studioLight == o.studioLight && studioLightIntensity == o.studioLightIntensity && background == o.background &&
            backgroundImage == o.backgroundImage && backgroundColor == o.backgroundColor && reactions == o.reactions && mirror == o.mirror &&
-           filter == o.filter && fun == o.fun;
+           rotate == o.rotate && filter == o.filter && fun == o.fun && fit == o.fit && zoom == o.zoom && panX == o.panX && panY == o.panY;
   }
   // Valid values for `filter` / `fun` ("none" first).
   static const std::vector<std::string>& filterNames();
   static const std::vector<std::string>& funNames();
 };
 
+// How a source is placed on the output: `fit` cover (largest output-aspect
+// part of the source fills the output), contain (whole source, letterboxed on
+// black) or stretch (whole source, aspect ignored); then `zoom` (1..4) into
+// it and `pan` (-1..1 per axis) the visible part across the room the zoom
+// leaves. Shared by the camera pipeline and the block placeholder.
+struct Framing {
+  std::string fit = "cover";
+  float zoom = 1, panX = 0, panY = 0;
+  bool operator==(const Framing& o) const { return fit == o.fit && zoom == o.zoom && panX == o.panX && panY == o.panY; }
+  bool operator!=(const Framing& o) const { return !(*this == o); }
+  static const std::vector<std::string>& fitNames();  // "cover" first
+};
+
+// Resolved framing: the part of the source (`crop`) shown in the part of the
+// output (`dst`: the whole output unless contain leaves bars) and the pan
+// room per axis as a fraction of the output size (0 = nothing to pan).
+struct FrameGeom {
+  cv::Rect crop, dst;
+  cv::Point2f range;
+  bool passthrough(const cv::Size& src, const cv::Size& out) const {
+    return src == out && crop == cv::Rect(0, 0, src.width, src.height) && dst == cv::Rect(0, 0, out.width, out.height);
+  }
+};
+FrameGeom frameGeometry(const cv::Size& src, const cv::Size& out, const Framing& f);
+
+// Renders `img` into `dst` (an out-sized image, black where the source does
+// not reach) per `f`; returns the geometry used. `dst` is reused when it
+// already has the size.
+FrameGeom fitFrame(const cv::Mat& img, cv::Mat& dst, const cv::Size& out, const Framing& f);
+
 // Parses "#RRGGBB" (exactly 6 hex digits). Returns false on anything else.
 bool parseHexColor(const std::string& s, unsigned& rgb);
 
 // Scales `img` to fill `sz` (keeping its aspect) and crops the centre; `dst`
-// is a fresh sz-sized image. Used for the background image and the block placeholder.
+// is a fresh sz-sized image. Used for the background image.
 void coverFit(const cv::Mat& img, cv::Mat& dst, const cv::Size& sz);
 
 // Alpha-blits a BGRA sprite scaled by `scale` and rotated by `rot` (radians,
@@ -77,8 +113,10 @@ private:
 class Framer {
 public:
   void reset();
-  // Returns the crop rect (in src coordinates) for this frame.
-  cv::Rect update(const cv::Size& src, const std::vector<cv::Rect2f>& faces, bool facesFresh, double outAspect, double dt);
+  // Returns the crop rect (in src coordinates) for this frame. `minZoom` is
+  // the user's zoom: the framer never shows more than the full crop / minZoom
+  // (and no less than full / maxZoom, see effects.cpp).
+  cv::Rect update(const cv::Size& src, const std::vector<cv::Rect2f>& faces, bool facesFresh, const cv::Size& out, double dt, double minZoom);
   cv::Rect fullCrop(const cv::Size& src, double outAspect) const;
 
 private:
@@ -86,7 +124,6 @@ private:
   double cx_ = 0, cy_ = 0, h_ = 0;          // current (eased) crop centre + height
   double tcx_ = 0, tcy_ = 0, th_ = 0;       // target
   double lastFaceTime_ = -1e9, now_ = 0;
-  double maxZoom_ = 2.2;
 };
 
 // Emoji particle overlays. trigger() may be called from any thread; it only
@@ -174,6 +211,17 @@ public:
   std::string lastGesture() const { return gestures_.lastGesture(); }
   std::string modelStatus() const { return modelStatus_; }
   std::string profileLine() const { return profileLine_; }
+  // Framing of the last processed frame (crop/dst/pan room, source size after
+  // rotation, faces the framer saw): shown by the daemon's state.
+  struct FramingInfo {
+    FrameGeom geom;
+    cv::Size src;
+    int faces = 0;
+    cv::Rect face;   // the largest face (source coordinates), empty when none
+    bool operator==(const FramingInfo& o) const { return geom.crop == o.geom.crop && geom.dst == o.geom.dst && geom.range == o.geom.range && src == o.src && faces == o.faces && face == o.face; }
+    bool operator!=(const FramingInfo& o) const { return !(*this == o); }
+  };
+  FramingInfo framing() const { return framing_; }
 
 private:
   Settings settings_;
@@ -186,6 +234,8 @@ private:
   std::string modelStatus_;
   Pyramid pyr_, srcPyr_;
   cv::Mat work_;           // crop/resize target (reused)
+  cv::Mat rot_;            // rotated source (Settings::rotate)
+  FramingInfo framing_;
   cv::Mat maskSmall_;      // temporal EMA of the 192x192 probability (CV_32F)
   cv::Mat mask8s_, mask8_, mask3_;  // 8-bit person mask: model res, work res, and a 3-channel copy for the blends
   cv::Mat bg_, bgSmall_, pre_, blurF_;     // portrait/background buffers

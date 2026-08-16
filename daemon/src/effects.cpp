@@ -35,15 +35,54 @@ const std::vector<std::string>& Settings::funNames() {
   return n;
 }
 
-void coverFit(const cv::Mat& img, cv::Mat& dst, const cv::Size& sz) {
-  if (img.size() == sz) { img.copyTo(dst); return; }
-  double s = std::max((double)sz.width / img.cols, (double)sz.height / img.rows);
-  cv::Mat scaled;
-  cv::Size ss(std::max(sz.width, (int)(img.cols * s)), std::max(sz.height, (int)(img.rows * s)));
-  cv::resize(img, scaled, ss, 0, 0, s < 1 ? cv::INTER_AREA : cv::INTER_LINEAR);
-  cv::Rect r((scaled.cols - sz.width) / 2, (scaled.rows - sz.height) / 2, sz.width, sz.height);
-  scaled(r).copyTo(dst);  // dst is reused when it already has the size
+const std::vector<std::string>& Framing::fitNames() {
+  static const std::vector<std::string> n = { "cover", "contain", "stretch" };
+  return n;
 }
+
+// The source is scaled by the fit's factor(s) times the zoom and placed on the
+// output plane, centred, then shifted by pan * (the overhang on that axis);
+// what falls inside the output is shown. Cover and stretch always fill the
+// output; contain fills it once the zoom eats the bars.
+FrameGeom frameGeometry(const cv::Size& src, const cv::Size& out, const Framing& f) {
+  FrameGeom g;
+  const double sw = std::max(1, src.width), sh = std::max(1, src.height), ow = std::max(1, out.width), oh = std::max(1, out.height);
+  const double z = std::clamp((double)f.zoom, 1.0, 4.0);
+  double kx, ky;
+  if (f.fit == "stretch") { kx = ow / sw; ky = oh / sh; }
+  else kx = ky = f.fit == "contain" ? std::min(ow / sw, oh / sh) : std::max(ow / sw, oh / sh);
+  kx *= z; ky *= z;
+  const double W = sw * kx, H = sh * ky;                                     // the placed source
+  const double fx = std::max(0.0, (W - ow) / 2), fy = std::max(0.0, (H - oh) / 2);  // room to pan
+  const double x0 = (ow - W) / 2 - std::clamp((double)f.panX, -1.0, 1.0) * fx;
+  const double y0 = (oh - H) / 2 - std::clamp((double)f.panY, -1.0, 1.0) * fy;
+  // Visible part of the placement, and the source behind it (each rounded on
+  // its own from the exact bounds, so a whole source stays whole).
+  const double dx0 = std::max(0.0, x0), dy0 = std::max(0.0, y0), dx1 = std::min(ow, x0 + W), dy1 = std::min(oh, y0 + H);
+  auto rect = [](double a0, double b0, double a1, double b1, const cv::Size& bound) {
+    int ia0 = (int)std::lround(a0), ib0 = (int)std::lround(b0);
+    cv::Rect r(ia0, ib0, std::max(1, (int)std::lround(a1) - ia0), std::max(1, (int)std::lround(b1) - ib0));
+    r &= cv::Rect(0, 0, bound.width, bound.height);
+    return r.empty() ? cv::Rect(0, 0, bound.width, bound.height) : r;
+  };
+  g.dst = rect(dx0, dy0, dx1, dy1, out);
+  g.crop = rect((dx0 - x0) / kx, (dy0 - y0) / ky, (dx1 - x0) / kx, (dy1 - y0) / ky, src);
+  g.range = cv::Point2f((float)(fx / ow), (float)(fy / oh));
+  return g;
+}
+
+FrameGeom fitFrame(const cv::Mat& img, cv::Mat& dst, const cv::Size& out, const Framing& f) {
+  FrameGeom g = frameGeometry(img.size(), out, f);
+  if (g.passthrough(img.size(), out)) { img.copyTo(dst); return g; }
+  dst.create(out, img.type());  // reused when it already has the size
+  if (g.dst != cv::Rect(0, 0, out.width, out.height)) dst.setTo(cv::Scalar::all(0));
+  cv::Mat roi = dst(g.dst);
+  double s = (double)g.dst.width / g.crop.width;
+  cv::resize(img(g.crop), roi, g.dst.size(), 0, 0, s < 1 ? cv::INTER_AREA : cv::INTER_LINEAR);
+  return g;
+}
+
+void coverFit(const cv::Mat& img, cv::Mat& dst, const cv::Size& sz) { fitFrame(img, dst, sz, Framing()); }
 
 void alphaBlit(cv::Mat& frame, const cv::Mat& sprite, double cx, double cy, double scale, double alpha, double rot) {
   if (sprite.empty() || sprite.type() != CV_8UC4 || frame.type() != CV_8UC3 || !(scale > 0) || alpha <= 0.01) return;  // empty: asset missing
@@ -91,38 +130,52 @@ cv::Rect Framer::fullCrop(const cv::Size& src, double outAspect) const {
   return cv::Rect((int)((src.width - w) / 2), (int)((src.height - h) / 2), (int)w, (int)h);
 }
 
-cv::Rect Framer::update(const cv::Size& src, const std::vector<cv::Rect2f>& faces, bool facesFresh, double outAspect, double dt) {
+cv::Rect Framer::update(const cv::Size& src, const std::vector<cv::Rect2f>& faces, bool facesFresh, const cv::Size& out, double dt, double minZoom) {
   now_ += dt;
+  const double outAspect = (double)out.width / std::max(1, out.height);
   cv::Rect full = fullCrop(src, outAspect);
+  // How far in we may go: 3x with a source at least 1.5x the output (the crop
+  // still has output resolution at 2x), 1.8x with less headroom, and 1.6x when
+  // the source is no bigger than the output (an upscale, but that is what a
+  // 720p Center Stage is: framing beats sharpness at desk distance).
+  const double ratio = (double)full.height / std::max(1, out.height);
+  const double maxZoom = ratio >= 1.5 ? 3.0 : (ratio > 1.0 ? 1.8 : 1.6);
+  minZoom = std::clamp(minZoom, 1.0, 4.0);
+  const double hRest = full.height / minZoom;                        // "nobody in view": the user's own zoom, centred
+  const double hMin = std::min(hRest, full.height / maxZoom);
   if (!init_) {
-    cx_ = tcx_ = full.x + full.width / 2.0; cy_ = tcy_ = full.y + full.height / 2.0; h_ = th_ = full.height;
+    cx_ = tcx_ = full.x + full.width / 2.0; cy_ = tcy_ = full.y + full.height / 2.0; h_ = th_ = hRest;
     init_ = true;
   }
   if (facesFresh) {
     if (!faces.empty()) {
       lastFaceTime_ = now_;
-      // Union of faces, expanded to head + shoulders.
+      // Union of faces, framed head + shoulders: 2.4 face heights tall for one
+      // face (YuNet's box runs forehead to chin), with 0.35 of a face height of
+      // headroom above the top face.
       float x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, maxFaceH = 0;
       for (auto& f : faces) {
         x0 = std::min(x0, f.x); y0 = std::min(y0, f.y); x1 = std::max(x1, f.x + f.width); y1 = std::max(y1, f.y + f.height);
         maxFaceH = std::max(maxFaceH, f.height);
       }
+      double nh = std::max((double)(y1 - y0) + 1.4 * maxFaceH, ((x1 - x0) + 2.0 * maxFaceH) / outAspect);
       double ncx = (x0 + x1) / 2.0;
-      double ncy = (y0 + y1) / 2.0 + 0.55 * maxFaceH;                    // headroom: face sits in the upper part
-      double nh = std::max((double)(y1 - y0) + 3.4 * maxFaceH, ((x1 - x0) + 3.0 * maxFaceH) / outAspect);
-      nh = std::clamp(nh, full.height / maxZoom_, (double)full.height);
+      double ncy = y0 - 0.35 * maxFaceH + nh / 2;  // centre of the ideal frame: kept when the zoom limits make the crop larger
+      nh = std::clamp(nh, hMin, hRest);
       // Deadband so tiny detector jitter doesn't move the frame.
       if (std::abs(ncx - tcx_) > 0.035 * h_ || std::abs(ncy - tcy_) > 0.035 * h_ || std::abs(nh - th_) > 0.06 * h_) {
         tcx_ = ncx; tcy_ = ncy; th_ = nh;
       }
     } else if (now_ - lastFaceTime_ > 1.5) {
-      tcx_ = full.x + full.width / 2.0; tcy_ = full.y + full.height / 2.0; th_ = full.height;
+      tcx_ = full.x + full.width / 2.0; tcy_ = full.y + full.height / 2.0; th_ = hRest;
     }
   }
+  th_ = std::clamp(th_, hMin, hRest);  // the user's zoom changed under us
   // Ease: pan fairly quick, zoom-in slower than zoom-out.
   double aPan = 1 - std::exp(-dt / 0.35);
   double aZoom = 1 - std::exp(-dt / (th_ > h_ ? 0.5 : 1.0));
   cx_ += (tcx_ - cx_) * aPan; cy_ += (tcy_ - cy_) * aPan; h_ += (th_ - h_) * aZoom;
+  h_ = std::min(h_, (double)full.height);
   double w = h_ * outAspect;
   if (w > src.width) { w = src.width; h_ = w / outAspect; }
   double x = std::clamp(cx_ - w / 2, 0.0, src.width - w);
@@ -600,8 +653,8 @@ bool EffectPipeline::init(const std::string& modelsDir, const std::string& asset
 }
 
 void EffectPipeline::setSettings(const Settings& s) {
-  if (s.centerStage != settings_.centerStage) framer_.reset();
-  if (s.fun != settings_.fun) fun_.reset();
+  if (s.centerStage != settings_.centerStage || s.rotate != settings_.rotate) framer_.reset();
+  if (s.fun != settings_.fun || s.rotate != settings_.rotate) fun_.reset();  // face tracks are in (rotated) source coordinates
   settings_ = s;
 }
 
@@ -840,7 +893,7 @@ void EffectPipeline::applyStudioLight(cv::Mat& work) {
   work = work_;
 }
 
-void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& outSize, double now) {
+void EffectPipeline::process(const cv::Mat& src0, cv::Mat& out, const cv::Size& outSize, double now) {
   auto tick = [&]() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
   const bool prof = profile_;  // sampled once: a flip mid-frame must not pair a stage with tl = 0
   double tl = prof ? tick() : 0;
@@ -851,18 +904,35 @@ void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& o
   double outAspect = (double)outSize.width / outSize.height;
   const bool handRecent = now - lastHandSeen_ < 2.0;
 
+  // Rotation first: the rotated frame is the source for everything after
+  // (faces, framing, mirror), so a 90/270 turn changes the source aspect.
+  // Everything below reads `src`, which aliases the capture buffer only when
+  // there is no rotation (the copy-on-write checks compare against it).
+  const cv::Mat* sp = &src0;
+  if (settings_.rotate == 90 || settings_.rotate == 180 || settings_.rotate == 270) {
+    cv::rotate(src0, rot_, settings_.rotate == 90 ? cv::ROTATE_90_CLOCKWISE : settings_.rotate == 180 ? cv::ROTATE_180 : cv::ROTATE_90_COUNTERCLOCKWISE);
+    sp = &rot_;
+  }
+  const cv::Mat& src = *sp;
+  const cv::Rect wholeSrc(0, 0, src.cols, src.rows), wholeOut(0, 0, outSize.width, outSize.height);
+
   // Cadences (Hz, by tier). Palm detection idles at ~5 Hz until a hand shows
   // up, then 10 Hz while one is around; YuNet runs only for Center Stage and
   // the fun face filters, or for the hand-on-face check when a palm was found.
   const double palmHz = tier_ == 0 ? (handRecent ? 10 : 5) : (tier_ == 1 ? (handRecent ? 6 : 3) : (handRecent ? 4 : 2));
   const double faceHz = tier_ == 0 ? 10 : (tier_ == 1 ? 6 : 3);
 
+  // Framing: the user's fit/zoom/pan, or with Center Stage the framer's crop
+  // (cover geometry; the user's zoom is its minimum, the pan is automatic).
+  FrameGeom geom;
+  if (settings_.centerStage) { geom.crop = framer_.fullCrop(src.size(), outAspect); geom.dst = wholeOut; }
+  else geom = frameGeometry(src.size(), outSize, Framing{ settings_.fit, settings_.zoom, settings_.panX, settings_.panY });
+
   // Faces for Center Stage are found in source coordinates (the crop is chosen
   // from them). srcPyr_ is only built when the source differs from the output.
   bool facesFresh = false;
   const bool funOn = settings_.fun != "none" && faces_.loaded();
-  cv::Rect full = framer_.fullCrop(src.size(), outAspect);
-  bool srcIsWork = full == cv::Rect(0, 0, src.cols, src.rows) && src.size() == outSize;
+  bool srcIsWork = geom.passthrough(src.size(), outSize);
   bool pyrReady = false;  // pyr_ already reset to this frame
   auto detectFaces = [&]() {
     int lvl = 0;
@@ -884,16 +954,31 @@ void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& o
   if ((settings_.centerStage || funOn) && faces_.loaded() && now - lastFaceTime_ >= 1.0 / faceHz) detectFaces();
   stage(0);  // faces
 
-  cv::Rect crop = settings_.centerStage ? framer_.update(src.size(), faceRects_, facesFresh, outAspect, dt) : full;
+  if (settings_.centerStage) geom.crop = framer_.update(src.size(), faceRects_, facesFresh, outSize, dt, settings_.zoom);
+  const cv::Rect crop = geom.crop, dst = geom.dst;
+  framing_.geom = geom; framing_.src = src.size(); framing_.faces = (int)faceRects_.size();
+  framing_.face = cv::Rect();
+  for (auto& f : faceRects_) if (f.area() > framing_.face.area()) framing_.face = cv::Rect((int)f.x, (int)f.y, (int)f.width, (int)f.height);
   cv::Mat work;
-  if (crop == cv::Rect(0, 0, src.cols, src.rows) && src.size() == outSize) work = src;  // passthrough: no copy
-  else { cv::resize(src(crop), work_, outSize, 0, 0, cv::INTER_LINEAR); work = work_; }  // LINEAR: 5x cheaper than AREA, invisible after MJPEG
+  if (crop == wholeSrc && dst == wholeOut && src.size() == outSize) work = src;  // passthrough: no copy
+  else if (dst == wholeOut) { cv::resize(src(crop), work_, outSize, 0, 0, cv::INTER_LINEAR); work = work_; }  // LINEAR: 5x cheaper than AREA, invisible after MJPEG
+  else {
+    // Contain leaves bars: black canvas, the crop scaled into its part of it.
+    work_.create(outSize, CV_8UC3);
+    work_.setTo(cv::Scalar::all(0));
+    cv::Mat roi = work_(dst);
+    cv::resize(src(crop), roi, dst.size(), 0, 0, cv::INTER_LINEAR);
+    work = work_;
+  }
   if (!(pyrReady && work.data == src.data)) pyr_.reset(work);  // detectFaces may have built it from src already
   // Palm detection wants the pre-effect pixels: build its level now, before
   // the effects overwrite `work` in place.
   const bool palmDue = settings_.reactions && gestures_.loaded() && now - lastPalmTime_ >= 1.0 / palmHz;
   if (palmDue) pyr_.atLeastWide(192);
   stage(1);  // crop/resize
+  // Source -> output mapping for anything found in source coordinates.
+  const double sx = (double)dst.width / crop.width, sy = (double)dst.height / crop.height;
+  auto toWork = [&](const cv::Rect2f& f) { return cv::Rect2f((float)((f.x - crop.x) * sx + dst.x), (float)((f.y - crop.y) * sy + dst.y), (float)(f.width * sx), (float)(f.height * sy)); };
 
   bool needMask = settings_.portrait || settings_.studioLight || settings_.background != "none";
   if (needMask) computeMask(work);
@@ -905,8 +990,7 @@ void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& o
   // Face accessories: tracks are in source coordinates, mapped through the crop.
   if (funOn) {
     if (work.data == src.data) { src.copyTo(work_); work = work_; }  // don't draw into the capture buffer
-    fun_.render(work, settings_.fun, cv::Point2f((float)crop.x, (float)crop.y),
-                cv::Point2f((float)outSize.width / crop.width, (float)outSize.height / crop.height), now);
+    fun_.render(work, settings_.fun, cv::Point2f((float)(crop.x - dst.x / sx), (float)(crop.y - dst.y / sy)), cv::Point2f((float)sx, (float)sy), now);
   }
   stage(5);  // fun
 
@@ -921,10 +1005,7 @@ void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& o
     }
     // Faces are in src coordinates; map into work coordinates for the on-face check.
     std::vector<cv::Rect2f> facesWork;
-    if (now - lastFaceTime_ < 1.0) {
-      double sx = (double)outSize.width / crop.width, sy = (double)outSize.height / crop.height;
-      for (auto& f : faceRects_) facesWork.emplace_back((f.x - crop.x) * sx, (f.y - crop.y) * sy, f.width * sx, f.height * sy);
-    }
+    if (now - lastFaceTime_ < 1.0) for (auto& f : faceRects_) facesWork.push_back(toWork(f));
     std::string g = gestures_.classify(hands, facesWork);
     if (debugGestures_) fprintf(stderr, "gesture: hands=%zu faces=%zu -> '%s'\n", hands.size(), facesWork.size(), g.c_str());
     if (g.empty() || g != pendingGesture_) { pendingGesture_ = g; pendingSince_ = now; }

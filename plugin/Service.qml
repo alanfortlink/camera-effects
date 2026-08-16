@@ -26,6 +26,14 @@ Item {
   readonly property bool hideRaw: !!state.hideRaw
   readonly property bool block: !!state.block                // camera blocked: placeholder instead of the webcam (global)
   readonly property string blockSource: state.blockSource || ""  // "" = built-in card, else an image/video path
+  // Framing of the placeholder image/video (the camera's own zoom/pan/fit live in `settings`).
+  readonly property real blockZoom: state.blockZoom !== undefined ? state.blockZoom : 1
+  readonly property real blockPanX: state.blockPanX || 0
+  readonly property real blockPanY: state.blockPanY || 0
+  readonly property string blockFit: state.blockFit || "cover"
+  // Pan room of what is shown now, per axis, as a fraction of the output size
+  // (0 = nothing to pan): the preview's drag maps pixels through it.
+  readonly property var panRange: state.panRange || [0, 0]
   readonly property int fps: state.fps || 0
   readonly property string gesture: state.gesture || ""
   readonly property var reactionNames: state.reactions || ["hearts", "thumbsup", "thumbsdown", "balloons", "confetti", "fireworks", "rain", "lasers"]

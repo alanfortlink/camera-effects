@@ -38,11 +38,16 @@ omarchy plugin remove alanfortlink.cames
 
 ## Using it
 
-- **Effects**: Center Stage (auto-framing), Portrait (blur, with intensity),
-  Studio Light (with intensity), Background (color or image), Mirror.
+- **Video**: Center Stage (auto-framing: head and shoulders, up to 3x on a
+  1080p camera), Portrait (blur, with intensity), Studio Light (with
+  intensity), Background (color or image), Rotate (90/180/270), Mirror.
+- **Framing**: Zoom (1-4x; slider, or scroll on the preview), pan (drag the
+  preview), Fit (Cover crops to 16:9, Contain letterboxes, Stretch ignores
+  the aspect). With Center Stage on, the zoom is its minimum and it pans on
+  its own. The same controls frame the block placeholder image or video.
 - **Filter**: a colour look — Mono, Sepia, Warm, Cool, Vivid, Soft, Sharpen,
   Vintage (about 1 ms per frame).
-- **Fun**: face accessories that follow your head (up to four faces) —
+- **Effects**: face accessories that follow your head (up to four faces) —
   Sunglasses, Glasses, Top hat, Crown, Cat, Halo, Headphones, Flowers.
 - **Reactions**: hearts, thumbs up/down, balloons, confetti, fireworks, rain,
   lasers. Click one, or hold a gesture ~1 s away from your face: heart hands,
@@ -79,7 +84,9 @@ Nothing leaves your machine.
 camesd status                          # JSON state (consumers, fps, settings…)
 camesd set portrait=true portraitIntensity=0.7 centerStage=true
 camesd set filter=vintage fun=sunglasses
+camesd set zoom=1.5 panX=0.3 panY=-0.2 rotate=90 fit=contain   # framing (pan -1..1 within the room the zoom leaves)
 camesd set block=true blockSource=/path/to/image-or-video   # blockSource= for the built-in card
+camesd set blockZoom=2 blockPanX=1 blockFit=cover           # frame the placeholder
 camesd react hearts                    # play a reaction now
 camesd camera <bus-or-/dev/path>       # pick the physical camera (or a video file)
 camesd preview on|off                  # keep the pipeline running without a consumer

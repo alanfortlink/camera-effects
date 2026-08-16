@@ -6,8 +6,9 @@ import qs.Commons
 import qs.Ui
 
 // Bar icon + popup panel for the cames Camera (the macOS "Video Effects"
-// menu, Omarchy style): live preview, camera picker, one row per effect
-// (switches and Filter/Fun dropdowns), reactions, and the privacy switches
+// menu, Omarchy style): live preview (drag to pan, wheel to zoom), camera
+// picker, one row per effect (switches, the Zoom slider, Fit/Filter/Effects/
+// Rotate dropdowns), reactions, and the privacy switches
 // (block camera, hide raw camera). All state lives in the camesd daemon (see
 // Service.qml); this file only renders and forwards.
 Panel {
@@ -25,6 +26,30 @@ Panel {
   readonly property bool multiCam: cams.length > 1
   readonly property bool alwaysShow: setting("alwaysShow", true)
   readonly property bool blocked: svc ? svc.block : false
+
+  // Framing (zoom / pan / fit) edits the camera's settings, or the
+  // placeholder's block* settings while the camera is blocked: always what
+  // the preview shows. The built-in card is not framed; with Center Stage on
+  // the pan is automatic and the zoom is its minimum.
+  readonly property real zoomNow: blocked ? (svc ? svc.blockZoom : 1) : (s.zoom !== undefined ? s.zoom : 1)
+  readonly property real panXNow: blocked ? (svc ? svc.blockPanX : 0) : (s.panX || 0)
+  readonly property real panYNow: blocked ? (svc ? svc.blockPanY : 0) : (s.panY || 0)
+  readonly property string fitNow: blocked ? (svc ? svc.blockFit : "cover") : (s.fit || "cover")
+  readonly property bool centerStageOn: !blocked && !!s.centerStage
+  readonly property bool framingEnabled: !!svc && (!blocked || svc.blockSource !== "")
+  readonly property bool panEnabled: framingEnabled && !centerStageOn
+  function setFraming(patch) {  // keys zoom / panX / panY / fit, sent as block* while blocked
+    if (!svc) return
+    var p = {}
+    for (var k in patch) p[blocked ? "block" + k.charAt(0).toUpperCase() + k.slice(1) : k] = patch[k]
+    svc.set(p)
+  }
+  // The zoom as last sent by the wheel: the daemon echoes settings ~150 ms
+  // later, so a quick scroll must not step from a stale value.
+  property real zoomLive: 1
+  onZoomNowChanged: if (!zoomTouched.running) zoomLive = zoomNow
+  Timer { id: zoomTouched; interval: 400; onTriggered: root.zoomLive = root.zoomNow }
+  Component.onCompleted: zoomLive = zoomNow
 
   // The panel's own preview is itself a consumer of the virtual camera, so
   // while it is loaded the daemon reports consumers >= 1 and running = true
@@ -266,6 +291,7 @@ Panel {
     signal changed(string v)
     width: parent ? parent.width : 200
     height: root.rowH
+    opacity: enabled ? 1 : 0.5
     Text {
       anchors.left: parent.left
       anchors.verticalCenter: parent.verticalCenter
@@ -293,6 +319,8 @@ Panel {
   readonly property var funOpts: [ { value: "none", label: "None" }, { value: "sunglasses", label: "Sunglasses" }, { value: "glasses", label: "Glasses" },
     { value: "tophat", label: "Top hat" }, { value: "crown", label: "Crown" }, { value: "cat", label: "Cat" }, { value: "halo", label: "Halo" },
     { value: "headphones", label: "Headphones" }, { value: "flowers", label: "Flowers" } ]
+  readonly property var fitOpts: [ { value: "cover", label: "Cover" }, { value: "contain", label: "Contain" }, { value: "stretch", label: "Stretch" } ]
+  readonly property var rotateOpts: [ { value: "0", label: "Off" }, { value: "90", label: "90°" }, { value: "180", label: "180°" }, { value: "270", label: "270°" } ]
   readonly property string imageFilter: "Images | *.png *.jpg *.jpeg *.webp *.bmp"
   readonly property string videoFilter: "Videos | *.mp4 *.mkv *.webm *.mov *.avi *.y4m *.gif"
   // Block placeholder kind: derived from the source's extension ("card" when
@@ -427,6 +455,49 @@ Panel {
                 font.pixelSize: Style.font.caption
               }
             }
+            MouseArea {  // drag pans, wheel zooms, double-click resets (the camera's framing, or the placeholder's while blocked)
+              id: panArea
+              anchors.fill: parent
+              enabled: root.framingEnabled && !!previewLoader.item
+              acceptedButtons: Qt.LeftButton
+              cursorShape: !enabled || !root.panEnabled ? Qt.ArrowCursor : (pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor)
+              property real startX: 0
+              property real startY: 0
+              property real panX0: 0
+              property real panY0: 0
+              property var pending: null
+              onPressed: function(mouse) { startX = mouse.x; startY = mouse.y; panX0 = root.panXNow; panY0 = root.panYNow }
+              onPositionChanged: function(mouse) {
+                if (!pressed || !root.panEnabled || !root.svc) return
+                var r = root.svc.panRange
+                var rx = r[0] || 0, ry = r[1] || 0
+                if (rx <= 0 && ry <= 0) return
+                // pan = the crop's place in its free range (-1..1); the range covers 2 * r * (preview size) px.
+                // The preview shows the camera feed as a mirror (whatever the Mirror setting), so a drag to the
+                // right reveals more of the feed's right; the placeholder is shown as is. Rotation needs no
+                // correction: pan applies to the rotated frame, which is what the preview shows.
+                var sx = root.blocked ? -1 : 1
+                var px = rx > 0 ? Math.max(-1, Math.min(1, panX0 + sx * (mouse.x - startX) / (rx * width))) : panX0
+                var py = ry > 0 ? Math.max(-1, Math.min(1, panY0 - (mouse.y - startY) / (ry * height))) : panY0
+                pending = { panX: Math.round(px * 1000) / 1000, panY: Math.round(py * 1000) / 1000 }
+                if (!panThrottle.running) { panThrottle.flush(); panThrottle.start() }  // ~20 Hz
+              }
+              onReleased: panThrottle.flush()
+              onDoubleClicked: root.setFraming({ zoom: 1, panX: 0, panY: 0 })
+              onWheel: function(wheel) {
+                var z = Math.round(Math.max(1, Math.min(4, root.zoomLive + (wheel.angleDelta.y > 0 ? 0.1 : -0.1))) * 10) / 10
+                if (z === root.zoomLive) return
+                root.zoomLive = z
+                zoomTouched.restart()
+                root.setFraming({ zoom: z })
+              }
+              Timer {
+                id: panThrottle
+                interval: 50
+                function flush() { if (panArea.pending) { root.setFraming(panArea.pending); panArea.pending = null } }
+                onTriggered: flush()
+              }
+            }
             Rectangle {  // gesture the daemon currently sees, and what it will trigger
               anchors.left: parent.left
               anchors.bottom: parent.bottom
@@ -445,6 +516,10 @@ Panel {
                 font.pixelSize: Style.font.caption
               }
             }
+          }
+          Note {
+            visible: previewBox.visible && root.previewActive && (root.centerStageOn || root.panEnabled)
+            text: root.centerStageOn ? "Center Stage frames automatically" : "Drag to pan · scroll to zoom"
           }
           Note {
             visible: previewBox.visible && root.previewActive && !!root.s.mirror
@@ -473,13 +548,55 @@ Panel {
           PanelSeparator { foreground: root.fg }
           Item { width: parent.width; height: Style.space(4) }
 
-          // ---------- Effects ----------
+          // ---------- Video ----------
           PanelSectionHeader {
-            text: root.multiCam && root.svc && !root.svc.sameForAll ? "EFFECTS · " + root.shortName(root.svc.camera).toUpperCase() : "EFFECTS"
+            text: root.multiCam && root.svc && !root.svc.sameForAll ? "VIDEO · " + root.shortName(root.svc.camera).toUpperCase() : "VIDEO"
             foreground: root.fg
             fontFamily: root.fontFamily
           }
           SwitchRow { label: "Center Stage"; checked: !!root.s.centerStage; onToggled: if (root.svc) root.svc.setSetting("centerStage", !root.s.centerStage) }
+          Item {  // Zoom: label · value · slider (right-click the slider resets; the preview's wheel steps it too)
+            width: parent.width
+            height: root.rowH
+            enabled: root.framingEnabled
+            opacity: enabled ? 1 : 0.5
+            Text {
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Zoom"
+              color: root.fg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+            }
+            Text {
+              anchors.right: zoomSlider.left
+              anchors.rightMargin: Style.space(10)
+              anchors.verticalCenter: parent.verticalCenter
+              text: zoomSlider.liveValue.toFixed(1) + "×"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+            PanelSlider {
+              id: zoomSlider
+              bar: root.bar
+              anchors.right: parent.right
+              anchors.rightMargin: root.trailInset
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(120)
+              minimum: 1; maximum: 4; step: 0.1
+              value: root.zoomNow
+              onReleased: function(v) { root.setFraming({ zoom: Math.round(v * 10) / 10 }) }
+              onRightClicked: root.setFraming({ zoom: 1 })
+            }
+          }
+          LabelDropdownRow {  // how the source is placed on the output (Center Stage frames on its own)
+            label: "Fit"
+            options: root.fitOpts
+            value: root.fitNow
+            enabled: root.framingEnabled && !root.centerStageOn
+            onChanged: function(v) { root.setFraming({ fit: v }) }
+          }
           SwitchRow { label: "Portrait"; checked: !!root.s.portrait; onToggled: if (root.svc) root.svc.setSetting("portrait", !root.s.portrait) }
           IntensityRow {
             visible: !!root.s.portrait
@@ -588,7 +705,7 @@ Panel {
             }
           }
           LabelDropdownRow { label: "Filter"; options: root.filterOpts; value: root.s.filter || "none"; onChanged: function(v) { if (root.svc) root.svc.setSetting("filter", v) } }
-          LabelDropdownRow { label: "Fun"; options: root.funOpts; value: root.s.fun || "none"; onChanged: function(v) { if (root.svc) root.svc.setSetting("fun", v) } }
+          LabelDropdownRow { label: "Effects"; options: root.funOpts; value: root.s.fun || "none"; onChanged: function(v) { if (root.svc) root.svc.setSetting("fun", v) } }
           SwitchRow {  // switch = hand-gesture triggers; the strip below plays one now
             label: "Reactions · hand gestures"
             checked: !!root.s.reactions
@@ -624,6 +741,13 @@ Panel {
               width: parent.width - Style.space(20)
               text: "Click to play"
             }
+          }
+          LabelDropdownRow {  // clockwise, before everything else (the placeholder is not rotated)
+            label: "Rotate"
+            options: root.rotateOpts
+            value: String(root.s.rotate || 0)
+            enabled: !!root.svc && !root.blocked
+            onChanged: function(v) { if (root.svc) root.svc.setSetting("rotate", parseInt(v, 10)) }
           }
           SwitchRow { label: "Mirror"; checked: !!root.s.mirror; onToggled: if (root.svc) root.svc.setSetting("mirror", !root.s.mirror) }
 

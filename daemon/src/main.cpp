@@ -1,9 +1,9 @@
 // camesd — system-wide camera effects daemon for Omarchy.
 //
-// Reads a physical webcam, applies effects (Center Stage, Portrait, Studio
-// Light, background replacement, colour filters, fun face filters, Reactions)
-// and publishes the result as a virtual V4L2 camera ("cames Camera") that every
-// app can use. Runs the camera only while some app has the virtual camera
+// Reads a physical webcam, applies framing (rotate, fit, zoom, pan) and
+// effects (Center Stage, Portrait, Studio Light, background replacement,
+// colour filters, fun face filters, Reactions) and publishes the result as a
+// virtual V4L2 camera ("cames Camera") that every app can use. Runs the camera only while some app has the virtual camera
 // open; with "block" on it never opens the camera and feeds a placeholder instead.
 #include <fcntl.h>
 #include <linux/videodev2.h>
@@ -65,7 +65,23 @@ json settingsToJson(const Settings& s) {
   return json{ { "centerStage", s.centerStage }, { "portrait", s.portrait }, { "portraitIntensity", s.portraitIntensity },
                { "studioLight", s.studioLight }, { "studioLightIntensity", s.studioLightIntensity }, { "background", s.background },
                { "backgroundImage", s.backgroundImage }, { "backgroundColor", s.backgroundColor }, { "reactions", s.reactions }, { "mirror", s.mirror },
-               { "filter", s.filter }, { "fun", s.fun } };
+               { "rotate", s.rotate }, { "filter", s.filter }, { "fun", s.fun },
+               { "fit", s.fit }, { "zoom", s.zoom }, { "panX", s.panX }, { "panY", s.panY } };
+}
+
+// Framing fields (`prefix` "" for a camera's settings, "block" for the
+// placeholder's blockZoom/blockPanX/blockPanY/blockFit), validated and clamped.
+void framingFromJson(const json& j, const std::string& prefix, std::string& fit, float& zoom, float& panX, float& panY) {
+  auto key = [&](const char* k) { return prefix.empty() ? std::string(k) : prefix + (char)toupper(k[0]) + (k + 1); };
+  auto getf = [&](const char* k, float& v, float lo, float hi) {
+    std::string kk = key(k);
+    if (j.contains(kk) && j[kk].is_number()) { float f = j[kk].get<float>(); if (std::isfinite(f)) v = std::clamp(f, lo, hi); }
+  };
+  getf("zoom", zoom, 1.f, 4.f); getf("panX", panX, -1.f, 1.f); getf("panY", panY, -1.f, 1.f);
+  std::string fk = key("fit");
+  if (j.contains(fk) && j[fk].is_string()) fit = j[fk];
+  const auto& names = Framing::fitNames();
+  if (std::find(names.begin(), names.end(), fit) == names.end()) fit = names[0];
 }
 
 void settingsFromJson(const json& j, Settings& s) {
@@ -78,6 +94,11 @@ void settingsFromJson(const json& j, Settings& s) {
   gets("background", s.background); gets("backgroundImage", s.backgroundImage); gets("backgroundColor", s.backgroundColor);
   getb("reactions", s.reactions); getb("mirror", s.mirror);
   gets("filter", s.filter); gets("fun", s.fun);
+  if (j.contains("rotate") && j["rotate"].is_number()) {
+    double r = j["rotate"].get<double>();
+    s.rotate = r == 90 || r == 180 || r == 270 ? (int)r : 0;
+  }
+  framingFromJson(j, "", s.fit, s.zoom, s.panX, s.panY);
   if (s.background != "none" && s.background != "image" && s.background != "color") s.background = "none";
   unsigned rgb;
   if (!parseHexColor(s.backgroundColor, rgb)) s.backgroundColor = Settings().backgroundColor;
@@ -136,6 +157,7 @@ struct Config {
   // file; "" = the built-in "Camera paused" card) instead.
   bool block = false;
   std::string blockSource;
+  Framing blockFraming;         // fit/zoom/pan of the placeholder image or video
   Settings settings;            // global settings (used when sameForAll, and as the template for new cameras)
   bool sameForAll = true;
   std::map<std::string, Settings> settingsByCamera;  // bus -> settings
@@ -167,6 +189,7 @@ void loadConfig(Config& c) {
     if (j.contains("camera") && j["camera"].is_string()) c.preferredCamera = j["camera"];
     if (j.contains("block") && j["block"].is_boolean()) c.block = j["block"];
     if (j.contains("blockSource") && j["blockSource"].is_string() && blockSourceValid(j["blockSource"])) c.blockSource = j["blockSource"];
+    framingFromJson(j, "block", c.blockFraming.fit, c.blockFraming.zoom, c.blockFraming.panX, c.blockFraming.panY);
     if (j.contains("settings")) settingsFromJson(j["settings"], c.settings);
     if (j.contains("sameForAll") && j["sameForAll"].is_boolean()) c.sameForAll = j["sameForAll"];
     if (j.contains("settingsByCamera") && j["settingsByCamera"].is_object()) {
@@ -186,6 +209,7 @@ void saveConfig(const Config& c) {
              { "camera", c.preferredCamera },
              { "block", c.block },
              { "blockSource", c.blockSource },
+             { "blockFit", c.blockFraming.fit }, { "blockZoom", c.blockFraming.zoom }, { "blockPanX", c.blockFraming.panX }, { "blockPanY", c.blockFraming.panY },
              { "sameForAll", c.sameForAll },
              { "settings", settingsToJson(c.settings) },
              { "settingsByCamera", byCam } };
@@ -241,6 +265,14 @@ private:
   bool csLowRes_ = false;    // Center Stage capture dropped to the output size (tier 2) until a probe at tier 0 shows the full size fits
   bool lowCores_ = false;    // <= 2 hardware threads: never capture above the output size
   std::string error_, loopPath_, pwStatus_ = "off", gesture_, profileLine_;
+  bool profile_ = false;       // `profile on`: per-stage timings and the framing debug object in the state
+  EffectPipeline::FramingInfo framing_;   // last frame's framing (shown while profile_ is on)
+  cv::Point2f panRange_;       // pan room of what is shown now (camera framing or placeholder), for the panel's drag
+  // Settings changes are saved at most every 0.5 s (a pan drag or a zoom
+  // wheel sends a burst of them): the first goes straight to disk, the rest
+  // are flushed by the main loop (and on exit). Both under mu_.
+  bool cfgDirty_ = false;
+  double cfgSavedAt_ = 0;
   bool forcePreview_ = false;  // keep running even without consumers (debug)
   bool hideRawActive_ = false;
   std::string runtimeDir_;
@@ -274,6 +306,8 @@ private:
     stateDirty_ = true;
   }
   void setError(const std::string& e) { setState(error_, e); }
+  void saveConfigSoon();   // caller holds mu_
+  void flushConfig();      // main loop / exit: write a pending save once it is due
   json stateJson();
   void publishState();
   // Settings that apply to the current camera (global when sameForAll).
@@ -310,7 +344,7 @@ json Daemon::stateJson() {
   for (auto& c : cameras_) cams.push_back({ { "path", c.path }, { "name", c.name }, { "bus", c.bus }, { "key", c.key }, { "hidden", cameraHidden(c) } });
   CameraInfo shown = current_;
   if (shown.bus.empty()) { std::string b = selectedBus(); for (auto& c : cameras_) if (c.bus == b) shown = c; }
-  return json{ { "type", "state" },
+  json j = json{ { "type", "state" },
                { "running", running_ },
                { "consumers", consumers_.load() },
                { "camera", { { "path", shown.path }, { "name", shown.name }, { "bus", shown.bus }, { "key", shown.key } } },
@@ -334,7 +368,30 @@ json Daemon::stateJson() {
                { "hideRaw", hideRawActive_ },
                { "block", cfg_.block },
                { "blockSource", cfg_.blockSource },
+               { "blockFit", cfg_.blockFraming.fit }, { "blockZoom", cfg_.blockFraming.zoom }, { "blockPanX", cfg_.blockFraming.panX }, { "blockPanY", cfg_.blockFraming.panY },
+               { "panRange", { panRange_.x, panRange_.y } },
                { "error", error_ } };
+  if (profile_) {
+    const auto& f = framing_;
+    j["framing"] = { { "faces", f.faces }, { "face", { f.face.x, f.face.y, f.face.width, f.face.height } },
+                     { "crop", { f.geom.crop.x, f.geom.crop.y, f.geom.crop.width, f.geom.crop.height } },
+                     { "dst", { f.geom.dst.x, f.geom.dst.y, f.geom.dst.width, f.geom.dst.height } }, { "src", { f.src.width, f.src.height } } };
+  }
+  return j;
+}
+
+void Daemon::saveConfigSoon() {
+  double now = nowSec();
+  if (now - cfgSavedAt_ >= 0.5) { saveConfig(cfg_); cfgSavedAt_ = now; cfgDirty_ = false; }
+  else cfgDirty_ = true;
+}
+
+void Daemon::flushConfig() {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!cfgDirty_) return;
+  double now = nowSec();
+  if (now - cfgSavedAt_ < 0.5) return;
+  saveConfig(cfg_); cfgSavedAt_ = now; cfgDirty_ = false;
 }
 
 void Daemon::publishState() {
@@ -558,13 +615,14 @@ std::string Daemon::handle(const std::string& req) {
           settingsFromJson(sj, effectiveSettings());
           // Global (not per camera) keys travel in the same object: `camesd set block=true blockSource=/path`.
           if (sj.contains("block") && sj["block"].is_boolean()) cfg_.block = sj["block"];
+          framingFromJson(sj, "block", cfg_.blockFraming.fit, cfg_.blockFraming.zoom, cfg_.blockFraming.panX, cfg_.blockFraming.panY);
           if (sj.contains("blockSource") && sj["blockSource"].is_string()) {
             std::string p = sj["blockSource"], why;
             if (blockSourceValid(p, &why)) cfg_.blockSource = p;
-            else { saveConfig(cfg_); stateDirty_ = true; return json{ { "type", "error" }, { "error", "blockSource: " + why } }.dump(); }
+            else { saveConfigSoon(); stateDirty_ = true; return json{ { "type", "error" }, { "error", "blockSource: " + why } }.dump(); }
           }
         }
-        saveConfig(cfg_);
+        saveConfigSoon();
       }
       stateDirty_ = true;
       return kOk;
@@ -579,7 +637,7 @@ std::string Daemon::handle(const std::string& req) {
     if (cmd == "profile") {
       bool on = boolField("on");
       fx_.setProfile(on);
-      if (!on) { std::lock_guard<std::mutex> lk(mu_); profileLine_.clear(); stateDirty_ = true; }  // clear at once, also while idle
+      { std::lock_guard<std::mutex> lk(mu_); profile_ = on; if (!on) profileLine_.clear(); stateDirty_ = true; }  // clear at once, also while idle
       return kOk;
     }
     if (cmd == "quit") { g_quit = true; return kOk; }
@@ -670,9 +728,11 @@ int Daemon::run() {
     if (now - lastPwCheck > std::chrono::seconds(1)) { lastPwCheck = now; setState(pwStatus_, pwOut_.maintain(nowSec())); }
     setState(hideRawActive_, fileExists("/etc/udev/rules.d/71-cames-hide-raw.rules"));
 
+    flushConfig();
     bool preview, block;
     std::string blockSrc;
-    { std::lock_guard<std::mutex> lk(mu_); preview = forcePreview_; block = cfg_.block; blockSrc = cfg_.blockSource; }
+    Framing blockFraming;
+    { std::lock_guard<std::mutex> lk(mu_); preview = forcePreview_; block = cfg_.block; blockSrc = cfg_.blockSource; blockFraming = cfg_.blockFraming; }
     bool want = (loop_.isOpen() && consumers_ > 0) || pwActive_ || preview;
     // Blocked: the physical camera stays closed (light off) whatever the
     // consumers do; they get the placeholder from block_ instead, on the same
@@ -693,9 +753,10 @@ int Daemon::run() {
     }
     if (want && block) {
       bool was = block_.active();
-      block_.open(blockSrc, cv::Size(cfg_.outW, cfg_.outH), cfg_.fps);
+      block_.open(blockSrc, cv::Size(cfg_.outW, cfg_.outH), cfg_.fps, blockFraming);
       if (!was) fprintf(stderr, "camesd: blocked: showing %s\n", blockSrc.empty() ? "the built-in card" : blockSrc.c_str());
       setError(block_.error());
+      setState(panRange_, block_.panRange());
     }
     if (!want && captureOpen()) { captureClose(); resetTier(false); stopped = true; }
     if (stopped) {
@@ -758,6 +819,12 @@ int Daemon::run() {
         setState(gesture_, fx_.lastGesture());
         setState(reactionsActive_, fx_.reactionsActive());
         setState(profileLine_, fx_.profileLine());
+        {
+          EffectPipeline::FramingInfo fi = fx_.framing();
+          std::lock_guard<std::mutex> lk(mu_);
+          if (panRange_ != fi.geom.range) { panRange_ = fi.geom.range; stateDirty_ = true; }
+          if (profile_ && framing_ != fi) { framing_ = fi; stateDirty_ = true; }
+        }
         countFrame();
       } else {
         // Camera unplugged or stalled: reopen.
@@ -779,6 +846,7 @@ int Daemon::run() {
   pwOut_.stop();
   watcher_.stop();
   server_.stop();
+  { std::lock_guard<std::mutex> lk(mu_); if (cfgDirty_) saveConfig(cfg_); }
   return 0;
 }
 
@@ -848,7 +916,7 @@ int main(int argc, char** argv) {
       if (eq == std::string::npos) continue;
       std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
       if (v == "true" || v == "false") s[k] = (v == "true");
-      else if (!v.empty() && (isdigit(v[0]) || v[0] == '.')) {
+      else if (!v.empty() && (isdigit(v[0]) || v[0] == '.' || (v[0] == '-' && v.size() > 1))) {  // numbers (panX=-0.5 too)
         try { size_t used = 0; double d = std::stod(v, &used); if (used == v.size() && std::isfinite(d)) s[k] = d; else s[k] = v; }
         catch (const std::exception&) { s[k] = v; }  // "." / "1e999": not a number, send as string
       } else s[k] = v;
