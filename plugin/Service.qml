@@ -90,6 +90,7 @@ Item {
     stderr: StdioCollector { onStreamFinished: if (String(text).trim() !== "") root.setupOutput = String(text).trim() }
     onExited: function(code) {
       Qt.callLater(root.refresh)
+      restartTimer.interval = 1000  // not whatever backoff the last crash/orphan path left behind
       restartTimer.restart()  // hide rules switch the daemon binary; a restart picks it up
     }
   }
@@ -160,6 +161,9 @@ Item {
     }
   }
 
+  // Set while we wait for an orphaned daemon to honour our quit; the socket
+  // dropping is the signal to start our own without the 5 s wait.
+  property bool orphanQuit: false
   Timer {
     id: restartTimer
     interval: 1000
@@ -168,7 +172,7 @@ Item {
       if (daemon.running) { daemon.signal(15); return }   // restart requested (setup changed things)
       // Not our process but something answers on the socket: a daemon orphaned by
       // a previous shell. Ask it to quit so we can start (and later restart) our own.
-      if (root.sockConnected) { root.send({ cmd: "quit" }); interval = 5000; restart(); return }
+      if (root.sockConnected) { root.send({ cmd: "quit" }); root.orphanQuit = true; interval = 5000; restart(); return }
       daemon.command = root.daemonCommand()
       daemon.running = true
     }
@@ -199,7 +203,11 @@ Item {
       }
       onConnectionStateChanged: {
         root.sockConnectedChanged()
-        if (!connected) { root.state = ({}); reconnectTimer.restart() }
+        if (!connected) {
+          root.state = ({})
+          if (root.orphanQuit) { root.orphanQuit = false; restartTimer.interval = 1000; restartTimer.restart() }
+          reconnectTimer.restart()
+        }
       }
       onError: function(err) { reconnectTimer.restart() }
     }

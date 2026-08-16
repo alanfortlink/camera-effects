@@ -588,8 +588,9 @@ void EffectPipeline::applyStudioLight(cv::Mat& work) {
 
 void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& outSize, double now) {
   auto tick = [&]() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
-  double tl = profile_ ? tick() : 0;
-  auto stage = [&](int i) { if (!profile_) return; double t = tick(); profAcc_[i] += t - tl; tl = t; };
+  const bool prof = profile_;  // sampled once: a flip mid-frame must not pair a stage with tl = 0
+  double tl = prof ? tick() : 0;
+  auto stage = [&](int i) { if (!prof) return; double t = tick(); profAcc_[i] += t - tl; tl = t; };
   double dt = lastTime_ > 0 ? std::clamp(now - lastTime_, 0.001, 0.2) : 1.0 / 30;
   lastTime_ = now;
   frameIdx_++;
@@ -678,7 +679,12 @@ void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& o
   stage(6);  // reactions
   if (settings_.mirror) { cv::flip(work, work.data == src.data ? work_ : work, 1); if (work.data == src.data) work = work_; }
   out = work;
-  if (profile_ && ++profN_ == 60) {
+  if (!prof) {
+    // profile off: drop the stale line and start the next window fresh (this
+    // thread owns profileLine_/profAcc_; setProfile only flips the flag)
+    if (!profileLine_.empty()) profileLine_.clear();
+    if (profN_) { for (auto& a : profAcc_) a = 0; profN_ = 0; }
+  } else if (++profN_ == 60) {
     char b[256];
     snprintf(b, sizeof b, "ms/frame: faces %.1f resize %.1f mask %.1f bg %.1f light %.1f gestures %.1f react %.1f",
              profAcc_[0] / profN_, profAcc_[1] / profN_, profAcc_[2] / profN_, profAcc_[3] / profN_, profAcc_[4] / profN_, profAcc_[5] / profN_, profAcc_[6] / profN_);

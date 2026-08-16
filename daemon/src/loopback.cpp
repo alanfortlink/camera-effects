@@ -155,20 +155,28 @@ void ConsumerWatcher::run() {
     pollfd p{ in, POLLIN, 0 };
     int r = in >= 0 ? poll(&p, 1, 250) : (usleep(250000), 0);
     if (r > 0) {
-      ssize_t n = read(in, buf, sizeof buf);
-      for (ssize_t off = 0; off < n;) {
-        auto* ev = (inotify_event*)(buf + off);
-        if (ev->mask & IN_OPEN) delta++;
-        if (ev->mask & IN_CLOSE) delta--;
-        off += sizeof(inotify_event) + ev->len;
-      }
+      auto drain = [&] {
+        for (;;) {
+          ssize_t n = read(in, buf, sizeof buf);
+          if (n <= 0) break;
+          for (ssize_t off = 0; off < n;) {
+            auto* ev = (inotify_event*)(buf + off);
+            if (ev->mask & IN_OPEN) delta++;
+            if (ev->mask & IN_CLOSE) delta--;
+            off += sizeof(inotify_event) + ev->len;
+          }
+        }
+      };
+      drain();
       // Debounce: apps enumerate cameras with a quick open/close; wait for the
-      // dust to settle before treating it as a real consumer.
+      // dust to settle, then pick up the CLOSE that may have landed meanwhile
+      // before treating it as a real consumer.
       usleep(150000);
+      drain();
       publish(base + delta);
     }
     auto now = std::chrono::steady_clock::now();
-    if (now - lastScan > std::chrono::seconds(2)) {
+    if (now - lastScan > std::chrono::seconds(5)) {
       base = scanProc();
       delta = 0;
       publish(base);

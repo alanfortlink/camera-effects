@@ -95,9 +95,11 @@ raw_devices() {
 
 # Root-owned setgid copy of the daemon: the only thing allowed to read hidden webcams.
 # The source must be a plain file of the invoking user (or root's when root itself
-# calls): this publishes it world-readable and setgid, so it must not be pointed at
-# someone else's file. The file is opened once and every check plus the copy go
-# through that descriptor, so the path cannot be swapped between check and copy.
+# calls): this publishes it setgid, so it must not be pointed at someone else's file.
+# The file is opened once and every check plus the copy go through that descriptor,
+# so the path cannot be swapped between check and copy. The copy is 2750 root:camerad
+# plus an ACL granting rx to the invoking user only, so other local accounts cannot
+# run it to reach the hidden webcams (hiding a camera must not widen its audience).
 install_privileged_daemon() {
   local bin=$1
   [[ -n $bin && ! -L $bin ]] || { echo "camfxd binary missing or a symlink: $bin" >&2; exit 1; }
@@ -107,8 +109,10 @@ install_privileged_daemon() {
   [[ $st == "$caller regular file" && -x /dev/fd/3 ]] || { echo "refusing $bin: must be an executable regular file owned by uid $caller (got: $st)" >&2; exit 1; }
   getent group "$GROUP" >/dev/null || groupadd -r "$GROUP"
   install -d -m 755 "$LIBDIR"
-  install -m 2755 -o root -g "$GROUP" /dev/fd/3 "$LIBDIR/camfxd"
+  # install replaces the destination inode, so no stale ACL survives from a previous copy
+  install -m 2750 -o root -g "$GROUP" /dev/fd/3 "$LIBDIR/camfxd"
   exec 3<&-
+  [[ $caller -eq 0 ]] || setfacl -m "u:$caller:rx" "$LIBDIR/camfxd"
 }
 
 # udev match for one USB camera from our (validated) key "usb-<vid>-<pid>[-<serial>]".

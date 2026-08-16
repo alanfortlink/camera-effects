@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <fstream>
@@ -207,8 +208,11 @@ private:
   int tier_ = 0;        // adaptive quality tier (0 = full, 2 = cheapest), see updateTier()
   bool reactionsActive_ = false;  // a reaction is playing or queued (mirrors fx_.reactionsActive())
   // Tier controller state (main thread only). ctrlMs_ is the EMA of the
-  // controlling metric (max of decode and processing: they run in parallel).
-  double ctrlMs_ = 0, overSince_ = -1, underSince_ = -1;
+  // controlling metric (max of decode and processing: they run in parallel);
+  // slowMs_ a slower EMA of the same for the step-down decision, periodMs_ the
+  // measured frame interval the budget is derived from.
+  double ctrlMs_ = 0, slowMs_ = 0, periodMs_ = 0, overSince_ = -1, underSince_ = -1, lastFrameT_ = -1;
+  int warmup_ = 0;           // frames still to skip after a (re)open before feeding the EMAs
   double holdSec_ = 10;      // headroom needed before stepping down (doubles after a failed probe)
   double probeSince_ = -1;   // >= 0 while a step-down is on probation
   bool probeRes_ = false;    // the current probe is the capture-size step (csLowRes_ off), not a tier step
@@ -429,40 +433,56 @@ bool Daemon::nextFrame(cv::Mat& f, double* decodeMs, int ms) {
 
 // Adaptive quality. The controlling metric is the larger of decode time and
 // processing time (they run on different threads), tracked as an EMA against a
-// budget of 80% of the frame period. Sustained overrun (~2 s) raises the tier.
-// Stepping down is a probe: after holdSec_ (10 s) below 70% of the budget the
-// tier drops; if that overruns the budget within 5 s it is reverted and the
-// hold doubles (thrash guard, reset by the next successful probe). Tiers only
-// cheapen the effects (see effects.cpp: segmenter every 2nd/3rd frame, slower
-// gesture/face cadence, single blur pass, portrait at 1/8); passthrough is
-// unaffected. Tier 2 additionally drops the Center Stage capture to the output
-// size (csLowRes_, see wantedCapture); going back up to the full capture size
-// is the last probe step after tier 0 fits.
+// budget of 80% of the frame period. The period is the measured frame interval
+// (a camera delivering 17 fps leaves 59 ms per frame), never shorter than the
+// configured one. Sustained overrun (~2 s) raises the tier. Stepping down is a
+// probe: after holdSec_ (10 s; twice that for the capture-size step, the only
+// one that reopens the camera) with a slow EMA below 70% of the budget the tier
+// drops; if the fast EMA then overruns the budget for 0.7 s within the 5 s
+// probation the step is reverted and the hold doubles (thrash guard, reset by
+// the next successful probe). The under-window only restarts once the slow EMA
+// climbs above 85% of the budget, so periodic heavy frames (palm detection with
+// a hand in view) do not keep a tier that would fit from ever being probed. The
+// first frames after a (re)open are warm-up outliers and are not fed in. Tiers
+// only cheapen the effects (see effects.cpp: segmenter every 2nd/3rd frame,
+// slower gesture/face cadence, single blur pass, portrait at 1/8); passthrough
+// is unaffected. Tier 2 additionally drops the Center Stage capture to the
+// output size (csLowRes_, see wantedCapture); going back up to the full capture
+// size is the last probe step after tier 0 fits.
 void Daemon::updateTier(double decodeMs, double loopMs, double now) {
-  double budget = 0.8 * 1000.0 / std::max(1, cfg_.fps);
+  double sum = decodeMs + loopMs;
+  { std::lock_guard<std::mutex> lk(mu_); procMs_ = procMs_ == 0 ? sum : procMs_ * 0.9 + sum * 0.1; }
+  double cfgPeriod = 1000.0 / std::max(1, cfg_.fps);
+  double gap = lastFrameT_ >= 0 ? (now - lastFrameT_) * 1000.0 : -1;
+  lastFrameT_ = now;
+  if (warmup_ > 0) { warmup_--; return; }
+  if (gap > 0 && gap < 4 * cfgPeriod) periodMs_ = periodMs_ == 0 ? gap : periodMs_ * 0.9 + gap * 0.1;  // stalls/misses are not the cadence
+  double budget = 0.8 * std::max(cfgPeriod, periodMs_);
   double ctrl = std::max(decodeMs, loopMs);
   ctrlMs_ = ctrlMs_ == 0 ? ctrl : ctrlMs_ * 0.9 + ctrl * 0.1;
-  { std::lock_guard<std::mutex> lk(mu_); double sum = decodeMs + loopMs; procMs_ = procMs_ == 0 ? sum : procMs_ * 0.9 + sum * 0.1; }
+  slowMs_ = slowMs_ == 0 ? ctrl : slowMs_ * 0.97 + ctrl * 0.03;
   double ema = ctrlMs_;
   int t = tier_;
   bool lowRes = csLowRes_;
   bool probing = probeSince_ >= 0;
   if (probing && now - probeSince_ > 5.0) { probeSince_ = -1; probing = false; holdSec_ = 10; }  // probe passed
   if (ema > budget) {
-    if (probing) {  // the step-down did not fit: back up at once, wait longer next time
+    if (overSince_ < 0) overSince_ = now;
+    else if (probing && now - overSince_ > 0.7) {  // the step-down did not fit: back up, wait longer next time
       if (probeRes_) lowRes = true; else t = std::min(t + 1, 2);
       probeSince_ = -1; overSince_ = -1; holdSec_ = std::min(holdSec_ * 2, 160.0);
-    } else if (overSince_ < 0) overSince_ = now;
-    else if (now - overSince_ > 2.0 && t < 2) { t++; overSince_ = -1; }
+    } else if (!probing && now - overSince_ > 2.0 && t < 2) { t++; overSince_ = -1; }
   } else overSince_ = -1;
-  if (ema < 0.7 * budget) {
-    if (underSince_ < 0) underSince_ = now;
-    else if (now - underSince_ > holdSec_ && !probing && (t > 0 || lowRes)) {
-      probeRes_ = t == 0;  // tier 0 already: the remaining step is the capture size
+  if (slowMs_ < 0.7 * budget && underSince_ < 0) underSince_ = now;
+  else if (slowMs_ > 0.85 * budget) underSince_ = -1;
+  if (underSince_ >= 0 && !probing && (t > 0 || lowRes)) {
+    bool resStep = t == 0;  // tier 0 already: the remaining step is the capture size (a reopen: ask for twice the headroom)
+    if (now - underSince_ > (resStep ? 2 * holdSec_ : holdSec_)) {
+      probeRes_ = resStep;
       if (probeRes_) lowRes = false; else t--;
       underSince_ = -1; probeSince_ = now;
     }
-  } else underSince_ = -1;
+  }
   if (t >= 2) lowRes = true;
   if (t != tier_ || lowRes != csLowRes_) {
     fx_.setTier(t);
@@ -476,7 +496,7 @@ void Daemon::updateTier(double decodeMs, double loopMs, double now) {
 // the camera goes idle. The tier survives a reopen (a Center Stage or camera
 // switch does not change the machine); a probe in flight gets a fresh window.
 void Daemon::resetTier(bool keepTier) {
-  ctrlMs_ = 0; overSince_ = underSince_ = -1;
+  ctrlMs_ = slowMs_ = periodMs_ = 0; overSince_ = underSince_ = lastFrameT_ = -1; warmup_ = 5;
   { std::lock_guard<std::mutex> lk(mu_); procMs_ = 0; }
   if (keepTier) { if (probeSince_ >= 0) probeSince_ = nowSec(); return; }
   probeSince_ = -1; probeRes_ = false; holdSec_ = 10;
@@ -520,7 +540,12 @@ std::string Daemon::handle(const std::string& req) {
     }
     if (cmd == "rescan") { rescanCameras(); stateDirty_ = true; return kOk; }
     if (cmd == "preview") { std::lock_guard<std::mutex> lk(mu_); forcePreview_ = boolField("on"); stateDirty_ = true; return kOk; }
-    if (cmd == "profile") { fx_.setProfile(boolField("on")); return kOk; }
+    if (cmd == "profile") {
+      bool on = boolField("on");
+      fx_.setProfile(on);
+      if (!on) { std::lock_guard<std::mutex> lk(mu_); profileLine_.clear(); stateDirty_ = true; }  // clear at once, also while idle
+      return kOk;
+    }
     if (cmd == "quit") { g_quit = true; return kOk; }
     return error("unknown cmd");
   } catch (const std::exception& e) {
@@ -756,8 +781,10 @@ int main(int argc, char** argv) {
       if (eq == std::string::npos) continue;
       std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
       if (v == "true" || v == "false") s[k] = (v == "true");
-      else if (!v.empty() && (isdigit(v[0]) || v[0] == '.')) s[k] = std::stod(v);
-      else s[k] = v;
+      else if (!v.empty() && (isdigit(v[0]) || v[0] == '.')) {
+        try { size_t used = 0; double d = std::stod(v, &used); if (used == v.size() && std::isfinite(d)) s[k] = d; else s[k] = v; }
+        catch (const std::exception&) { s[k] = v; }  // "." / "1e999": not a number, send as string
+      } else s[k] = v;
     }
     return cmdClient(sock, json{ { "cmd", "set" }, { "settings", s } }.dump(), true);
   }

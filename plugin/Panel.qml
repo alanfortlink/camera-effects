@@ -100,13 +100,21 @@ Panel {
     var n = camName(c)
     return n.length > 26 ? n.slice(0, 25) + "…" : n
   }
-  function cameraOptions() {
-    var opts = cams.map(function(c) { return { value: String(c.bus), label: camName(c) } })
-    var cur = svc ? svc.camera : null
-    if (cur && cur.bus && !cams.some(function(c) { return String(c.bus) === String(cur.bus) }))
+  function cameraOptions(list, cur) {
+    var opts = list.map(function(c) { return { value: String(c.bus), label: camName(c) } })
+    if (cur && cur.bus && !list.some(function(c) { return String(c.bus) === String(cur.bus) }))
       opts.push({ value: String(cur.bus), label: camName(cur) })
     return opts
   }
+  // The daemon pushes state every ~150 ms while running; a fresh array per push
+  // would rebuild the Dropdown/Repeater delegates each time (a hide switch could
+  // vanish mid-click). Derive the option lists from the JSON text of the inputs
+  // instead, so they only change when the cameras/reactions themselves do.
+  readonly property string camsJson: JSON.stringify([cams, svc && svc.camera ? svc.camera : null])
+  readonly property string reactionsJson: JSON.stringify(svc ? svc.reactionNames : [])
+  readonly property var cameraOpts: { var j = JSON.parse(camsJson); return cameraOptions(j[0], j[1]) }
+  readonly property var hideableCams: JSON.parse(camsJson)[0].filter(function(c) { return !!c.key })
+  readonly property var reactionList: JSON.parse(reactionsJson)
   function footer() {
     if (!svc || !connected) return ""
     var res = svc.state.output ? " · " + svc.state.output.width + "×" + svc.state.output.height : ""
@@ -369,7 +377,7 @@ Panel {
                      (!!root.svc.camera && !!root.svc.camera.bus && !root.cams.some(function(c) { return c.bus === root.svc.camera.bus })))
             showLabel: false
             fontFamily: root.fontFamily
-            options: root.cameraOptions()
+            options: root.cameraOpts
             value: root.svc && root.svc.camera && root.svc.camera.bus ? String(root.svc.camera.bus) : ""
             onChanged: function(v) { if (root.svc) root.svc.selectCamera(v) }
           }
@@ -510,7 +518,7 @@ Panel {
               x: Style.space(20)
               spacing: Style.space(4)
               Repeater {
-                model: root.svc ? root.svc.reactionNames : []
+                model: root.reactionList
                 delegate: Item {
                   required property string modelData
                   width: Style.space(20); height: Style.space(20)
@@ -549,7 +557,7 @@ Panel {
             onToggled: if (root.svc) root.svc.runSetup("hide-all", !root.svc.hideRaw)
           }
           Repeater {  // per-camera switches (USB cameras only), when there is more than one
-            model: root.multiCam && root.svc && !root.svc.hideRaw ? root.cams.filter(function(c) { return !!c.key }) : []
+            model: root.multiCam && root.svc && !root.svc.hideRaw ? root.hideableCams : []
             delegate: SwitchRow {
               required property var modelData
               label: "Hide " + root.shortName(modelData)
