@@ -6,7 +6,7 @@ import QtMultimedia
 // *processed* feed (the loopback device), so what you see is what apps get.
 Item {
   id: root
-  property string deviceLabel: "Iris Camera"
+  property string deviceLabel: "cames Camera"
   property string devicePath: ""
   // True when the daemon already mirrors the output (settings.mirror). The
   // preview always shows you a mirror view of yourself, so it flips the feed

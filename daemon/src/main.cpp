@@ -1,8 +1,8 @@
-// irisd — system-wide camera effects daemon for Omarchy.
+// camesd — system-wide camera effects daemon for Omarchy.
 //
 // Reads a physical webcam, applies effects (Center Stage, Portrait, Studio
 // Light, background replacement, colour filters, fun face filters, Reactions)
-// and publishes the result as a virtual V4L2 camera ("Iris Camera") that every
+// and publishes the result as a virtual V4L2 camera ("cames Camera") that every
 // app can use. Runs the camera only while some app has the virtual camera
 // open; with "block" on it never opens the camera and feeds a placeholder instead.
 #include <fcntl.h>
@@ -124,7 +124,7 @@ int cmdClient(const std::string& sockPath, const std::string& request, bool wait
 // Daemon
 
 struct Config {
-  std::string label = "Iris Camera";
+  std::string label = "cames Camera";
   int outW = 1280, outH = 720, fps = 30;
   // Capture size used while Center Stage is on (it needs room to zoom).
   // Otherwise the camera is asked for the output size: a 1080p MJPEG decode
@@ -279,7 +279,7 @@ private:
   // Settings that apply to the current camera (global when sameForAll).
   Settings& effectiveSettings();
   std::string selectedBus();
-  static bool cameraHidden(const CameraInfo& c) { return !c.key.empty() && fileExists("/etc/udev/rules.d/71-iris-hide-" + c.key + ".rules"); }
+  static bool cameraHidden(const CameraInfo& c) { return !c.key.empty() && fileExists("/etc/udev/rules.d/71-cames-hide-" + c.key + ".rules"); }
   std::string handle(const std::string& req);
   void rescanCameras();
   CameraInfo pickCamera();
@@ -422,11 +422,11 @@ void Daemon::captureLoop() {
     try {
       ok = captureGrab(f, 200);
       if (ok && (f.empty() || f.cols > maxW || f.rows > maxH)) {
-        if (badLogged++ < 3) fprintf(stderr, "irisd: dropping %dx%d frame (negotiated up to %dx%d)\n", f.cols, f.rows, maxW, maxH);
+        if (badLogged++ < 3) fprintf(stderr, "camesd: dropping %dx%d frame (negotiated up to %dx%d)\n", f.cols, f.rows, maxW, maxH);
         ok = false;
       }
     } catch (const std::exception& e) {
-      if (badLogged++ < 3) fprintf(stderr, "irisd: decode failed: %s\n", e.what());
+      if (badLogged++ < 3) fprintf(stderr, "camesd: decode failed: %s\n", e.what());
       ok = false;
     }
     std::lock_guard<std::mutex> lk(slotMu_);
@@ -514,7 +514,7 @@ void Daemon::updateTier(double decodeMs, double loopMs, double now) {
     fx_.setTier(t);
     setState(tier_, t);
     setState(csLowRes_, lowRes);
-    fprintf(stderr, "irisd: quality tier %d%s (%.1f ms/frame, budget %.1f, hold %.0f s)\n", t, lowRes ? " (capture at output size)" : "", ema, budget, holdSec_);
+    fprintf(stderr, "camesd: quality tier %d%s (%.1f ms/frame, budget %.1f, hold %.0f s)\n", t, lowRes ? " (capture at output size)" : "", ema, budget, holdSec_);
   }
 }
 
@@ -556,7 +556,7 @@ std::string Daemon::handle(const std::string& req) {
         if (j.contains("settings") && j["settings"].is_object()) {
           const json& sj = j["settings"];
           settingsFromJson(sj, effectiveSettings());
-          // Global (not per camera) keys travel in the same object: `irisd set block=true blockSource=/path`.
+          // Global (not per camera) keys travel in the same object: `camesd set block=true blockSource=/path`.
           if (sj.contains("block") && sj["block"].is_boolean()) cfg_.block = sj["block"];
           if (sj.contains("blockSource") && sj["blockSource"].is_string()) {
             std::string p = sj["blockSource"], why;
@@ -585,7 +585,7 @@ std::string Daemon::handle(const std::string& req) {
     if (cmd == "quit") { g_quit = true; return kOk; }
     return error("unknown cmd");
   } catch (const std::exception& e) {
-    fprintf(stderr, "irisd: request failed: %s\n", e.what());
+    fprintf(stderr, "camesd: request failed: %s\n", e.what());
     return error("request failed");
   }
 }
@@ -620,14 +620,14 @@ int Daemon::run() {
   unsigned hw = std::thread::hardware_concurrency();
   cv::setNumThreads(hw <= 2 ? 1 : 2);
   lowCores_ = hw > 0 && hw <= 2;
-  runtimeDir_ = xdgRuntime() + "/iris";
+  runtimeDir_ = xdgRuntime() + "/cames";
   std::string err;
-  if (!ensureRuntimeDir(runtimeDir_, &err)) { fprintf(stderr, "irisd: %s\n", err.c_str()); return 1; }
+  if (!ensureRuntimeDir(runtimeDir_, &err)) { fprintf(stderr, "camesd: %s\n", err.c_str()); return 1; }
   std::string sockPath = runtimeDir_ + "/ctl.sock";
   // Single instance per session (the shell restarts us; a stray manual copy
   // must not fight over the loopback writer).
   int lockFd = open((runtimeDir_ + "/lock").c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
-  if (lockFd < 0 || flock(lockFd, LOCK_EX | LOCK_NB) < 0) { fprintf(stderr, "irisd: another instance is running\n"); return 3; }
+  if (lockFd < 0 || flock(lockFd, LOCK_EX | LOCK_NB) < 0) { fprintf(stderr, "camesd: another instance is running\n"); return 3; }
 
   if (!fx_.init(cfg_.modelsDir, cfg_.assetsDir, &err)) fprintf(stderr, "models: %s\n", err.c_str());
   else if (!err.empty()) fprintf(stderr, "models (degraded): %s\n", err.c_str());
@@ -637,10 +637,10 @@ int Daemon::run() {
 
   // Native PipeWire camera node for portal-based apps (best effort).
   if (pwOut_.start(cfg_.outW, cfg_.outH, cfg_.fps, cfg_.label, [this](bool on) { pwActive_ = on; stateDirty_ = true; }, &err)) setState(pwStatus_, std::string("ok"));
-  else { setState(pwStatus_, err); fprintf(stderr, "irisd: pipewire output unavailable: %s\n", err.c_str()); }
+  else { setState(pwStatus_, err); fprintf(stderr, "camesd: pipewire output unavailable: %s\n", err.c_str()); }
 
-  // The loopback device is created by the iris-camera-device systemd unit
-  // (v4l2loopback-ctl, installed by `iris-setup install`). Wait for
+  // The loopback device is created by the cames-camera-device systemd unit
+  // (v4l2loopback-ctl, installed by `cames-setup install`). Wait for
   // it rather than fail: the plugin's setup step may still be running.
   auto lastLoopCheck = clk::now() - std::chrono::seconds(10);
   auto lastScan = clk::now() - std::chrono::seconds(10);
@@ -650,7 +650,7 @@ int Daemon::run() {
   int frames = 0;
   auto fpsT0 = clk::now();
   cv::Mat frame;  // processing-side frame buffer (rotates with the capture slot)
-  fprintf(stderr, "irisd: ready (socket %s)\n", sockPath.c_str());
+  fprintf(stderr, "camesd: ready (socket %s)\n", sockPath.c_str());
 
   while (!g_quit) {
     auto now = clk::now();
@@ -661,14 +661,14 @@ int Daemon::run() {
       else if (loop_.open(p, cfg_.outW, cfg_.outH, &err)) {
         setState(loopPath_, p);
         setError("");
-        fprintf(stderr, "irisd: virtual camera %s (%dx%d)\n", p.c_str(), cfg_.outW, cfg_.outH);
+        fprintf(stderr, "camesd: virtual camera %s (%dx%d)\n", p.c_str(), cfg_.outW, cfg_.outH);
         watcher_.start(p, [this](int n) { consumers_ = n; stateDirty_ = true; });
       } else setError(err);
     }
     if (now - lastScan > std::chrono::seconds(running_ ? 10 : 4)) { lastScan = now; rescanCameras(); }
     // PipeWire restarted / stream error: reconnect with backoff, show it meanwhile.
     if (now - lastPwCheck > std::chrono::seconds(1)) { lastPwCheck = now; setState(pwStatus_, pwOut_.maintain(nowSec())); }
-    setState(hideRawActive_, fileExists("/etc/udev/rules.d/71-iris-hide-raw.rules"));
+    setState(hideRawActive_, fileExists("/etc/udev/rules.d/71-cames-hide-raw.rules"));
 
     bool preview, block;
     std::string blockSrc;
@@ -678,15 +678,15 @@ int Daemon::run() {
     // consumers do; they get the placeholder from block_ instead, on the same
     // on-demand terms.
     bool stopped = false;
-    if (block && captureOpen()) { captureClose(); resetTier(false); fprintf(stderr, "irisd: blocked: camera released\n"); }
+    if (block && captureOpen()) { captureClose(); resetTier(false); fprintf(stderr, "camesd: blocked: camera released\n"); }
     if (block_.active() && (!block || !want)) { block_.close(); setError(""); stopped = !want; }
     if (want && !block && !captureOpen()) {
       if (openCapture(&err)) {
         setError("");
         misses_ = 0;
-        fprintf(stderr, "irisd: capturing %s %dx%d %s\n", current_.path.c_str(), useFile_ ? file_.width() : cap_.width(), useFile_ ? file_.height() : cap_.height(), useFile_ ? "file" : cap_.format().c_str());
+        fprintf(stderr, "camesd: capturing %s %dx%d %s\n", current_.path.c_str(), useFile_ ? file_.width() : cap_.width(), useFile_ ? file_.height() : cap_.height(), useFile_ ? "file" : cap_.format().c_str());
       } else {
-        if (error_ != err) fprintf(stderr, "irisd: capture: %s\n", err.c_str());
+        if (error_ != err) fprintf(stderr, "camesd: capture: %s\n", err.c_str());
         setError(err);
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
       }
@@ -694,7 +694,7 @@ int Daemon::run() {
     if (want && block) {
       bool was = block_.active();
       block_.open(blockSrc, cv::Size(cfg_.outW, cfg_.outH), cfg_.fps);
-      if (!was) fprintf(stderr, "irisd: blocked: showing %s\n", blockSrc.empty() ? "the built-in card" : blockSrc.c_str());
+      if (!was) fprintf(stderr, "camesd: blocked: showing %s\n", blockSrc.empty() ? "the built-in card" : blockSrc.c_str());
       setError(block_.error());
     }
     if (!want && captureOpen()) { captureClose(); resetTier(false); stopped = true; }
@@ -703,7 +703,7 @@ int Daemon::run() {
       cv::Mat black(cfg_.outH, cfg_.outW, CV_8UC3, cv::Scalar(0, 0, 0));
       if (loop_.isOpen()) loop_.write(black);
       pwOut_.clear();
-      fprintf(stderr, "irisd: idle\n");
+      fprintf(stderr, "camesd: idle\n");
     }
     setState(running_, captureOpen() || block_.active());
     if (running_ != wasRunning) { wasRunning = running_; frames = 0; fpsT0 = now; setState(fps_, 0.0); }
@@ -721,7 +721,7 @@ int Daemon::run() {
         pwOut_.pushYuyv(yuyv_);
         countFrame();
       } catch (const std::exception& e) {
-        fprintf(stderr, "irisd: placeholder frame dropped: %s\n", e.what());
+        fprintf(stderr, "camesd: placeholder frame dropped: %s\n", e.what());
         std::this_thread::sleep_for(std::chrono::milliseconds(60));
       }
       setState(reactionsActive_, fx_.reactionsActive());
@@ -750,7 +750,7 @@ int Daemon::run() {
           if (loop_.isOpen()) loop_.writeYuyv(yuyv_);
           pwOut_.pushYuyv(yuyv_);
         } catch (const std::exception& e) {
-          fprintf(stderr, "irisd: frame dropped: %s\n", e.what());
+          fprintf(stderr, "camesd: frame dropped: %s\n", e.what());
           continue;
         }
         double loopMs = std::chrono::duration<double, std::milli>(clk::now() - p0).count();
@@ -797,7 +797,7 @@ int main(int argc, char** argv) {
     ssize_t n = readlink("/proc/self/exe", exe.data(), exe.size() - 1);
     exe.resize(n > 0 ? n : 0);
     std::string dir = exe.substr(0, exe.rfind('/'));
-    std::string models = fileExists(dir + "/../../models/pphumanseg.onnx") ? dir + "/../../models" : xdgData() + "/iris/models";
+    std::string models = fileExists(dir + "/../../models/pphumanseg.onnx") ? dir + "/../../models" : xdgData() + "/cames/models";
     GestureDetector g;
     std::string err;
     if (!g.load(models, &err)) { fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
@@ -819,13 +819,13 @@ int main(int argc, char** argv) {
   }
 
   Config cfg;
-  cfg.configPath = xdgConfig() + "/iris/config.json";
+  cfg.configPath = xdgConfig() + "/cames/config.json";
   std::string exe(4096, '\0');
   ssize_t n = readlink("/proc/self/exe", exe.data(), exe.size() - 1);
   exe.resize(n > 0 ? n : 0);
   std::string exeDir = exe.substr(0, exe.rfind('/'));
   // Data dirs: installed layout first, then the source tree (daemon/build/../..).
-  std::string dataDir = xdgData() + "/iris";
+  std::string dataDir = xdgData() + "/cames";
   if (fileExists(exeDir + "/../models/pphumanseg.onnx")) dataDir = exeDir + "/..";
   else if (fileExists(exeDir + "/../../models/pphumanseg.onnx")) dataDir = exeDir + "/../..";
   cfg.modelsDir = dataDir + "/models";
@@ -837,7 +837,7 @@ int main(int argc, char** argv) {
   }
   loadConfig(cfg);
 
-  std::string sock = xdgRuntime() + "/iris/ctl.sock";
+  std::string sock = xdgRuntime() + "/cames/ctl.sock";
   if (cmd == "status") return cmdClient(sock, R"({"cmd":"get"})", false);
   if (cmd == "react" && argc > 2) return cmdClient(sock, json{ { "cmd", "react" }, { "name", argv[2] } }.dump(), true);
   if (cmd == "set") {
@@ -860,7 +860,7 @@ int main(int argc, char** argv) {
   if (cmd == "quit") return cmdClient(sock, R"({"cmd":"quit"})", true);
   if (cmd == "profile") return cmdClient(sock, json{ { "cmd", "profile" }, { "on", argc > 2 && std::string(argv[2]) == "on" } }.dump(), true);
   if (cmd != "run") {
-    fprintf(stderr, "usage: irisd [run|status|set k=v...|react NAME|camera BUS|preview on|off|profile on|off|quit]\n");
+    fprintf(stderr, "usage: camesd [run|status|set k=v...|react NAME|camera BUS|preview on|off|profile on|off|quit]\n");
     return 2;
   }
   signal(SIGINT, onSignal);

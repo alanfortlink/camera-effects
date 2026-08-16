@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "alanfortlink.iris",
-  "name": "Iris",
+  "id": "alanfortlink.cames",
+  "name": "cames",
   "version": "0.1.0",
   "author": "alanfortlink",
   "license": "MIT",
-  "description": "System-wide camera effects (Center Stage, Portrait, Studio Light, Backgrounds, Filters, Fun face filters, Reactions, Block camera) exposed as the \"Iris Camera\" virtual webcam, with a Control-Center-style panel in the bar.",
+  "description": "System-wide camera effects (Center Stage, Portrait, Studio Light, Backgrounds, Filters, Fun face filters, Reactions, Block camera) exposed as the \"cames Camera\" virtual webcam, with a Control-Center-style panel in the bar.",
   "kinds": [
     "service",
     "bar-widget"
@@ -16,7 +16,7 @@
     "barWidget": "plugin/Panel.qml"
   },
   "barWidget": {
-    "displayName": "Iris",
+    "displayName": "cames",
     "description": "Camera effects panel with live preview; the icon lights up while an app is using the camera.",
     "category": "Media",
     "allowMultiple": false,
