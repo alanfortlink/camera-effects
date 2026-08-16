@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <fstream>
 #include <mutex>
@@ -115,6 +116,9 @@ int cmdClient(const std::string& sockPath, const std::string& request, bool wait
 struct Config {
   std::string label = "Omarchy Camera";
   int outW = 1280, outH = 720, fps = 30;
+  // Capture size used while Center Stage is on (it needs room to zoom).
+  // Otherwise the camera is asked for the output size: a 1080p MJPEG decode
+  // costs 3x a 720p one and is the single biggest item on a weak laptop.
   int capW = 1920, capH = 1080;
   std::string preferredCamera;  // bus info or path
   Settings settings;            // global settings (used when sameForAll, and as the template for new cameras)
@@ -196,12 +200,33 @@ private:
   CameraInfo current_;
   bool running_ = false;
   double fps_ = 0;
-  double procMs_ = 0;   // EMA of per-frame processing time
+  double procMs_ = 0;   // EMA of the whole per-frame cost: decode + effects + output conversion/write
+  int tier_ = 0;        // adaptive quality tier (0 = full, 2 = cheapest), see updateTier()
+  double overSince_ = -1, underSince_ = -1;
   std::string error_, loopPath_, pwStatus_ = "off", gesture_, profileLine_;
   bool forcePreview_ = false;  // keep running even without consumers (debug)
   bool hideRawActive_ = false;
   std::string runtimeDir_;
   int misses_ = 0;      // consecutive grab timeouts
+  cv::Size capOpened_;  // size the current capture was asked for (reopen when the wanted size changes)
+  cv::Size capActual_;  // what the device actually delivers (shown in the state)
+  cv::Mat yuyv_;        // output frame converted once for both writers
+
+  // Capture thread: grab + decode run off the processing thread into a
+  // depth-1 "latest frame" slot (drop-oldest), so the decode overlaps with
+  // the effects on any >=2-core machine. Latency is unchanged (no queue).
+  std::thread capThread_;
+  std::atomic<bool> capStop_{false};
+  std::mutex slotMu_;
+  std::condition_variable slotCv_;
+  cv::Mat slotFrame_;
+  double slotDecodeMs_ = 0;
+  bool slotHas_ = false;
+  int slotMisses_ = 0;
+  void captureLoop();
+  bool nextFrame(cv::Mat& f, double* decodeMs, int ms);
+  cv::Size wantedCapture();
+  void updateTier(double loopMs, double now);
 
   // Set a client-visible field (main thread) and mark the state dirty if it changed.
   template <class T> void setState(T& field, const T& value) {
@@ -259,6 +284,8 @@ json Daemon::stateJson() {
                { "output", { { "width", cfg_.outW }, { "height", cfg_.outH }, { "fps", cfg_.fps } } },
                { "fps", (int)std::lround(fps_) },
                { "procMs", (int)std::lround(procMs_) },
+               { "tier", tier_ },
+               { "capture", { { "width", capActual_.width }, { "height", capActual_.height } } },
                { "settings", settingsToJson(effectiveSettings()) },
                { "sameForAll", cfg_.sameForAll },
                { "models", fx_.modelStatus() },
@@ -289,27 +316,98 @@ CameraInfo Daemon::pickCamera() {
   return cameras_.empty() ? CameraInfo{} : cameras_[0];
 }
 
+cv::Size Daemon::wantedCapture() {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (effectiveSettings().centerStage) return cv::Size(cfg_.capW, cfg_.capH);
+  return cv::Size(std::min(cfg_.capW, cfg_.outW), std::min(cfg_.capH, cfg_.outH));
+}
+
 bool Daemon::openCapture(std::string* err) {
   std::string pref;
   { std::lock_guard<std::mutex> lk(mu_); pref = cfg_.preferredCamera; }
+  cv::Size want = wantedCapture();
   if (!pref.empty() && pref[0] == '/' && pref.rfind("/dev/", 0) != 0 && fileExists(pref)) {
     if (!file_.open(pref, cfg_.fps, err)) return false;
     useFile_ = true;
     std::lock_guard<std::mutex> lk(mu_);
     current_ = CameraInfo{ pref, "File: " + pref.substr(pref.rfind('/') + 1), pref, "" };
-    return true;
+    capOpened_ = want; capActual_ = cv::Size(file_.width(), file_.height());
+  } else {
+    useFile_ = false;
+    CameraInfo c = pickCamera();
+    if (c.path.empty()) { *err = "no camera found"; return false; }
+    if (!cap_.open(c.path, want.width, want.height, cfg_.fps, err)) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    current_ = c; capOpened_ = want; capActual_ = cv::Size(cap_.width(), cap_.height());
   }
-  useFile_ = false;
-  CameraInfo c = pickCamera();
-  if (c.path.empty()) { *err = "no camera found"; return false; }
-  if (!cap_.open(c.path, cfg_.capW, cfg_.capH, cfg_.fps, err)) return false;
-  std::lock_guard<std::mutex> lk(mu_);
-  current_ = c;
+  { std::lock_guard<std::mutex> lk(slotMu_); slotHas_ = false; slotMisses_ = 0; }
+  capStop_ = false;
+  capThread_ = std::thread([this] { captureLoop(); });
   return true;
 }
 bool Daemon::captureOpen() const { return useFile_ ? file_.isOpen() : cap_.isOpen(); }
-void Daemon::captureClose() { cap_.close(); file_.close(); std::lock_guard<std::mutex> lk(mu_); current_ = CameraInfo{}; }
+void Daemon::captureClose() {
+  capStop_ = true;
+  if (capThread_.joinable()) capThread_.join();
+  cap_.close(); file_.close();
+  std::lock_guard<std::mutex> lk(mu_);
+  current_ = CameraInfo{};
+  capOpened_ = capActual_ = cv::Size();
+}
 bool Daemon::captureGrab(cv::Mat& f, int ms) { return useFile_ ? file_.grab(f, ms) : cap_.grab(f, ms); }
+
+// Capture thread body. `f` is reused as the decode target; swapping it with
+// the slot means the three buffers (capture, slot, processing) rotate without
+// per-frame allocation, and an unconsumed frame is simply overwritten.
+void Daemon::captureLoop() {
+  cv::Mat f;
+  while (!capStop_) {
+    bool ok = captureGrab(f, 200);
+    std::lock_guard<std::mutex> lk(slotMu_);
+    if (ok) {
+      std::swap(f, slotFrame_);
+      slotDecodeMs_ = useFile_ ? file_.decodeMs() : cap_.decodeMs();
+      slotHas_ = true;
+      slotMisses_ = 0;
+    } else {
+      slotMisses_++;
+    }
+    slotCv_.notify_one();
+  }
+}
+
+// Processing side: waits up to `ms` for a fresh frame (false on timeout or a
+// grab error, which the caller counts as a miss).
+bool Daemon::nextFrame(cv::Mat& f, double* decodeMs, int ms) {
+  std::unique_lock<std::mutex> lk(slotMu_);
+  slotCv_.wait_for(lk, std::chrono::milliseconds(ms), [&] { return slotHas_ || slotMisses_ > 0; });
+  if (slotHas_) {
+    std::swap(f, slotFrame_);
+    slotHas_ = false;
+    *decodeMs = slotDecodeMs_;
+    return true;
+  }
+  if (slotMisses_ > 0) slotMisses_--;
+  return false;
+}
+
+// Adaptive quality. The whole per-frame cost (decode + effects + output) is
+// tracked as an EMA against a budget of 80% of the frame period; sustained
+// overrun (~2 s) raises the tier, sustained headroom (<50% of the budget for
+// ~10 s) lowers it again. Tiers only cheapen the effects (see effects.cpp:
+// segmenter every 2nd/3rd frame, slower gesture/face cadence, single blur
+// pass, portrait at 1/8); passthrough is unaffected.
+void Daemon::updateTier(double loopMs, double now) {
+  double budget = 0.8 * 1000.0 / std::max(1, cfg_.fps);
+  double ema;
+  { std::lock_guard<std::mutex> lk(mu_); procMs_ = procMs_ == 0 ? loopMs : procMs_ * 0.9 + loopMs * 0.1; ema = procMs_; }
+  int t = tier_;
+  if (ema > budget) { if (overSince_ < 0) overSince_ = now; else if (now - overSince_ > 2.0 && t < 2) { t++; overSince_ = -1; } }
+  else overSince_ = -1;
+  if (ema < 0.5 * budget) { if (underSince_ < 0) underSince_ = now; else if (now - underSince_ > 10.0 && t > 0) { t--; underSince_ = -1; } }
+  else underSince_ = -1;
+  if (t != tier_) { fx_.setTier(t); setState(tier_, t); fprintf(stderr, "camfxd: quality tier %d (%.1f ms/frame, budget %.1f)\n", t, ema, budget); }
+}
 
 // Runs on the server thread. Requests come from same-uid clients but may be
 // malformed: every field is type-checked and nothing here may throw.
@@ -375,6 +473,11 @@ int Daemon::run() {
   // The shell owns us: exit with it rather than linger as an orphan the next
   // shell cannot manage (it also asks a stray instance to quit, belt and braces).
   prctl(PR_SET_PDEATHSIG, SIGTERM);
+  // OpenCV's worker threads spin after every parallel region: with one thread
+  // per core the passthrough loop burns 3-4x the CPU time for the same wall
+  // time. Two threads (one on a dual-core) keeps the CPU for the video apps.
+  unsigned hw = std::thread::hardware_concurrency();
+  cv::setNumThreads(hw <= 2 ? 1 : 2);
   runtimeDir_ = xdgRuntime() + "/omarchy-camera";
   std::string err;
   if (!ensureRuntimeDir(runtimeDir_, &err)) { fprintf(stderr, "camfxd: %s\n", err.c_str()); return 1; }
@@ -403,6 +506,7 @@ int Daemon::run() {
   bool wasRunning = false;
   int frames = 0;
   auto fpsT0 = clk::now();
+  cv::Mat frame;  // processing-side frame buffer (rotates with the capture slot)
   fprintf(stderr, "camfxd: ready (socket %s)\n", sockPath.c_str());
 
   while (!g_quit) {
@@ -447,8 +551,9 @@ int Daemon::run() {
     if (running_ != wasRunning) { wasRunning = running_; frames = 0; fpsT0 = now; setState(fps_, 0.0); }
 
     if (running_) {
-      cv::Mat frame, out;
-      if (captureGrab(frame, 200)) {
+      cv::Mat out;
+      double decodeMs = 0;
+      if (nextFrame(frame, &decodeMs, 200)) {
         misses_ = 0;
         Settings s;
         std::string preferred;
@@ -459,18 +564,22 @@ int Daemon::run() {
           CameraInfo c = pickCamera();
           if (useFile_ || fileExists(preferred) || (!c.path.empty() && c.path != current_.path)) { captureClose(); continue; }
         }
+        // Center Stage toggled: the camera is reopened at the size it needs.
+        if (!useFile_ && wantedCapture() != capOpened_) { captureClose(); continue; }
         auto p0 = clk::now();
         // A bad frame or setting must not take the daemon down mid-call: log and skip the frame.
         try {
           fx_.process(frame, out, cv::Size(cfg_.outW, cfg_.outH), nowSec());
-          if (loop_.isOpen()) loop_.write(out);
-          pwOut_.push(out);
+          // One BGR->YUYV conversion feeds both outputs.
+          cv::cvtColor(out, yuyv_, cv::COLOR_BGR2YUV_YUYV);
+          if (loop_.isOpen()) loop_.writeYuyv(yuyv_);
+          pwOut_.pushYuyv(yuyv_);
         } catch (const std::exception& e) {
           fprintf(stderr, "camfxd: frame dropped: %s\n", e.what());
           continue;
         }
-        double ms = std::chrono::duration<double, std::milli>(clk::now() - p0).count();
-        { std::lock_guard<std::mutex> lk(mu_); procMs_ = procMs_ == 0 ? ms : procMs_ * 0.9 + ms * 0.1; }  // shown with the next publish
+        double ms = decodeMs + std::chrono::duration<double, std::milli>(clk::now() - p0).count();
+        updateTier(ms, nowSec());  // also updates procMs_ (shown with the next publish)
         setState(gesture_, fx_.lastGesture());
         setState(profileLine_, fx_.profileLine());
         frames++;

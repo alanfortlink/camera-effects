@@ -7,7 +7,6 @@
 #include <string.h>
 
 #include <cstdio>
-#include <opencv2/imgproc.hpp>
 
 struct PwCallbacks {
   static void process(void* data) { static_cast<PipeWireOutput*>(data)->onProcess(); }
@@ -145,13 +144,12 @@ void PipeWireOutput::onProcess() {
   pw_stream_queue_buffer(stream_, pb);
 }
 
-void PipeWireOutput::push(const cv::Mat& bgr) {
+void PipeWireOutput::pushYuyv(const cv::Mat& yuyv) {
   if (!stream_ || !active_.load()) return;
+  if (yuyv.type() != CV_8UC2 || yuyv.cols != w_ || yuyv.rows != h_) return;
   {
     std::lock_guard<std::mutex> lk(frameMu_);
-    cv::Mat src = bgr;
-    if (src.cols != w_ || src.rows != h_) cv::resize(bgr, src, cv::Size(w_, h_), 0, 0, cv::INTER_AREA);
-    cv::cvtColor(src, yuyv_, cv::COLOR_BGR2YUV_YUYV);
+    yuyv.copyTo(yuyv_);  // reuses the allocation
     haveFrame_ = true;
   }
   // We are the driver: schedule one graph cycle so process() runs now.

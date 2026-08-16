@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <map>
@@ -69,7 +70,28 @@ private:
   void drainPending();
   void spawn(Anim& a, const cv::Size& sz);
   void blit(cv::Mat& frame, const cv::Mat& sprite, double cx, double cy, double size, double alpha, double rot);
-  cv::Mat overlay_, overlayA_;  // procedural drawing layer + alpha, composited once per frame
+  // Procedural drawing layer + 8-bit alpha, composited once per frame over
+  // the union bounding box of what was drawn (dirty_: what to clear next time).
+  cv::Mat overlay_, overlayA_, glowC_, glowA_, tmp_;
+  cv::Rect dirty_;
+};
+
+// Downscale pyramid of one frame (pyrDown chain: ~0.3 ms for 720p and
+// alias-free), built lazily and shared by the segmenter, palm detection, YuNet
+// and the portrait blur so nobody runs its own slow INTER_AREA resize.
+class Pyramid {
+public:
+  void reset(const cv::Mat& base) { base_ = base; built_ = 0; }
+  const cv::Mat& base() const { return base_; }
+  // Level i is base / 2^i (level 0 = base itself).
+  const cv::Mat& level(int i);
+  // Smallest level that is still at least `minW` wide.
+  const cv::Mat& atLeastWide(int minW, int* levelOut = nullptr);
+  static double scaleOf(int level) { return 1.0 / (1 << level); }
+
+private:
+  cv::Mat base_, lv_[4];
+  int built_ = 0;
 };
 
 class EffectPipeline {
@@ -77,11 +99,15 @@ public:
   bool init(const std::string& modelsDir, const std::string& assetsDir, std::string* err);
   void setSettings(const Settings& s);
   Settings settings() const { return settings_; }
-  // Processes a source frame into an output of the given size.
+  // Processes a source frame into an output of the given size. `out` may alias
+  // `src` when nothing needs to be done (passthrough).
   void process(const cv::Mat& src, cv::Mat& out, const cv::Size& outSize, double now);
   // Thread-safe (queued); everything else is main-thread only.
   void triggerReaction(const std::string& name) { reactions_.trigger(name); }
   void setProfile(bool on) { profile_ = on; }
+  // Adaptive quality tier (0 = full quality, 2 = cheapest); see main.cpp.
+  void setTier(int t) { tier_ = std::clamp(t, 0, 2); }
+  int tier() const { return tier_; }
   // Main thread only.
   bool reactionsActive() { return reactions_.active(); }
   std::string lastGesture() const { return gestures_.lastGesture(); }
@@ -96,21 +122,34 @@ private:
   Framer framer_;
   Reactions reactions_;
   std::string modelStatus_;
-  cv::Mat maskSmall_;      // temporal EMA of the 192x192 probability
+  Pyramid pyr_, srcPyr_;
+  cv::Mat work_;           // crop/resize target (reused)
+  cv::Mat maskSmall_;      // temporal EMA of the 192x192 probability (CV_32F)
+  cv::Mat mask8s_, mask8_, mask3_;  // 8-bit person mask: model res, work res, and a 3-channel copy for the blends
+  cv::Mat bg_, bgSmall_, pre_, blurF_;     // portrait/background buffers
+  cv::Mat lit_, dark_, darkFactor_, lut_;  // studio light buffers
+  float darkI_ = -1, lutI_ = -1;
   cv::Mat bgImage_;        // cached background image (scaled to out)
   std::string bgImagePath_;
   cv::Size bgImageSize_;
   std::vector<cv::Rect2f> lastFaces_;
   int frameIdx_ = 0;
+  int tier_ = 0;
   std::atomic<bool> profile_{false};
   std::string profileLine_;
   double profAcc_[8] = {0};
   int profN_ = 0;
   double lastTime_ = 0;
   double lastGestureTime_ = 0;
+  // Time-based cadences (capture fps varies, so nothing counts frames).
+  double lastPalmTime_ = -1e9, lastFaceTime_ = -1e9, lastHandSeen_ = -1e9;
+  bool hadFacesLastPalm_ = false;
+  std::string pendingGesture_;
+  double pendingSince_ = 0;
+  bool debugGestures_ = false;
 
-  void computeMask(const cv::Mat& work, cv::Mat& maskF);
-  void applyBackground(cv::Mat& work, const cv::Mat& maskF);
-  void applyStudioLight(cv::Mat& work, const cv::Mat& maskF);
+  void computeMask(const cv::Mat& work);
+  void applyBackground(cv::Mat& work);
+  void applyStudioLight(cv::Mat& work);
   void ensureBackground(const cv::Size& sz);
 };

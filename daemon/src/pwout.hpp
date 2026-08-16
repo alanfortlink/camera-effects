@@ -22,8 +22,9 @@ public:
   void stop();
   bool started() const { return stream_ != nullptr; }
   bool active() const { return active_.load(); }  // some consumer is linked
-  // Publish a BGR frame (converted to YUY2 and pushed to linked consumers).
-  void push(const cv::Mat& bgr);
+  // Publish a frame already converted to YUY2 (CV_8UC2, w x h); it is copied
+  // for the PipeWire thread and pushed to linked consumers.
+  void pushYuyv(const cv::Mat& yuyv);
   // Forget the last frame (consumers get black until the next push).
   void clear();
 

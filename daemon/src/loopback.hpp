@@ -18,6 +18,9 @@ public:
   void close();
   bool isOpen() const { return fd_ >= 0; }
   bool write(const cv::Mat& bgr);
+  // Same, from an already converted YUYV (CV_8UC2, w x h) frame: main.cpp
+  // converts once and hands the buffer to both outputs.
+  bool writeYuyv(const cv::Mat& yuyv);
   int width() const { return w_; }
   int height() const { return h_; }
   std::string path() const { return path_; }

@@ -71,8 +71,13 @@ bool LoopbackWriter::write(const cv::Mat& bgr) {
   cv::Mat src = bgr;
   if (src.cols != w_ || src.rows != h_) cv::resize(bgr, src, cv::Size(w_, h_), 0, 0, cv::INTER_AREA);
   cv::cvtColor(src, yuyv_, cv::COLOR_BGR2YUV_YUYV);
-  size_t len = yuyv_.total() * yuyv_.elemSize();
-  ssize_t n = ::write(fd_, yuyv_.data, len);
+  return writeYuyv(yuyv_);
+}
+
+bool LoopbackWriter::writeYuyv(const cv::Mat& yuyv) {
+  if (fd_ < 0 || yuyv.type() != CV_8UC2 || yuyv.cols != w_ || yuyv.rows != h_ || !yuyv.isContinuous()) return false;
+  size_t len = yuyv.total() * yuyv.elemSize();
+  ssize_t n = ::write(fd_, yuyv.data, len);
   return n == (ssize_t)len;
 }
 

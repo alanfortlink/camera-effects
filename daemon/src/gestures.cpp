@@ -32,19 +32,19 @@ bool GestureDetector::load(const std::string& dir, std::string* err) {
   return true;
 }
 
-std::vector<Hand> GestureDetector::detect(const cv::Mat& bgr) {
+std::vector<Hand> GestureDetector::detect(const cv::Mat& bgr, const cv::Mat& small) {
   std::vector<Hand> hands;
   if (!loaded()) return hands;
-  // Letterbox to 192x192.
-  float ratio = std::min((float)PALM_IN / bgr.cols, (float)PALM_IN / bgr.rows);
-  int rw = (int)(bgr.cols * ratio), rh = (int)(bgr.rows * ratio);
+  // Letterbox the small copy to 192x192 (INTER_LINEAR from a pyramid level:
+  // the INTER_AREA path from 720p was ~2 ms, more than the model itself).
+  float ratio = std::min((float)PALM_IN / small.cols, (float)PALM_IN / small.rows);
+  int rw = (int)(small.cols * ratio), rh = (int)(small.rows * ratio);
   int padL = (PALM_IN - rw) / 2, padT = (PALM_IN - rh) / 2;
-  cv::Mat resized, rgb;
-  cv::resize(bgr, resized, cv::Size(rw, rh), 0, 0, cv::INTER_AREA);
-  cv::copyMakeBorder(resized, resized, padT, PALM_IN - rh - padT, padL, PALM_IN - rw - padL, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-  cv::cvtColor(resized, rgb, cv::COLOR_BGR2RGB);
+  cv::resize(small, resized_, cv::Size(rw, rh), 0, 0, cv::INTER_LINEAR);
+  cv::copyMakeBorder(resized_, resized_, padT, PALM_IN - rh - padT, padL, PALM_IN - rw - padL, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+  cv::cvtColor(resized_, rgb_, cv::COLOR_BGR2RGB);
   in_.resize(PALM_IN * PALM_IN * 3);
-  const uchar* p = rgb.ptr<uchar>();
+  const uchar* p = rgb_.ptr<uchar>();
   for (int i = 0; i < PALM_IN * PALM_IN * 3; i++) in_[i] = p[i] / 255.0f;
   auto out = palm_.run(in_.data(), { 1, PALM_IN, PALM_IN, 3 });
   if (out.size() < 2) return hands;
@@ -56,8 +56,10 @@ std::vector<Hand> GestureDetector::detect(const cv::Mat& bgr) {
     else if (sh.back() == 1) sc = o.GetTensorData<float>();
   }
   if (!reg || !sc) return hands;
-  const float scale = (float)std::max(bgr.cols, bgr.rows);
-  const float biasX = padL / ratio, biasY = padT / ratio;
+  // Palm coordinates come out in `small` space; scale them into `bgr` space.
+  const float up = (float)bgr.cols / small.cols;
+  const float scale = (float)std::max(small.cols, small.rows) * up;
+  const float biasX = padL / ratio * up, biasY = padT / ratio * up;
   std::vector<cv::Rect2d> boxes;
   std::vector<float> scores;
   std::vector<std::vector<float>> palms;  // x1,y1,x2,y2, 7x(x,y), score

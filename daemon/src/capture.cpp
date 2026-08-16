@@ -214,10 +214,10 @@ bool V4L2Capture::decode(const unsigned char* data, size_t len, cv::Mat& bgr) {
   switch (pixfmt_) {
     case V4L2_PIX_FMT_MJPEG: {
       cv::Mat buf(1, (int)len, CV_8UC1, const_cast<unsigned char*>(data));
-      cv::Mat img = cv::imdecode(buf, cv::IMREAD_COLOR);
-      if (img.empty()) return false;
-      bgr = img;
-      return true;
+      // Decode into the caller's Mat: reused across frames instead of a fresh
+      // multi-MB allocation per frame.
+      cv::Mat img = cv::imdecode(buf, cv::IMREAD_COLOR, &bgr);
+      return !img.empty();
     }
     case V4L2_PIX_FMT_YUYV: {
       if (len < size_t(width_ * height_ * 2)) return false;
@@ -250,9 +250,11 @@ bool V4L2Capture::grab(cv::Mat& bgr, int timeoutMs) {
   b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; b.memory = V4L2_MEMORY_MMAP;
   if (xioctl(fd_, VIDIOC_DQBUF, &b) < 0) return false;
   bool ok = false;
+  auto t0 = std::chrono::steady_clock::now();
   if (!(b.flags & V4L2_BUF_FLAG_ERROR) && b.bytesused > 0)
     ok = decode((const unsigned char*)bufs_[b.index].start, b.bytesused, bgr);
   xioctl(fd_, VIDIOC_QBUF, &b);
+  decodeMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   return ok;
 }
 
@@ -291,10 +293,12 @@ bool FileCapture::grab(cv::Mat& bgr, int) {
   double now = monoNow();
   if (now < next_) std::this_thread::sleep_for(std::chrono::duration<double>(next_ - now));
   next_ = std::max(next_ + period_, monoNow() - period_);
-  if (!impl_->still.empty()) { bgr = impl_->still.clone(); return true; }
+  double t0 = monoNow();
+  if (!impl_->still.empty()) { impl_->still.copyTo(bgr); decodeMs_ = 0; return true; }
   if (!impl_->cap.read(bgr) || bgr.empty()) {
     impl_->cap.set(cv::CAP_PROP_POS_FRAMES, 0);
     if (!impl_->cap.read(bgr) || bgr.empty()) return false;
   }
+  decodeMs_ = (monoNow() - t0) * 1000;
   return true;
 }

@@ -85,9 +85,17 @@ omarchy-shell tank.camera toggle    # open/close the panel (bind it to a key)
 
 ## Notes / limits
 
-- Output is 1280x720 @ 30 (`~/.config/omarchy/camera.json` → `output`), source
-  captured at 1920x1080 MJPEG when possible so Center Stage can zoom without
+- Output is 1280x720 @ 30 (`~/.config/omarchy/camera.json` → `output`). The
+  source is captured at the output size (720p MJPEG) and switched to `capture`
+  (1920x1080 by default) only while Center Stage is on, so it can zoom without
   upscaling.
+- Performance: the daemon is tuned for weak dual-core laptops (2 OpenCV threads,
+  one shared 2-thread ONNX Runtime pool, 8-bit compositing, downscale pyramid
+  shared by all detectors, decode on its own thread). It measures the whole
+  per-frame cost against 80% of the frame period and steps through three
+  quality tiers (`tier` in `status`: 0 = full; 1 = segmentation every 2nd frame,
+  slower gesture/face cadence, single blur pass; 2 = every 3rd frame, portrait
+  at 1/8 scale) with hysteresis; `procMs` in `status` is that per-frame cost.
 - Chromium/Electron/Zoom read cameras through V4L2 (the loopback); the PipeWire
   node matters only for portal-based apps and for the "hide raw" mode.
 - Gesture triggers: hold the gesture ~0.7 s away from your face; 4 s cooldown.

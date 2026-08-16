@@ -183,33 +183,92 @@ void Reactions::blit(cv::Mat& frame, const cv::Mat& sprite, double cx, double cy
   }
 }
 
+namespace {
+// 8-bit alpha blend of two 3-channel images with a 3-channel mask (all the
+// same size and continuous): out = (a*m + b*(255-m)) / 255. Plain elementwise
+// loop so the compiler vectorises it; parallel_for_ splits it over OpenCV's
+// (two) worker threads. This replaces cv::blendLinear + the F32 mask copies.
+void blend8(const cv::Mat& a, const cv::Mat& b, const cv::Mat& m3, cv::Mat& out) {
+  CV_Assert(a.size() == b.size() && a.size() == m3.size() && a.type() == CV_8UC3 && b.type() == CV_8UC3 && m3.type() == CV_8UC3);
+  out.create(a.size(), CV_8UC3);
+  const int n = a.cols * 3;
+  cv::parallel_for_(cv::Range(0, a.rows), [&](const cv::Range& r) {
+    for (int y = r.start; y < r.end; y++) {
+      const uchar* pa = a.ptr<uchar>(y);
+      const uchar* pb = b.ptr<uchar>(y);
+      const uchar* pm = m3.ptr<uchar>(y);
+      uchar* pd = out.ptr<uchar>(y);
+      for (int i = 0; i < n; i++) {
+        unsigned v = pa[i] * pm[i] + pb[i] * (255 - pm[i]) + 128;
+        pd[i] = (uchar)((v + (v >> 8)) >> 8);  // exact v/255 for v < 65536
+      }
+    }
+  });
+}
+// Same, but with a single-channel mask, over a ROI (used by the reactions overlay).
+void blend8Roi(cv::Mat& frame, const cv::Mat& layer, const cv::Mat& alpha, const cv::Rect& roi) {
+  cv::parallel_for_(cv::Range(roi.y, roi.y + roi.height), [&](const cv::Range& r) {
+    for (int y = r.start; y < r.end; y++) {
+      uchar* pd = frame.ptr<uchar>(y) + roi.x * 3;
+      const uchar* pl = layer.ptr<uchar>(y) + roi.x * 3;
+      const uchar* pm = alpha.ptr<uchar>(y) + roi.x;
+      for (int x = 0; x < roi.width; x++) {
+        unsigned m = pm[x];
+        if (!m) continue;
+        unsigned im = 255 - m;
+        for (int c = 0; c < 3; c++) {
+          unsigned v = pl[x * 3 + c] * m + pd[x * 3 + c] * im + 128;
+          pd[x * 3 + c] = (uchar)((v + (v >> 8)) >> 8);
+        }
+      }
+    }
+  });
+}
+}  // namespace
+
 void Reactions::render(cv::Mat& frame, double now) {
   const double DUR = 3.6;
   const double W = frame.cols, H = frame.rows;
+  const cv::Rect frameRect(0, 0, frame.cols, frame.rows);
   // Procedural effects draw into an overlay + alpha layer, composited once so
-  // shapes get real transparency (and a cheap glow where it helps).
+  // shapes get real transparency (and a cheap glow where it helps). Only the
+  // union bounding box of what was drawn is cleared and blended.
   bool usedOverlay = false;
   bool glow = false;
+  cv::Rect bbox;
   auto ensureOverlay = [&]() {
     if (usedOverlay) return;
-    overlay_.create(frame.size(), CV_8UC3); overlay_.setTo(cv::Scalar(0, 0, 0));
-    overlayA_.create(frame.size(), CV_32F); overlayA_.setTo(0.0f);
+    if (overlay_.size() != frame.size()) {
+      overlay_.create(frame.size(), CV_8UC3); overlay_.setTo(cv::Scalar(0, 0, 0));
+      overlayA_.create(frame.size(), CV_8UC1); overlayA_.setTo(0);
+    } else if (!dirty_.empty()) {  // clear only what the previous frame drew
+      overlay_(dirty_).setTo(cv::Scalar(0, 0, 0));
+      overlayA_(dirty_).setTo(0);
+    }
+    dirty_ = cv::Rect();
     usedOverlay = true;
   };
+  auto grow = [&](cv::Rect r) { r &= frameRect; bbox = bbox.empty() ? r : (bbox | r); };
   auto poly = [&](const cv::Point* pts, int n, cv::Scalar col, double a) {
     ensureOverlay();
     cv::fillConvexPoly(overlay_, pts, n, col, cv::LINE_AA);
-    cv::fillConvexPoly(overlayA_, pts, n, cv::Scalar(a), cv::LINE_AA);
+    cv::fillConvexPoly(overlayA_, pts, n, cv::Scalar(a * 255), cv::LINE_AA);
+    cv::Rect r = cv::boundingRect(std::vector<cv::Point>(pts, pts + n));
+    grow(cv::Rect(r.x - 2, r.y - 2, r.width + 4, r.height + 4));
   };
   auto line = [&](cv::Point2f p0, cv::Point2f p1, cv::Scalar col, double a, int th) {
     ensureOverlay();
     cv::line(overlay_, p0, p1, col, th, cv::LINE_AA);
-    cv::line(overlayA_, p0, p1, cv::Scalar(a), th, cv::LINE_AA);
+    cv::line(overlayA_, p0, p1, cv::Scalar(a * 255), th, cv::LINE_AA);
+    int x0 = (int)std::floor(std::min(p0.x, p1.x)) - th - 2, y0 = (int)std::floor(std::min(p0.y, p1.y)) - th - 2;
+    int x1 = (int)std::ceil(std::max(p0.x, p1.x)) + th + 2, y1 = (int)std::ceil(std::max(p0.y, p1.y)) + th + 2;
+    grow(cv::Rect(x0, y0, x1 - x0, y1 - y0));
   };
   auto dot = [&](cv::Point2f c, int r, cv::Scalar col, double a) {
     ensureOverlay();
     cv::circle(overlay_, c, r, col, -1, cv::LINE_AA);
-    cv::circle(overlayA_, c, r, cv::Scalar(a), -1, cv::LINE_AA);
+    cv::circle(overlayA_, c, r, cv::Scalar(a * 255), -1, cv::LINE_AA);
+    grow(cv::Rect((int)c.x - r - 2, (int)c.y - r - 2, 2 * r + 5, 2 * r + 5));
   };
 
   drainPending();
@@ -290,29 +349,52 @@ void Reactions::render(cv::Mat& frame, double now) {
         }
       }
     }
-    if (a.name == "rain") {  // cool, darker cast while it rains
+    if (a.name == "rain") {  // cool, darker cast while it rains: in place, no tint frame
       double k = 0.35 * fadeAll * smooth(t / 0.4);
-      cv::Mat tint(frame.size(), CV_8UC3, cv::Scalar(90, 60, 30));
-      cv::addWeighted(frame, 1 - k, tint, k, 0, frame);
+      frame.convertTo(frame, -1, 1 - k, 0);
+      cv::add(frame, cv::Scalar(90, 60, 30) * k, frame);
     }
   }
-  if (usedOverlay) {
-    if (glow) {  // soft halo: blurred copy added under the crisp layer
-      cv::Mat gA, gC;
+  if (usedOverlay && !bbox.empty()) {
+    if (glow) {  // soft halo: blurred copy (at half resolution) added under the crisp layer
       int k = std::max(3, (int)(H * 0.02) | 1);
-      cv::GaussianBlur(overlayA_, gA, cv::Size(k, k), 0);
-      cv::GaussianBlur(overlay_, gC, cv::Size(k, k), 0);
-      cv::Mat inv = 1.0f - gA * 0.7f;
-      cv::Mat tmp;
-      cv::blendLinear(frame, gC, inv, gA * 0.7f, tmp);
-      frame = tmp;
+      cv::Rect gr(bbox.x - k, bbox.y - k, bbox.width + 2 * k, bbox.height + 2 * k);
+      gr &= frameRect;
+      cv::Size half((gr.width + 1) / 2, (gr.height + 1) / 2);
+      cv::resize(overlay_(gr), glowC_, half, 0, 0, cv::INTER_LINEAR);
+      cv::resize(overlayA_(gr), glowA_, half, 0, 0, cv::INTER_LINEAR);
+      int kh = std::max(3, (k / 2) | 1);
+      cv::GaussianBlur(glowC_, glowC_, cv::Size(kh, kh), 0);
+      cv::GaussianBlur(glowA_, glowA_, cv::Size(kh, kh), 0);
+      glowA_.convertTo(glowA_, -1, 0.7);
+      cv::Mat gc, ga;  // upsampled halo, blended over the ROI only
+      cv::resize(glowC_, gc, gr.size(), 0, 0, cv::INTER_LINEAR);
+      cv::resize(glowA_, ga, gr.size(), 0, 0, cv::INTER_LINEAR);
+      cv::Mat roi = frame(gr);
+      blend8Roi(roi, gc, ga, cv::Rect(0, 0, gr.width, gr.height));
+      bbox = gr;
     }
-    cv::Mat inv = 1.0f - overlayA_;
-    cv::Mat out;
-    cv::blendLinear(frame, overlay_, inv, overlayA_, out);
-    frame = out;
+    blend8Roi(frame, overlay_, overlayA_, bbox);
+    dirty_ = bbox;
   }
   anims_.erase(std::remove_if(anims_.begin(), anims_.end(), [&](const Anim& a) { return a.start >= 0 && now - a.start > DUR; }), anims_.end());
+}
+
+// ---------------------------------------------------------------------------
+// Pyramid
+
+const cv::Mat& Pyramid::level(int i) {
+  if (i <= 0) return base_;
+  i = std::min(i, 4);
+  for (; built_ < i; built_++) cv::pyrDown(built_ == 0 ? base_ : lv_[built_ - 1], lv_[built_]);
+  return lv_[i - 1];
+}
+
+const cv::Mat& Pyramid::atLeastWide(int minW, int* levelOut) {
+  int i = 0;
+  while (i < 4 && (base_.cols >> (i + 1)) >= minW) i++;
+  if (levelOut) *levelOut = i;
+  return level(i);
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +408,7 @@ bool EffectPipeline::init(const std::string& modelsDir, const std::string& asset
   if (!gestures_.load(modelsDir, &e)) status += "gestures: " + e + "; ";
   if (!reactions_.loadAssets(assetsDir, &e)) status += "assets: " + e + "; ";
   modelStatus_ = status.empty() ? "ok" : status;
+  debugGestures_ = getenv("CAMFX_DEBUG") != nullptr;
   if (err) *err = status;
   return segmenter_.loaded();  // the rest degrade gracefully
 }
@@ -362,107 +445,143 @@ void EffectPipeline::ensureBackground(const cv::Size& sz) {
   }
 }
 
-void EffectPipeline::computeMask(const cv::Mat& work, cv::Mat& maskF) {
+// Person mask for this frame. Everything after the model runs on 8-bit data:
+// the mask is smoothed and feathered at model resolution (192x192), upsampled
+// once with INTER_LINEAR, and kept as 3-channel fg/bg weights (mask3_/inv3_)
+// so the blends below are single elementwise passes.
+void EffectPipeline::computeMask(const cv::Mat& work) {
+  // Segmenter cadence by tier: every frame / every 2nd / every 3rd; the
+  // temporal EMA (maskSmall_) is reused in between (the mask barely moves).
+  int every = tier_ == 0 ? 1 : (tier_ == 1 ? 2 : 3);
+  bool haveOld = !maskSmall_.empty() && !mask8_.empty() && mask8_.size() == work.size();
+  if (haveOld && frameIdx_ % every != 0) return;
   cv::Mat prob;
-  if (!segmenter_.infer(work, prob)) { maskF = cv::Mat(work.size(), CV_32F, cv::Scalar(1)); return; }
+  if (!segmenter_.infer(pyr_.atLeastWide(192), prob)) {
+    mask3_ = cv::Mat(work.size(), CV_8UC3, cv::Scalar::all(255));
+    mask8_ = cv::Mat(work.size(), CV_8UC1, cv::Scalar::all(255));
+    return;
+  }
   // Temporal smoothing at model resolution.
   if (maskSmall_.empty() || maskSmall_.size() != prob.size()) maskSmall_ = prob.clone();
   else cv::addWeighted(prob, 0.55, maskSmall_, 0.45, 0, maskSmall_);
   // Push uncertain probabilities towards 0/1 (smoothstep between 0.25 and
-  // 0.75) so clothing with mid confidence doesn't turn milky, then upsample
-  // and feather the edge.
+  // 0.75) so clothing with mid confidence doesn't turn milky, then feather
+  // (blur at 192x192 instead of at 720p: 10x cheaper, same look after the
+  // bilinear upsample) and go 8-bit.
   cv::Mat m = (maskSmall_ - 0.25f) * (1.0f / 0.5f);
   cv::min(cv::max(m, 0.0f), 1.0f, m);
   m = m.mul(m).mul(3.0f - 2.0f * m);
-  cv::resize(m, maskF, work.size(), 0, 0, cv::INTER_LINEAR);
-  int k = std::max(3, (work.rows / 90) | 1);
-  cv::GaussianBlur(maskF, maskF, cv::Size(k, k), 0);
+  m.convertTo(mask8s_, CV_8UC1, 255.0);
+  cv::GaussianBlur(mask8s_, mask8s_, cv::Size(3, 3), 0);
+  cv::resize(mask8s_, mask8_, work.size(), 0, 0, cv::INTER_LINEAR);
+  cv::cvtColor(mask8_, mask3_, cv::COLOR_GRAY2BGR);  // 3-channel so the blends are plain elementwise loops
 }
 
-void EffectPipeline::applyBackground(cv::Mat& work, const cv::Mat& maskF) {
+void EffectPipeline::applyBackground(cv::Mat& work) {
   cv::Mat bg;
   if (settings_.background == "image" || settings_.background == "color") {
     ensureBackground(work.size());
     bg = bgImage_;
   } else if (settings_.portrait) {
-    // Masked blur at quarter resolution: the foreground is excluded from the
-    // blur so its colours don't halo into the background.
-    cv::Mat small, msmall, inv;
-    cv::resize(work, small, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
-    cv::resize(maskF, msmall, small.size(), 0, 0, cv::INTER_AREA);
-    inv = 1.0f - msmall;
-    cv::Mat smallF;
-    small.convertTo(smallF, CV_32FC3);
-    cv::Mat inv3;
-    cv::merge(std::vector<cv::Mat>{ inv, inv, inv }, inv3);
-    cv::Mat num = smallF.mul(inv3), den;
-    int k = std::max(3, (int)(small.rows * (0.04 + 0.12 * settings_.portraitIntensity)) | 1);
-    cv::GaussianBlur(num, num, cv::Size(k, k), 0);
-    cv::GaussianBlur(inv, den, cv::Size(k, k), 0);
-    den = cv::max(den, 0.02f);
-    cv::Mat den3;
-    cv::merge(std::vector<cv::Mat>{ den, den, den }, den3);
-    cv::Mat blurred = num / den3;
-    // second pass for a creamier bokeh at high intensity
-    if (settings_.portraitIntensity > 0.5f) cv::GaussianBlur(blurred, blurred, cv::Size(k, k), 0);
-    blurred.convertTo(blurred, CV_8UC3);
-    cv::resize(blurred, bg, work.size(), 0, 0, cv::INTER_LINEAR);
+    // Portrait blur: a fixed small kernel at a working scale that shrinks with
+    // intensity (1/4 -> 1/8 of the frame), so the cost is constant and the
+    // blur radius grows with the setting. The foreground is excluded via a
+    // premultiplied 4-channel blur (BGR*inv, inv), which keeps subject colours
+    // from haloing into the background; one small F32 buffer, no merge/split.
+    float I = settings_.portraitIntensity;
+    double scale = 0.25 / (1.0 + I);
+    if (tier_ >= 2) scale = 0.125;  // cheapest tier: always 1/8
+    cv::Size ss(std::max(16, (int)std::lround(work.cols * scale)), std::max(9, (int)std::lround(work.rows * scale)));
+    const cv::Mat& lvl = pyr_.atLeastWide(ss.width);
+    cv::resize(lvl, bgSmall_, ss, 0, 0, cv::INTER_LINEAR);
+    cv::Mat msmall;
+    cv::resize(mask8_, msmall, ss, 0, 0, cv::INTER_AREA);
+    pre_.create(ss, CV_32FC4);
+    for (int y = 0; y < ss.height; y++) {
+      const uchar* p = bgSmall_.ptr<uchar>(y);
+      const uchar* pm = msmall.ptr<uchar>(y);
+      float* d = pre_.ptr<float>(y);
+      for (int x = 0; x < ss.width; x++) {
+        float inv = (255 - pm[x]) * (1.0f / 255);
+        d[x * 4 + 0] = p[x * 3 + 0] * inv; d[x * 4 + 1] = p[x * 3 + 1] * inv; d[x * 4 + 2] = p[x * 3 + 2] * inv; d[x * 4 + 3] = inv;
+      }
+    }
+    const int k = 9;
+    cv::GaussianBlur(pre_, blurF_, cv::Size(k, k), 0);
+    // second pass for a creamier bokeh at high intensity (skipped on the low tiers)
+    if (I > 0.5f && tier_ == 0) cv::GaussianBlur(blurF_, blurF_, cv::Size(k, k), 0);
+    for (int y = 0; y < ss.height; y++) {
+      const float* s = blurF_.ptr<float>(y);
+      uchar* d = bgSmall_.ptr<uchar>(y);
+      for (int x = 0; x < ss.width; x++) {
+        float den = std::max(s[x * 4 + 3], 0.02f), r = 1.0f / den;
+        d[x * 3 + 0] = cv::saturate_cast<uchar>(s[x * 4 + 0] * r);
+        d[x * 3 + 1] = cv::saturate_cast<uchar>(s[x * 4 + 1] * r);
+        d[x * 3 + 2] = cv::saturate_cast<uchar>(s[x * 4 + 2] * r);
+      }
+    }
+    cv::resize(bgSmall_, bg_, work.size(), 0, 0, cv::INTER_LINEAR);
+    bg = bg_;
   } else {
     return;
   }
-  cv::Mat inv = 1.0f - maskF;
-  cv::Mat out;
-  cv::blendLinear(work, bg, maskF, inv, out);
-  work = out;
+  blend8(work, bg, mask3_, work_);
+  work = work_;
 }
 
-void EffectPipeline::applyStudioLight(cv::Mat& work, const cv::Mat& maskF) {
+// Studio Light. Foreground: lift the midtones with a soft gamma and a touch of
+// warmth (key light) via one 3-channel LUT; background: darken with a vignette
+// (a cached 8-bit factor plane, rebuilt only when the size or intensity
+// changes). Composited with the 8-bit mask in one elementwise pass.
+void EffectPipeline::applyStudioLight(cv::Mat& work) {
   float I = settings_.studioLightIntensity;
-  // Foreground: lift the midtones with a soft gamma and a touch of warmth
-  // (key light); background: darken with a vignette so the subject pops.
-  static cv::Mat lutB, lutG, lutR;
-  static float lutI = -1;
-  if (lutI != I) {
-    lutB.create(1, 256, CV_8UC1); lutG.create(1, 256, CV_8UC1); lutR.create(1, 256, CV_8UC1);
+  if (lutI_ != I) {
+    lut_.create(1, 256, CV_8UC3);
     float g = 1.0f - 0.32f * I;
     for (int i = 0; i < 256; i++) {
       double v = 255.0 * std::pow(i / 255.0, g);
-      lutB.at<uchar>(i) = (uchar)std::min(255.0, v * (1.0 - 0.04 * I));
-      lutG.at<uchar>(i) = (uchar)std::min(255.0, v);
-      lutR.at<uchar>(i) = (uchar)std::min(255.0, v * (1.0 + 0.05 * I));
+      uchar* e = lut_.ptr<uchar>(0) + i * 3;
+      e[0] = (uchar)std::min(255.0, v * (1.0 - 0.04 * I));
+      e[1] = (uchar)std::min(255.0, v);
+      e[2] = (uchar)std::min(255.0, v * (1.0 + 0.05 * I));
     }
-    lutI = I;
+    lutI_ = I;
   }
-  static cv::Mat vignette;  // CV_32F, 1 in the middle, ~0.45 in the corners
-  if (vignette.empty() || vignette.size() != work.size()) {
-    vignette.create(work.size(), CV_32F);
+  if (darkFactor_.size() != work.size() || darkI_ != I) {
+    // dark = flat dim blended with a vignette (1 in the middle, ~0.45 in the corners) by intensity
+    darkFactor_.create(work.size(), CV_8UC3);
     float cx = work.cols / 2.f, cy = work.rows / 2.f, rmax = std::sqrt(cx * cx + cy * cy);
+    float dim = 1.0f - 0.5f * I;
     for (int y = 0; y < work.rows; y++) {
-      float* row = vignette.ptr<float>(y);
+      uchar* row = darkFactor_.ptr<uchar>(y);
       for (int x = 0; x < work.cols; x++) {
         float d = std::sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy)) / rmax;
-        row[x] = 1.0f - 0.55f * d * d;
+        float vig = 1.0f - 0.55f * d * d;
+        uchar f = cv::saturate_cast<uchar>(255.0f * dim * (1.0f - (1.0f - vig) * I));
+        row[x * 3] = row[x * 3 + 1] = row[x * 3 + 2] = f;
       }
     }
+    darkI_ = I;
   }
-  std::vector<cv::Mat> ch(3);
-  cv::split(work, ch);
-  cv::LUT(ch[0], lutB, ch[0]); cv::LUT(ch[1], lutG, ch[1]); cv::LUT(ch[2], lutR, ch[2]);
-  cv::Mat lit;
-  cv::merge(ch, lit);
-  // Background darkening = flat dim blended with the vignette by intensity.
-  cv::Mat dimF;
-  work.convertTo(dimF, CV_32FC3, 1.0 - 0.5 * I);
-  cv::Mat vig3;
-  cv::Mat v = 1.0f - (1.0f - vignette) * I;
-  cv::merge(std::vector<cv::Mat>{ v, v, v }, vig3);
-  dimF = dimF.mul(vig3);
-  cv::Mat dark;
-  dimF.convertTo(dark, CV_8UC3);
-  cv::Mat inv = 1.0f - maskF;
-  cv::Mat out;
-  cv::blendLinear(lit, dark, maskF, inv, out);
-  work = out;
+  cv::LUT(work, lut_, lit_);
+  // out = lit*m + (work*dark/255)*(255-m), all 8-bit, one pass.
+  work_.create(work.size(), CV_8UC3);
+  const int n = work.cols * 3;
+  cv::parallel_for_(cv::Range(0, work.rows), [&](const cv::Range& r) {
+    for (int y = r.start; y < r.end; y++) {
+      const uchar* pw = work.ptr<uchar>(y);
+      const uchar* pl = lit_.ptr<uchar>(y);
+      const uchar* pf = darkFactor_.ptr<uchar>(y);
+      const uchar* pm = mask3_.ptr<uchar>(y);
+      uchar* pd = work_.ptr<uchar>(y);
+      for (int i = 0; i < n; i++) {
+        unsigned dk = pw[i] * pf[i] + 128; dk = (dk + (dk >> 8)) >> 8;
+        unsigned v = pl[i] * pm[i] + dk * (255 - pm[i]) + 128;
+        pd[i] = (uchar)((v + (v >> 8)) >> 8);
+      }
+    }
+  });
+  work = work_;
 }
 
 void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& outSize, double now) {
@@ -473,54 +592,89 @@ void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& o
   lastTime_ = now;
   frameIdx_++;
   double outAspect = (double)outSize.width / outSize.height;
+  const bool handRecent = now - lastHandSeen_ < 2.0;
 
-  bool needFaces = settings_.centerStage || settings_.reactions;
+  // Cadences (Hz, by tier). Palm detection idles at ~5 Hz until a hand shows
+  // up, then 10 Hz while one is around; YuNet runs only for Center Stage, or
+  // for the hand-on-face check when a palm was found.
+  const double palmHz = tier_ == 0 ? (handRecent ? 10 : 5) : (tier_ == 1 ? (handRecent ? 6 : 3) : (handRecent ? 4 : 2));
+  const double faceHz = tier_ == 0 ? 10 : (tier_ == 1 ? 6 : 3);
+
+  // Faces for Center Stage are found in source coordinates (the crop is chosen
+  // from them). srcPyr_ is only built when the source differs from the output.
   bool facesFresh = false;
-  if (needFaces && faces_.loaded() && frameIdx_ % 3 == 0) {
-    lastFaces_ = faces_.detect(src);
-    facesFresh = true;
-  }
-
+  cv::Rect full = framer_.fullCrop(src.size(), outAspect);
+  bool srcIsWork = full == cv::Rect(0, 0, src.cols, src.rows) && src.size() == outSize;
+  bool pyrReady = false;  // pyr_ already reset to this frame
+  auto detectFaces = [&]() {
+    int lvl = 0;
+    Pyramid* p = &srcPyr_;
+    // Reuse the work pyramid when it is (or will be) built from src itself.
+    if (srcIsWork && (!pyrReady || pyr_.base().data == src.data)) {
+      if (!pyrReady) { pyr_.reset(src); pyrReady = true; }
+      p = &pyr_;
+    } else {
+      srcPyr_.reset(src);
+    }
+    const cv::Mat& s = p->atLeastWide(320, &lvl);
+    lastFaces_ = faces_.detect(s, 1.0 / Pyramid::scaleOf(lvl));
+    lastFaceTime_ = now; facesFresh = true;
+  };
+  if (settings_.centerStage && faces_.loaded() && now - lastFaceTime_ >= 1.0 / faceHz) detectFaces();
   stage(0);  // faces
-  cv::Rect crop = settings_.centerStage ? framer_.update(src.size(), lastFaces_, facesFresh, outAspect, dt)
-                                        : framer_.fullCrop(src.size(), outAspect);
+
+  cv::Rect crop = settings_.centerStage ? framer_.update(src.size(), lastFaces_, facesFresh, outAspect, dt) : full;
   cv::Mat work;
-  cv::resize(src(crop), work, outSize, 0, 0, crop.width > outSize.width ? cv::INTER_AREA : cv::INTER_LINEAR);
+  if (crop == cv::Rect(0, 0, src.cols, src.rows) && src.size() == outSize) work = src;  // passthrough: no copy
+  else { cv::resize(src(crop), work_, outSize, 0, 0, cv::INTER_LINEAR); work = work_; }  // LINEAR: 5x cheaper than AREA, invisible after MJPEG
+  if (!(pyrReady && work.data == src.data)) pyr_.reset(work);  // detectFaces may have built it from src already
+  // Palm detection wants the pre-effect pixels: build its level now, before
+  // the effects overwrite `work` in place.
+  const bool palmDue = settings_.reactions && gestures_.loaded() && now - lastPalmTime_ >= 1.0 / palmHz;
+  if (palmDue) pyr_.atLeastWide(192);
   stage(1);  // crop/resize
 
   bool needMask = settings_.portrait || settings_.studioLight || settings_.background != "none";
-  cv::Mat maskF;
-  if (needMask) computeMask(work, maskF);
+  if (needMask) computeMask(work);
   stage(2);  // mask
-  if (settings_.portrait || settings_.background != "none") applyBackground(work, maskF);
+  if (settings_.portrait || settings_.background != "none") applyBackground(work);
   stage(3);  // background
-  if (settings_.studioLight) applyStudioLight(work, maskF);
+  if (settings_.studioLight) applyStudioLight(work);
   stage(4);  // studio light
 
-  // Gesture-triggered reactions (checked at ~10 Hz on the output frame).
-  if (settings_.reactions && gestures_.loaded() && frameIdx_ % 3 == 1) {
-    auto hands = gestures_.detect(work);
+  // Gesture-triggered reactions, checked on the output frame at palmHz.
+  if (palmDue) {
+    lastPalmTime_ = now;
+    auto hands = gestures_.detect(work, pyr_.atLeastWide(192));
+    if (!hands.empty()) {
+      lastHandSeen_ = now;
+      // A hand is in view: (re)detect faces for the on-face check if not fresh.
+      if (faces_.loaded() && now - lastFaceTime_ > 1.0 / faceHz) detectFaces();
+    }
     // Faces are in src coordinates; map into work coordinates for the on-face check.
     std::vector<cv::Rect2f> facesWork;
-    double sx = (double)outSize.width / crop.width, sy = (double)outSize.height / crop.height;
-    for (auto& f : lastFaces_) facesWork.emplace_back((f.x - crop.x) * sx, (f.y - crop.y) * sy, f.width * sx, f.height * sy);
+    if (now - lastFaceTime_ < 1.0) {
+      double sx = (double)outSize.width / crop.width, sy = (double)outSize.height / crop.height;
+      for (auto& f : lastFaces_) facesWork.emplace_back((f.x - crop.x) * sx, (f.y - crop.y) * sy, f.width * sx, f.height * sy);
+    }
     std::string g = gestures_.classify(hands, facesWork);
-    static const bool dbg = getenv("CAMFX_DEBUG") != nullptr;
-    if (dbg) fprintf(stderr, "gesture: hands=%zu faces=%zu -> '%s'\n", hands.size(), facesWork.size(), g.c_str());
-    static std::string pending; static int stable = 0;
-    if (!g.empty() && g == pending) stable++; else { pending = g; stable = g.empty() ? 0 : 1; }
+    if (debugGestures_) fprintf(stderr, "gesture: hands=%zu faces=%zu -> '%s'\n", hands.size(), facesWork.size(), g.c_str());
+    if (g.empty() || g != pendingGesture_) { pendingGesture_ = g; pendingSince_ = now; }
     gestures_.noteGesture(g);
     // ~0.7 s of a steady gesture, then a cooldown so it does not re-fire while held.
-    if (!g.empty() && stable >= 7 && now - lastGestureTime_ > 4.0) {
+    if (!g.empty() && now - pendingSince_ >= 0.6 && now - lastGestureTime_ > 4.0) {
       reactions_.trigger(g);
       lastGestureTime_ = now;
-      stable = 0;
+      pendingGesture_.clear();
     }
   }
   stage(5);  // gestures
-  if (reactions_.active()) reactions_.render(work, now);
+  if (reactions_.active()) {
+    if (work.data == src.data) { src.copyTo(work_); work = work_; }  // don't draw into the capture buffer
+    reactions_.render(work, now);
+  }
   stage(6);  // reactions
-  if (settings_.mirror) cv::flip(work, work, 1);
+  if (settings_.mirror) { cv::flip(work, work.data == src.data ? work_ : work, 1); if (work.data == src.data) work = work_; }
   out = work;
   if (profile_ && ++profN_ == 60) {
     char b[256];

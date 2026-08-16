@@ -43,6 +43,7 @@ public:
   bool grab(cv::Mat& bgr, int timeoutMs);
   int width() const { return width_; }
   int height() const { return height_; }
+  double decodeMs() const { return decodeMs_; }  // read/decode time of the last frame
 
 private:
   struct Impl;
@@ -51,6 +52,7 @@ private:
   int width_ = 0, height_ = 0;
   double period_ = 1.0 / 30;
   double next_ = 0;
+  double decodeMs_ = 0;
 };
 
 class V4L2Capture {
@@ -62,11 +64,13 @@ public:
   void close();
   bool isOpen() const { return fd_ >= 0; }
   // Blocks up to timeoutMs for a frame. Returns false on timeout/error.
+  // `bgr` is reused as the decode target when it already has the right size.
   bool grab(cv::Mat& bgr, int timeoutMs);
   int width() const { return width_; }
   int height() const { return height_; }
   std::string format() const { return fourcc_; }
   std::string path() const { return path_; }
+  double decodeMs() const { return decodeMs_; }  // decode time of the last frame (excludes the wait)
 
 private:
   struct Buf { void* start = nullptr; size_t length = 0; };
@@ -76,5 +80,6 @@ private:
   unsigned pixfmt_ = 0;
   std::string fourcc_, path_;
   bool streaming_ = false;
+  double decodeMs_ = 0;
   bool decode(const unsigned char* data, size_t len, cv::Mat& bgr);
 };
