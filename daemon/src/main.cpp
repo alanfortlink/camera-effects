@@ -183,6 +183,7 @@ struct Config {
   // physical camera is opened; consumers get blockSource (image or video
   // file; "" = the built-in "Camera paused" card) instead.
   bool block = false;
+  bool previewMirror = true;   // panel-only: show the preview as a mirror (self-view convention); apps are unaffected
   std::string blockSource;
   Framing blockFraming;         // fit/zoom/pan of the placeholder image or video
   Settings settings;            // global settings (used when sameForAll, and as the template for new cameras)
@@ -215,6 +216,7 @@ void loadConfig(Config& c) {
     c.outW &= ~1; c.outH &= ~1; c.capW &= ~1; c.capH &= ~1;
     if (j.contains("camera") && j["camera"].is_string()) c.preferredCamera = j["camera"];
     if (j.contains("block") && j["block"].is_boolean()) c.block = j["block"];
+    if (j.contains("previewMirror") && j["previewMirror"].is_boolean()) c.previewMirror = j["previewMirror"];
     if (j.contains("blockSource") && j["blockSource"].is_string() && blockSourceValid(j["blockSource"])) c.blockSource = j["blockSource"];
     framingFromJson(j, "block", c.blockFraming.fit, c.blockFraming.zoom, c.blockFraming.panX, c.blockFraming.panY);
     if (j.contains("settings")) settingsFromJson(j["settings"], c.settings);
@@ -234,6 +236,7 @@ void saveConfig(const Config& c) {
              { "capture", { { "width", c.capW }, { "height", c.capH } } },
              { "camera", c.preferredCamera },
              { "block", c.block },
+             { "previewMirror", c.previewMirror },
              { "blockSource", c.blockSource },
              { "blockFit", c.blockFraming.fit }, { "blockZoom", c.blockFraming.zoom }, { "blockPanX", c.blockFraming.panX }, { "blockPanY", c.blockFraming.panY },
              { "sameForAll", c.sameForAll },
@@ -423,6 +426,7 @@ json Daemon::stateJson() {
                { "reactionsActive", reactionsActive_ },
                { "hideRaw", hideRawActive_ },
                { "block", cfg_.block },
+               { "previewMirror", cfg_.previewMirror },
                { "blockSource", cfg_.blockSource },
                { "blockFit", cfg_.blockFraming.fit }, { "blockZoom", cfg_.blockFraming.zoom }, { "blockPanX", cfg_.blockFraming.panX }, { "blockPanY", cfg_.blockFraming.panY },
                { "panRange", { panRange_.x, panRange_.y } },
@@ -678,6 +682,7 @@ std::string Daemon::handle(int client, const std::string& req) {
           settingsFromJson(sj, effectiveSettings());
           // Global (not per camera) keys travel in the same object: `camera-effects-server set block=true blockSource=/path`.
           if (sj.contains("block") && sj["block"].is_boolean()) cfg_.block = sj["block"];
+          if (sj.contains("previewMirror") && sj["previewMirror"].is_boolean()) cfg_.previewMirror = sj["previewMirror"];
           framingFromJson(sj, "block", cfg_.blockFraming.fit, cfg_.blockFraming.zoom, cfg_.blockFraming.panX, cfg_.blockFraming.panY);
           if (sj.contains("blockSource") && sj["blockSource"].is_string()) {
             std::string p = sj["blockSource"], why;

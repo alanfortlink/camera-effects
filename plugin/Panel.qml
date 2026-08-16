@@ -474,7 +474,10 @@ Panel {
                 // Keep the preview a mirror view of yourself whatever the
                 // output setting is: undo the flip only when the feed
                 // itself is already mirrored.
-                item.mirror = Qt.binding(function() { return !!root.s.mirror || root.blocked })  // the placeholder card must not be shown mirrored
+                // Self-view convention: the preview is a mirror unless the user turns it off; the
+                // placeholder is never flipped. This is display-only — apps get the unflipped output
+                // (or the mirrored one when "Mirror output" is on).
+                item.mirror = Qt.binding(function() { return !root.blocked && root.svc && root.svc.previewMirror })
               }
             }
             // Black until the daemon delivers its first live frame.
@@ -511,7 +514,8 @@ Panel {
                 // The preview shows the output as apps get it: dragging the picture right moves the crop left
                 // (-1); when the output is mirrored the picture is flipped, so the sign flips too. Rotation
                 // needs no correction: pan applies to the rotated frame, which is what the preview shows.
-                var sx = (!root.blocked && !!root.s.mirror) ? 1 : -1
+                var flipped = !root.blocked && ((!!root.s.mirror) !== (!!(root.svc && root.svc.previewMirror)))
+                var sx = flipped ? 1 : -1
                 var px = rx > 0 ? Math.max(-1, Math.min(1, panX0 + sx * (mouse.x - startX) / (rx * width))) : panX0
                 var py = ry > 0 ? Math.max(-1, Math.min(1, panY0 - (mouse.y - startY) / (ry * height))) : panY0
                 pending = { panX: Math.round(px * 1000) / 1000, panY: Math.round(py * 1000) / 1000 }
@@ -835,7 +839,8 @@ Panel {
             enabled: !!root.svc && !root.blocked
             onChanged: function(v) { if (root.svc) root.svc.setSetting("rotate", parseInt(v, 10)) }
           }
-          SwitchRow { label: "Mirror"; checked: !!root.s.mirror; onToggled: if (root.svc) root.svc.setSetting("mirror", !root.s.mirror) }
+          SwitchRow { label: "Mirror preview (only here)"; checked: root.svc ? root.svc.previewMirror : true; onToggled: if (root.svc) root.svc.send({ cmd: "set", settings: { previewMirror: !root.svc.previewMirror } }) }
+          SwitchRow { label: "Mirror output (for everyone)"; checked: !!root.s.mirror; onToggled: if (root.svc) root.svc.setSetting("mirror", !root.s.mirror) }
 
           Item { width: parent.width; height: Style.space(6) }
           PanelSeparator { foreground: root.fg }

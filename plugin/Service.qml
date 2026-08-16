@@ -25,6 +25,7 @@ Item {
   readonly property string loopbackLabel: state.loopbackLabel || "Camera Effects"
   readonly property string error: state.error || ""
   readonly property bool hideRaw: !!state.hideRaw
+  readonly property bool previewMirror: state.previewMirror !== false   // panel-only self-view mirroring
   readonly property bool block: !!state.block                // camera blocked: placeholder instead of the webcam (global)
   readonly property string blockSource: state.blockSource || ""  // "" = built-in card, else an image/video path
   // Framing of the placeholder image/video (the camera's own zoom/pan/fit live in `settings`).
