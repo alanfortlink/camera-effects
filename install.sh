@@ -1,26 +1,26 @@
 #!/bin/bash
-# Build and install the Omarchy Camera plugin for the current user.
+# Build and install the Iris Camera plugin for the current user.
 #   ./install.sh            build daemon, install files, enable the shell plugin, set up the device (asks for password)
 #   ./install.sh --no-root  everything except the privileged device setup
 #   ./install.sh --uninstall
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-LIB=$HOME/.local/lib/omarchy-camera
-DATA=$HOME/.local/share/omarchy-camera
+LIB=$HOME/.local/lib/iris
+DATA=$HOME/.local/share/iris
 BIN=$HOME/.local/bin
-PLUGIN=$HOME/.config/omarchy/plugins/tank.camera
-ID=tank.camera
+PLUGIN=$HOME/.config/omarchy/plugins/alanfortlink.iris
+ID=alanfortlink.iris
 
 privileged() {  # run the setup script as root, silently if sudo allows it
-  if sudo -n true 2>/dev/null; then sudo "$LIB/omarchy-camera-setup" "$@"; else pkexec "$LIB/omarchy-camera-setup" "$@"; fi
+  if sudo -n true 2>/dev/null; then sudo "$LIB/iris-setup" "$@"; else pkexec "$LIB/iris-setup" "$@"; fi
 }
 
 if [[ ${1:-} == --uninstall ]]; then
   omarchy-plugin-disable "$ID" 2>/dev/null || true
   privileged uninstall || true
-  rm -rf "$LIB" "$DATA" "$BIN/camfxd"
-  [[ -L $PLUGIN ]] && rm -f "$PLUGIN"   # dev symlink; a real checkout is removed with `omarchy plugin remove tank.camera`
-  echo "uninstalled (config left in ~/.config/omarchy/camera.json)"
+  rm -rf "$LIB" "$DATA" "$BIN/irisd"
+  [[ -L $PLUGIN ]] && rm -f "$PLUGIN"   # dev symlink; a real checkout is removed with `omarchy plugin remove alanfortlink.iris`
+  echo "uninstalled (config left in ~/.config/iris/config.json)"
   exit 0
 fi
 
@@ -40,11 +40,11 @@ make -C "$HERE/daemon" -j"$(nproc)" >/dev/null
 
 echo "› installing to $LIB, $DATA"
 install -d "$LIB" "$DATA/models" "$DATA/assets" "$BIN"
-install -m 755 "$HERE/daemon/build/camfxd" "$LIB/camfxd"
-install -m 755 "$HERE/scripts/omarchy-camera-setup" "$LIB/omarchy-camera-setup"
+install -m 755 "$HERE/daemon/build/irisd" "$LIB/irisd"
+install -m 755 "$HERE/scripts/iris-setup" "$LIB/iris-setup"
 install -m 644 "$HERE"/models/*.onnx "$DATA/models/"
 install -m 644 "$HERE"/assets/*.png "$DATA/assets/"
-ln -sfn "$LIB/camfxd" "$BIN/camfxd"
+ln -sfn "$LIB/irisd" "$BIN/irisd"
 
 echo "› installing shell plugin"
 mkdir -p "$(dirname "$PLUGIN")"
@@ -64,12 +64,12 @@ if [[ ${1:-} != --no-root ]]; then
 fi
 # A "hide raw camera" rule means the shell runs the root-owned setgid copy of the
 # daemon; refresh it so it matches the build we just installed (rules untouched).
-if ls /etc/udev/rules.d/71-omarchy-camera-hide-*.rules >/dev/null 2>&1; then
+if ls /etc/udev/rules.d/71-iris-hide-*.rules >/dev/null 2>&1; then
   if [[ ${1:-} != --no-root ]] || sudo -n true 2>/dev/null; then
     echo "› refreshing the privileged daemon copy (root)"
-    privileged refresh-daemon "$LIB/camfxd" || true
+    privileged refresh-daemon "$LIB/irisd" || true
   else
-    echo "› note: cameras are hidden, so the shell runs the privileged daemon copy; run: sudo $LIB/omarchy-camera-setup refresh-daemon $LIB/camfxd"
+    echo "› note: cameras are hidden, so the shell runs the privileged daemon copy; run: sudo $LIB/iris-setup refresh-daemon $LIB/irisd"
   fi
 fi
 

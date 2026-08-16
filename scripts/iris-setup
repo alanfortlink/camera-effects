@@ -1,26 +1,26 @@
 #!/bin/bash
-# omarchy-camera-setup — the privileged half of the Omarchy Camera plugin.
+# iris-setup — the privileged half of the Iris Camera plugin.
 # Invoked through pkexec by the shell plugin (or sudo by install.sh).
 #
-#   install [<camfxd>]              create the virtual camera now and at every boot; also
+#   install [<irisd>]              create the virtual camera now and at every boot; also
 #                                   installs a root-owned copy of this script for the shell to pkexec
 #                                   and, when hide rules exist, refreshes the privileged daemon copy
 #   uninstall                       remove the boot unit, the device and all hide rules
-#   hide-raw on <camfxd> [<key>]    hide physical webcams from apps (all, or one USB camera by
-#                                   key "usb-<vid>-<pid>[-<serial>]"); only camfxd may read them
+#   hide-raw on <irisd> [<key>]    hide physical webcams from apps (all, or one USB camera by
+#                                   key "usb-<vid>-<pid>[-<serial>]"); only irisd may read them
 #   hide-raw off [<key>]            make physical webcams (all, or that one) visible again
-#   refresh-daemon <camfxd>         refresh the privileged daemon copy only (rules untouched)
+#   refresh-daemon <irisd>         refresh the privileged daemon copy only (rules untouched)
 #   status                          print JSON status
 set -euo pipefail
 export LC_ALL=C  # the key/serial regexes below are ASCII classes; keep them locale-independent
 
-LABEL="Omarchy Camera"
+LABEL="Iris Camera"
 NR=20
-UNIT=/etc/systemd/system/omarchy-camera-device.service
-MODLOAD=/etc/modules-load.d/omarchy-camera.conf
+UNIT=/etc/systemd/system/iris-camera-device.service
+MODLOAD=/etc/modules-load.d/iris.conf
 RULES_DIR=/etc/udev/rules.d
-RULE_ALL=$RULES_DIR/71-omarchy-camera-hide-raw.rules
-LIBDIR=/usr/local/lib/omarchy-camera
+RULE_ALL=$RULES_DIR/71-iris-hide-raw.rules
+LIBDIR=/usr/local/lib/iris
 GROUP=camerad
 # Camera key as built by the daemon (capture.cpp): 4 hex vid, 4 hex pid, optional
 # serial of [A-Za-z0-9._]{1,64}. Anything else is refused: the key becomes part of a
@@ -51,7 +51,7 @@ cmd_install() {
   modprobe v4l2loopback 2>/dev/null || true
   cat > "$UNIT" <<EOF
 [Unit]
-Description=Omarchy Camera virtual video device
+Description=Iris Camera virtual video device
 After=systemd-modules-load.service
 ConditionPathExists=/dev/v4l2loopback
 
@@ -65,16 +65,16 @@ ExecStart=/bin/sh -c 'v4l2loopback-ctl list 2>/dev/null | grep -q "$LABEL" || v4
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable omarchy-camera-device.service >/dev/null 2>&1 || true
-  systemctl restart omarchy-camera-device.service
+  systemctl enable iris-camera-device.service >/dev/null 2>&1 || true
+  systemctl restart iris-camera-device.service
   # A root-owned copy of this script: the shell pkexecs that one (not the
   # user-writable copy in ~/.local) once it exists. Re-run install to update it.
   local self; self=$(readlink -f "$0")
   install -d -m 755 "$LIBDIR"
-  [[ $self == "$LIBDIR/omarchy-camera-setup" ]] || install -m 755 -o root -g root "$self" "$LIBDIR/omarchy-camera-setup"
+  [[ $self == "$LIBDIR/iris-setup" ]] || install -m 755 -o root -g root "$self" "$LIBDIR/iris-setup"
   # Cameras hidden => the shell runs the privileged daemon copy: keep it in step
-  # with the build being installed (the caller passes its camfxd path).
-  if [[ -n $bin ]] && ls "$RULES_DIR"/71-omarchy-camera-hide-*.rules >/dev/null 2>&1; then
+  # with the build being installed (the caller passes its irisd path).
+  if [[ -n $bin ]] && ls "$RULES_DIR"/71-iris-hide-*.rules >/dev/null 2>&1; then
     install_privileged_daemon "$bin"
     echo "privileged daemon refreshed"
   fi
@@ -102,7 +102,7 @@ raw_devices() {
 # run it to reach the hidden webcams (hiding a camera must not widen its audience).
 install_privileged_daemon() {
   local bin=$1
-  [[ -n $bin && ! -L $bin ]] || { echo "camfxd binary missing or a symlink: $bin" >&2; exit 1; }
+  [[ -n $bin && ! -L $bin ]] || { echo "irisd binary missing or a symlink: $bin" >&2; exit 1; }
   exec 3<"$bin" || { echo "cannot open $bin" >&2; exit 1; }
   local caller=${PKEXEC_UID:-${SUDO_UID:-0}}
   local st; st=$(stat -L -c '%u %F' /dev/fd/3)
@@ -110,9 +110,9 @@ install_privileged_daemon() {
   getent group "$GROUP" >/dev/null || groupadd -r "$GROUP"
   install -d -m 755 "$LIBDIR"
   # install replaces the destination inode, so no stale ACL survives from a previous copy
-  install -m 2750 -o root -g "$GROUP" /dev/fd/3 "$LIBDIR/camfxd"
+  install -m 2750 -o root -g "$GROUP" /dev/fd/3 "$LIBDIR/irisd"
   exec 3<&-
-  [[ $caller -eq 0 ]] || setfacl -m "u:$caller:rx" "$LIBDIR/camfxd"
+  [[ $caller -eq 0 ]] || setfacl -m "u:$caller:rx" "$LIBDIR/irisd"
 }
 
 # udev match for one USB camera from our (validated) key "usb-<vid>-<pid>[-<serial>]".
@@ -158,7 +158,7 @@ reapply() {
     hidden=false
     [[ -f $RULE_ALL ]] && is_usb_capture "$d" && hidden=true
     key=$(device_key "$d")
-    [[ -n $key && -f $RULES_DIR/71-omarchy-camera-hide-$key.rules ]] && hidden=true
+    [[ -n $key && -f $RULES_DIR/71-iris-hide-$key.rules ]] && hidden=true
     if $hidden; then
       chgrp "$GROUP" "$d" 2>/dev/null || true; chmod 0660 "$d" 2>/dev/null || true
       setfacl -b "$d" 2>/dev/null || true
@@ -179,15 +179,15 @@ cmd_hide_raw() {
       if [[ -z $key ]]; then
         # Only USB capture cameras: not tuners, capture cards or codec (M2M) nodes.
         cat > "$RULE_ALL" <<EOF
-# Omarchy Camera: physical webcams are read by the effects daemon only; apps use the
-# virtual "Omarchy Camera" device instead. Toggle "Hide raw cameras" in the panel to restore.
+# Iris Camera: physical webcams are read by the effects daemon only; apps use the
+# virtual "Iris Camera" device instead. Toggle "Hide raw cameras" in the panel to restore.
 SUBSYSTEM=="video4linux", SUBSYSTEMS=="usb", ENV{ID_V4L_CAPABILITIES}=="*:capture:*", TAG-="uaccess", GROUP="$GROUP", MODE="0660"
 EOF
         echo "raw cameras hidden"
       else
         local match; match=$(key_match "$key")
-        cat > "$RULES_DIR/71-omarchy-camera-hide-$key.rules" <<EOF
-# Omarchy Camera: this webcam is read by the effects daemon only (see the Camera panel).
+        cat > "$RULES_DIR/71-iris-hide-$key.rules" <<EOF
+# Iris Camera: this webcam is read by the effects daemon only (see the Camera panel).
 SUBSYSTEM=="video4linux", $match, TAG-="uaccess", GROUP="$GROUP", MODE="0660"
 EOF
         echo "camera $key hidden"
@@ -197,10 +197,10 @@ EOF
     off)
       local key=${2:-}
       if [[ -z $key ]]; then rm -f "$RULE_ALL"; echo "raw cameras visible"
-      else valid_key "$key"; rm -f "$RULES_DIR/71-omarchy-camera-hide-$key.rules"; echo "camera $key visible"; fi
+      else valid_key "$key"; rm -f "$RULES_DIR/71-iris-hide-$key.rules"; echo "camera $key visible"; fi
       reapply
       ;;
-    *) echo "usage: hide-raw on <camfxd> [<key>] | hide-raw off [<key>]" >&2; exit 2;;
+    *) echo "usage: hide-raw on <irisd> [<key>] | hide-raw off [<key>]" >&2; exit 2;;
   esac
 }
 
@@ -213,9 +213,9 @@ cmd_refresh_daemon() {
 
 cmd_uninstall() {
   need_root
-  rm -f "$RULES_DIR"/71-omarchy-camera-hide-*.rules
+  rm -f "$RULES_DIR"/71-iris-hide-*.rules
   reapply || true
-  systemctl disable --now omarchy-camera-device.service >/dev/null 2>&1 || true
+  systemctl disable --now iris-camera-device.service >/dev/null 2>&1 || true
   rm -f "$UNIT" "$MODLOAD"
   systemctl daemon-reload
   local dev; dev=$(device_path)
@@ -228,7 +228,7 @@ cmd_status() {
   local dev; dev=$(device_path 2>/dev/null || true)
   local hide=false; [[ -f $RULE_ALL ]] && hide=true
   local unit=false; [[ -f $UNIT ]] && unit=true
-  local per; per=$(ls "$RULES_DIR"/71-omarchy-camera-hide-usb-*.rules 2>/dev/null | sed 's|.*/71-omarchy-camera-hide-||;s|\.rules$||' | paste -sd, - || true)
+  local per; per=$(ls "$RULES_DIR"/71-iris-hide-usb-*.rules 2>/dev/null | sed 's|.*/71-iris-hide-||;s|\.rules$||' | paste -sd, - || true)
   printf '{"device":"%s","hideRaw":%s,"hiddenCameras":"%s","bootUnit":%s}\n' "$dev" "$hide" "$per" "$unit"
 }
 

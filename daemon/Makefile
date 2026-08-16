@@ -6,7 +6,7 @@ LDFLAGS += $(shell pkg-config --libs libonnxruntime libpipewire-0.3) \
 
 SRC := $(wildcard src/*.cpp)
 OBJ := $(patsubst src/%.cpp,build/%.o,$(SRC))
-BIN := build/camfxd
+BIN := build/irisd
 
 all: $(BIN)
 

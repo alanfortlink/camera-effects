@@ -410,7 +410,7 @@ bool EffectPipeline::init(const std::string& modelsDir, const std::string& asset
   if (!gestures_.load(modelsDir, &e)) status += "gestures: " + e + "; ";
   if (!reactions_.loadAssets(assetsDir, &e)) status += "assets: " + e + "; ";
   modelStatus_ = status.empty() ? "ok" : status;
-  debugGestures_ = getenv("CAMFX_DEBUG") != nullptr;
+  debugGestures_ = getenv("IRIS_DEBUG") != nullptr;
   if (err) *err = status;
   return segmenter_.loaded();  // the rest degrade gracefully
 }

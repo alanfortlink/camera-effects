@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "tank.camera",
-  "name": "Camera",
+  "id": "alanfortlink.iris",
+  "name": "Iris",
   "version": "0.1.0",
   "author": "tank",
   "license": "MIT",
-  "description": "System-wide camera effects (Center Stage, Portrait, Studio Light, Backgrounds, Reactions) exposed as the \"Omarchy Camera\" virtual webcam, with a Control-Center-style panel.",
+  "description": "Iris \u2014 system-wide camera effects (Center Stage, Portrait, Studio Light, Backgrounds, Reactions) exposed as the \"Iris Camera\" virtual webcam, with a Control-Center-style panel.",
   "kinds": [
     "service",
     "bar-widget"
@@ -16,7 +16,7 @@
     "barWidget": "plugin/Panel.qml"
   },
   "barWidget": {
-    "displayName": "Camera",
+    "displayName": "Iris",
     "description": "Camera effects panel with live preview; the icon lights up while an app is using the camera.",
     "category": "Media",
     "allowMultiple": false,

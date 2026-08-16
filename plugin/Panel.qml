@@ -5,18 +5,18 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Bar icon + popup panel for the Omarchy Camera (the macOS "Video Effects"
+// Bar icon + popup panel for the Iris Camera (the macOS "Video Effects"
 // menu, Omarchy style): live preview, camera picker, one row per effect,
 // reactions, and the "hide raw camera" switches. All state lives in the
-// camfxd daemon (see Service.qml); this file only renders and forwards.
+// irisd daemon (see Service.qml); this file only renders and forwards.
 Panel {
   id: root
-  moduleName: "tank.camera"
-  ipcTarget: "tank.camera"
+  moduleName: "alanfortlink.iris"
+  ipcTarget: "alanfortlink.iris"
 
   // The shell mounts our service at startup (kinds: service); calling
   // ensureService() from a binding would mutate the registry it reads (loop).
-  readonly property var svc: bar && bar.shell ? bar.shell.serviceFor("tank.camera") : null
+  readonly property var svc: bar && bar.shell ? bar.shell.serviceFor("alanfortlink.iris") : null
   readonly property bool inUse: svc ? svc.running : false
   readonly property bool connected: svc ? svc.connected : false
   readonly property var s: svc ? svc.settings : ({})
@@ -270,7 +270,7 @@ Panel {
           // ---------- Hero ----------
           PanelHero {
             width: parent.width
-            title: root.svc ? root.svc.loopbackLabel : "Omarchy Camera"
+            title: root.svc ? root.svc.loopbackLabel : "Iris Camera"
             meta: root.subtitle()
             foreground: root.fg
             fontFamily: root.fontFamily

@@ -2,7 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Headless service: owns the camfxd daemon (starts it, restarts it if it dies)
+// Headless service: owns the irisd daemon (starts it, restarts it if it dies)
 // and keeps a control connection to it. Everything the panel shows comes from
 // the daemon's state pushes; everything the panel changes goes through set().
 Item {
@@ -11,7 +11,7 @@ Item {
   property var shell: null
   property var manifest: null
 
-  // ---- daemon state (mirrors the JSON pushed by camfxd) ----
+  // ---- daemon state (mirrors the JSON pushed by irisd) ----
   property var state: ({})
   readonly property bool connected: sockConnected
   readonly property bool running: !!state.running          // camera is being read + processed right now
@@ -21,7 +21,7 @@ Item {
   readonly property var cameras: state.cameras || []
   readonly property var camera: state.camera || ({})
   readonly property string loopback: state.loopback || ""
-  readonly property string loopbackLabel: state.loopbackLabel || "Omarchy Camera"
+  readonly property string loopbackLabel: state.loopbackLabel || "Iris Camera"
   readonly property string error: state.error || ""
   readonly property bool hideRaw: !!state.hideRaw
   readonly property int fps: state.fps || 0
@@ -34,16 +34,16 @@ Item {
   // missing after a system update, a stale privileged copy); cleared once it talks to us.
   property string daemonError: ""
 
-  readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omarchy-camera"
+  readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/iris"
   readonly property string socketPath: runtimeDir + "/ctl.sock"
   readonly property string homeDir: Quickshell.env("HOME") || ""
-  readonly property string libDir: homeDir + "/.local/lib/omarchy-camera"
-  readonly property string setupScript: libDir + "/omarchy-camera-setup"
-  readonly property string daemonBinary: libDir + "/camfxd"
-  readonly property string privilegedBinary: "/usr/local/lib/omarchy-camera/camfxd"
-  // Root-owned copy of the setup script (installed by `omarchy-camera-setup install`).
+  readonly property string libDir: homeDir + "/.local/lib/iris"
+  readonly property string setupScript: libDir + "/iris-setup"
+  readonly property string daemonBinary: libDir + "/irisd"
+  readonly property string privilegedBinary: "/usr/local/lib/iris/irisd"
+  // Root-owned copy of the setup script (installed by `iris-setup install`).
   // Preferred for pkexec so that what runs as root is not user-writable.
-  readonly property string privilegedSetupScript: "/usr/local/lib/omarchy-camera/omarchy-camera-setup"
+  readonly property string privilegedSetupScript: "/usr/local/lib/iris/iris-setup"
   // The plugin checkout (this file lives in <repo>/plugin/).
   readonly property string repoDir: String(Qt.resolvedUrl("..")).replace(/^file:\/\//, "").replace(/\/$/, "")
   property bool installed: false   // daemon binary present in ~/.local/lib
@@ -78,7 +78,7 @@ Item {
     setupOutput = ""
     // The root-owned script copy when it exists (after the first install), else ours.
     setupProc.command = ["sh", "-c", 'if [ -f "$1" ]; then s=$1; else s=$2; fi; shift 2; exec pkexec "$s" "$@"',
-                         "camfx-setup", privilegedSetupScript, setupScript].concat(args)
+                         "iris-setup-run", privilegedSetupScript, setupScript].concat(args)
     setupProc.running = true
   }
   property bool setupBusy: setupProc.running || installProc.running
@@ -99,7 +99,7 @@ Item {
   // half (no password), then create the device (password).
   function install() {
     if (installProc.running) return
-    installProc.command = ["sh", "-c", 'cd "$1" && ./install.sh --no-root 2>&1', "camfx-install", repoDir]
+    installProc.command = ["sh", "-c", 'cd "$1" && ./install.sh --no-root 2>&1', "iris-install", repoDir]
     installProc.running = true
   }
   Process {
@@ -136,9 +136,9 @@ Item {
   // otherwise the user's own build.
   function daemonCommand() {
     return ["sh", "-c",
-      'if ls /etc/udev/rules.d/71-omarchy-camera-hide-*.rules >/dev/null 2>&1 && [ -x "$1" ]; then exec "$1" run; fi; ' +
-      'if [ -x "$2" ]; then exec "$2" run; fi; exec camfxd run',
-      "camfxd-launch", privilegedBinary, daemonBinary]
+      'if ls /etc/udev/rules.d/71-iris-hide-*.rules >/dev/null 2>&1 && [ -x "$1" ]; then exec "$1" run; fi; ' +
+      'if [ -x "$2" ]; then exec "$2" run; fi; exec irisd run',
+      "irisd-launch", privilegedBinary, daemonBinary]
   }
 
   Process {
