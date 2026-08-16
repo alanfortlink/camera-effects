@@ -472,9 +472,10 @@ Panel {
         }
         Text {
           width: parent.width
-          visible: root.svc && (root.svc.setupOutput !== "" || (root.needsRebuild && root.svc.daemonLog !== ""))
+          visible: root.svc && (root.svc.busyText !== "" || root.svc.setupOutput !== "" || (root.needsRebuild && root.svc.daemonLog !== ""))
           wrapMode: Text.WordWrap
-          text: root.svc ? (root.svc.setupOutput !== "" ? root.svc.setupOutput
+          text: root.svc ? (root.svc.busyText !== "" ? root.svc.busyText
+                            : root.svc.setupOutput !== "" ? root.svc.setupOutput
                             : root.svc.daemonLog.trim().split("\n").slice(-3).join("\n")) : ""
           color: root.dim
           font.family: root.fontFamily

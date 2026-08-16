@@ -103,13 +103,18 @@ Item {
     else if (what === "hide-camera") args = b ? ["hide-raw", "on", daemonBinary, String(a)] : ["hide-raw", "off", String(a)]
     else return
     setupOutput = ""
+    busyText = what === "install" ? "Setting up the virtual camera…" : "Applying…"
     // The root-owned script copy when it exists (after the first install), else ours.
     setupProc.command = ["sh", "-c", 'if [ -f "$1" ]; then s=$1; else s=$2; fi; shift 2; exec pkexec "$s" "$@"',
                          "camera-effects-setup-run", privilegedSetupScript, setupScript].concat(args)
     setupProc.running = true
   }
   property bool setupBusy: setupProc.running || installProc.running
+  // setupOutput carries only what the user must act on (a failure, a cancelled
+  // prompt). Progress lives in busyText and disappears on its own: a finished
+  // build or setup must not leave a wall of shell output in the panel.
   property string setupOutput: ""
+  property string busyText: ""
 
   // ---- snapshots ----
   // A state whose lastSnapshot.time moved is a fresh one (a snapshot asked for
@@ -146,9 +151,17 @@ Item {
 
   Process {
     id: setupProc
-    stdout: StdioCollector { onStreamFinished: root.setupOutput = String(text).trim() }
-    stderr: StdioCollector { onStreamFinished: if (String(text).trim() !== "") root.setupOutput = String(text).trim() }
+    property string outText: ""
+    property string errText: ""
+    stdout: StdioCollector { onStreamFinished: setupProc.outText = String(text).trim() }
+    stderr: StdioCollector { onStreamFinished: setupProc.errText = String(text).trim() }
     onExited: function(code) {
+      root.busyText = ""
+      // 126/127 = the polkit dialog was dismissed or pkexec is missing.
+      if (code === 0) root.setupOutput = ""
+      else if (code === 126 || code === 127) root.setupOutput = "Cancelled: the system part was not changed."
+      else root.setupOutput = errText !== "" ? errText : (outText !== "" ? outText : "setup failed (" + code + ")")
+      outText = ""; errText = ""
       Qt.callLater(root.refresh)
       restartTimer.interval = 1000  // not whatever backoff the last crash/orphan path left behind
       restartTimer.restart()  // hide rules switch the daemon binary; a restart picks it up
@@ -163,6 +176,7 @@ Item {
   function install() {
     if (installProc.running) return
     setupOutput = ""
+    if (busyText === "") busyText = "Building the daemon…"
     daemonError = ""
     installProc.command = ["sh", "-c",
       'mkdir -p "$(dirname "$2")"; cd "$1" && ./install.sh --no-root >"$2" 2>&1; rc=$?; tail -n 4 "$2"; exit $rc',
@@ -171,10 +185,13 @@ Item {
   }
   Process {
     id: installProc
-    stdout: StdioCollector { onStreamFinished: root.setupOutput = String(text).trim() }
+    property string tailText: ""
+    stdout: StdioCollector { onStreamFinished: installProc.tailText = String(text).trim() }
     onExited: function(code) {
-      if (code === 0) { restartTimer.restart(); rootCheckProc.running = true }
-      else root.setupOutput = "install failed (" + code + "), see " + root.installLog + ":\n" + root.setupOutput
+      root.busyText = ""
+      if (code === 0) { root.setupOutput = ""; restartTimer.restart(); rootCheckProc.running = true }
+      else root.setupOutput = "Build failed (" + code + "). Log: " + root.installLog + "\n" + tailText
+      tailText = ""
       probeProc.running = true   // re-check the binary rather than trusting the exit code
     }
   }
@@ -201,7 +218,7 @@ Item {
       'a=$(git -C "$1" rev-parse HEAD 2>/dev/null) || exit 0; b=$(cat "$2/installed-commit" 2>/dev/null); ' +
       '[ -x "$2/camera-effects-server" ] || exit 0; [ -n "$a" ] && [ "$a" != "$b" ] && exit 3; exit 0',
       "camera-effects-updatecheck", root.repoDir, root.libDir]
-    onExited: function(code) { if (code === 3) { root.setupOutput = "Updating…"; root.install() } }
+    onExited: function(code) { if (code === 3) { root.busyText = "Updating…"; root.install() } }
   }
   // Is the daemon binary there? Answers the "exit 127" question: not installed
   // yet (wait for install()) or installed but not startable (back off, tell the user).
