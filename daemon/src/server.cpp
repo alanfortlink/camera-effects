@@ -61,6 +61,14 @@ void ControlServer::broadcast(const std::string& line) {
   }
 }
 
+void ControlServer::sendTo(int client, const std::string& line) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (std::find(clients_.begin(), clients_.end(), client) == clients_.end()) return;  // gone (its fd number may be someone else's by now)
+  std::string msg = line + "\n";
+  ssize_t n = send(client, msg.data(), msg.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+  if (n < 0 && errno != EAGAIN) shutdown(client, SHUT_RDWR);
+}
+
 void ControlServer::dropClient(int fd, std::map<int, std::string>& buffers) {
   {
     std::lock_guard<std::mutex> lk(mu_);

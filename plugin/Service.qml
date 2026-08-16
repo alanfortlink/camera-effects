@@ -39,6 +39,9 @@ Item {
   readonly property string gesture: state.gesture || ""
   readonly property var reactionNames: state.reactions || ["hearts", "thumbsup", "thumbsdown", "balloons", "confetti", "fireworks", "rain", "lasers"]
   readonly property bool deviceMissing: error.indexOf("virtual camera device missing") !== -1
+  // Last snapshot the daemon saved: { path, time[, error] } (null until one is taken).
+  readonly property var lastSnapshot: state.lastSnapshot || null
+  signal snapshotTaken(string path)   // a new one was saved (the panel flashes its preview)
   property string daemonLog: ""
   property int restarts: 0
   // Set when the daemon binary is present but cannot start (exit 127: a library
@@ -75,6 +78,9 @@ Item {
   function selectCamera(busOrPath) { return send({ cmd: "set", camera: busOrPath }) }
   function react(name) { return send({ cmd: "react", name: name }) }
   function rescan() { return send({ cmd: "rescan" }) }
+  // The daemon saves its next output frame as a PNG under ~/Pictures/Camera Effects
+  // and reports it in the state (lastSnapshot): see noteSnapshot for what happens then.
+  function snapshot() { return send({ cmd: "snapshot" }) }
   function refresh() { return send({ cmd: "get" }) }
   // The preview is per control connection (it ends when the connection does):
   // remember it so a reconnect asks again.
@@ -102,6 +108,39 @@ Item {
   }
   property bool setupBusy: setupProc.running || installProc.running
   property string setupOutput: ""
+
+  // ---- snapshots ----
+  // A state whose lastSnapshot.time moved is a fresh one (a snapshot asked for
+  // by us, the CLI or IPC alike): copy the PNG to the clipboard and say so.
+  // The first state after a (re)connect only records the time: it may carry a
+  // snapshot from before we were listening. snapSeen < 0 = not adopted yet.
+  property real snapSeen: -1
+  function noteSnapshot(msg) {
+    var snap = msg.lastSnapshot
+    var t = snap && snap.time ? snap.time : 0
+    var fresh = snapSeen >= 0 && t !== snapSeen && !!snap
+    snapSeen = t
+    if (!fresh) return
+    if (snap.error) { notify("Snapshot failed", String(snap.error)); return }
+    snapshotTaken(String(snap.path))
+    var name = String(snap.path).slice(String(snap.path).lastIndexOf("/") + 1)
+    snapProc.running = false   // a copy still in flight (two snapshots back to back) is superseded
+    snapProc.command = ["sh", "-c",
+      'wl-copy --type image/png < "$1"; ' +
+      'if command -v omarchy-notification-send >/dev/null 2>&1; then exec omarchy-notification-send "Camera Effects" "$2"; fi; ' +
+      'exec notify-send "Camera Effects" "$2"',
+      "camera-effects-snapshot", String(snap.path), "Snapshot copied to clipboard · " + name]
+    snapProc.running = true
+  }
+  function notify(title, body) {
+    if (notifyProc.running) return
+    notifyProc.command = ["sh", "-c",
+      'if command -v omarchy-notification-send >/dev/null 2>&1; then exec omarchy-notification-send "$1" "$2"; fi; exec notify-send "$1" "$2"',
+      "camera-effects-notify", title, body]
+    notifyProc.running = true
+  }
+  Process { id: snapProc }
+  Process { id: notifyProc }
 
   Process {
     id: setupProc
@@ -232,7 +271,7 @@ Item {
         onRead: function(line) {
           try {
             var msg = JSON.parse(line)
-            if (msg && msg.type === "state") { root.state = msg; if (root.daemonError !== "") root.daemonError = "" }
+            if (msg && msg.type === "state") { root.state = msg; if (root.daemonError !== "") root.daemonError = ""; root.noteSnapshot(msg) }
           } catch (e) { /* reply we don't care about */ }
         }
       }
@@ -241,6 +280,7 @@ Item {
         if (connected && root.previewWanted) root.setPreview(true)
         if (!connected) {
           root.state = ({})
+          root.snapSeen = -1
           if (root.orphanQuit) { root.orphanQuit = false; restartTimer.interval = 1000; restartTimer.restart() }
           reconnectTimer.restart()
         }

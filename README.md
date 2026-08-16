@@ -53,6 +53,11 @@ omarchy plugin remove alanfortlink.camera-effects
   lasers. Click one, or hold a gesture ~1 s away from your face: heart hands,
   thumbs up/down, peace sign, two peace signs, two thumbs up/down, two rock
   signs (4 s cooldown).
+- **Snapshot**: the shutter button on the preview (or
+  `omarchy-shell alanfortlink.camera-effects snap`, or `camera-effects-server
+  snap`) counts 3 · 2 · 1, then saves what apps see, at full output size, as
+  `~/Pictures/Camera Effects/YYYY-MM-DD_HH-MM-SS.png`, copies it to the
+  clipboard and notifies.
 - **Several cameras**: a source picker and a "Same effects on every camera"
   switch; off, each camera keeps its own settings.
 - **Block camera** (Privacy section): the webcam stays closed (light off) even
@@ -91,6 +96,7 @@ camera-effects-server set zoom=1.5 panX=0.3 panY=-0.2 rotate=90 fit=contain   # 
 camera-effects-server set block=true blockSource=/path/to/image-or-video   # blockSource= for the built-in card
 camera-effects-server set blockZoom=2 blockPanX=1 blockFit=cover           # frame the placeholder
 camera-effects-server react hearts                    # play a reaction now
+camera-effects-server snap                            # save the next output frame as a PNG (prints the path)
 camera-effects-server camera <bus-or-/dev/path>       # pick the physical camera (or a video file)
 camera-effects-server preview on                      # run the pipeline without a consumer (and write preview.jpg) while this command runs
 ```

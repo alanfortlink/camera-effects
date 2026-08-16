@@ -8,13 +8,16 @@ import qs.Ui
 // Bar icon + popup panel for the Camera Effects (the macOS "Video Effects"
 // menu, Omarchy style): live preview (drag to pan, wheel to zoom), camera
 // picker, one row per effect (switches, the Zoom slider, Fit/Filter/Effects/
-// Rotate dropdowns), reactions, and the privacy switches
+// Rotate dropdowns), reactions, a snapshot button, and the privacy switches
 // (block camera, hide raw camera). All state lives in the camera-effects-server daemon (see
 // Service.qml); this file only renders and forwards.
 Panel {
   id: root
   moduleName: "alanfortlink.camera-effects"
   ipcTarget: "alanfortlink.camera-effects"
+  // manageIpc: false so this panel can own the single IpcHandler the target
+  // permits — needed for `snap` below.
+  manageIpc: false
 
   // The shell mounts our service at startup (kinds: service); calling
   // ensureService() from a binding would mutate the registry it reads (loop).
@@ -95,11 +98,43 @@ Panel {
       if (root.svc && root.svc.gesture !== "" && !!root.s.reactions) gestureFire.restart()
       else gestureFire.stop()
     }
+    function onSnapshotTaken(path) { snapFlash.restart() }   // shutter feedback (also for a CLI/IPC snapshot while open)
   }
 
   visible: alwaysShow || inUse
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
+
+  // Snapshot: 3 · 2 · 1 over the preview, then the daemon saves its next
+  // output frame (what apps see) as a PNG; the service copies it to the
+  // clipboard and notifies, the preview flashes white here.
+  property int snapCount: 0   // 3..1 while counting down, 0 otherwise
+  function snap() {
+    if (!svc || snapCount > 0) return
+    if (!opened) open()   // the countdown is drawn over the preview
+    snapCount = 3
+    snapTimer.restart()
+  }
+  Timer {
+    id: snapTimer
+    interval: 1000
+    repeat: true
+    onTriggered: {
+      root.snapCount--
+      if (root.snapCount > 0) return
+      snapTimer.stop()
+      if (root.svc) root.svc.snapshot()
+    }
+  }
+  IpcHandler {
+    target: root.ipcTarget
+    function open() { root.open() }
+    function close() { root.close() }
+    function show() { root.open() }
+    function hide() { root.close() }
+    function toggle() { root.toggle() }
+    function snap() { root.snap() }   // omarchy-shell alanfortlink.camera-effects snap
+  }
 
   function basename(p) {
     var str = String(p || "")
@@ -515,6 +550,56 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
+            }
+            Rectangle {  // shutter button: snapshot of what apps see (after a 3 s countdown)
+              anchors.right: parent.right
+              anchors.bottom: parent.bottom
+              anchors.margins: Style.space(8)
+              visible: !!root.svc && root.snapCount === 0 && !!previewLoader.item && previewLoader.item.ready
+              color: snapArea.containsMouse ? "#cc000000" : "#aa000000"
+              radius: Style.space(4)
+              width: snapGlyph.implicitWidth + Style.space(12)
+              height: snapGlyph.implicitHeight + Style.space(6)
+              Text {
+                id: snapGlyph
+                anchors.centerIn: parent
+                text: "󰄀"
+                color: "#fff"
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+              MouseArea {
+                id: snapArea
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.snap()
+              }
+              PanelToolTip { visible: snapArea.containsMouse; text: "Snapshot · saved to ~/Pictures/Camera Effects and copied"; fontFamily: root.fontFamily }
+            }
+            Rectangle {  // countdown: a big centred number on a dim backdrop
+              anchors.centerIn: parent
+              visible: root.snapCount > 0
+              color: "#aa000000"
+              radius: Style.space(8)
+              width: Math.max(snapCountText.implicitHeight, snapCountText.implicitWidth) + Style.space(24)
+              height: width
+              Text {
+                id: snapCountText
+                anchors.centerIn: parent
+                text: root.snapCount > 0 ? String(root.snapCount) : ""
+                color: "#fff"
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.display * 2
+                font.bold: true
+              }
+            }
+            Rectangle {  // shutter flash when the snapshot is saved
+              id: snapFlashRect
+              anchors.fill: parent
+              color: "#ffffff"
+              opacity: 0
+              NumberAnimation { id: snapFlash; target: snapFlashRect; property: "opacity"; from: 0.85; to: 0; duration: 400; easing.type: Easing.OutQuad }
             }
           }
           Note {

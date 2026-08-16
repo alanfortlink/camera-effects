@@ -20,6 +20,7 @@ public:
   bool start(const std::string& socketPath, Handler handler, OnClose onClose, std::string* err);
   void stop();
   void broadcast(const std::string& line);
+  void sendTo(int client, const std::string& line);   // to one client if it is still connected (any thread)
   int clients();
 
 private:

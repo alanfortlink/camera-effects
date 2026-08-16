@@ -8,12 +8,14 @@
 // opens the camera and feeds a placeholder instead. The panel's preview is a
 // small JPEG the daemon writes to the runtime dir while a preview is wanted:
 // the loopback lets a single reader negotiate the format, so a second reader
-// (the panel) would see nothing while an app streams.
+// (the panel) would see nothing while an app streams. A snapshot request
+// saves the next output frame as a PNG under ~/Pictures/Camera Effects.
 #include <fcntl.h>
 #include <linux/videodev2.h>
 #include <pwd.h>
 #include <signal.h>
 #include <string.h>
+#include <time.h>
 #include <sys/prctl.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -22,6 +24,7 @@
 #include <sys/file.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -117,31 +120,43 @@ void settingsFromJson(const json& j, Settings& s) {
 
 // `hold`: stay connected after the reply until the daemon goes away or we are
 // killed (used by `preview on`, whose effect lasts as long as the connection).
-int cmdClient(const std::string& sockPath, const std::string& request, bool wait, bool hold = false) {
+// `untilType`: the reply is not the next line but the first one whose "type"
+// is this (a snapshot reply comes with the next frame, after any state pushes);
+// its "path" is printed, or its "error" and the exit code is 1.
+int cmdClient(const std::string& sockPath, const std::string& request, bool wait, bool hold = false, const char* untilType = nullptr) {
   sockaddr_un addr{};
   if (sockPath.size() >= sizeof(addr.sun_path)) { fprintf(stderr, "socket path too long: %s\n", sockPath.c_str()); return 1; }
   int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   addr.sun_family = AF_UNIX;
   strncpy(addr.sun_path, sockPath.c_str(), sizeof(addr.sun_path) - 1);
   if (connect(fd, (sockaddr*)&addr, sizeof addr) < 0) { fprintf(stderr, "daemon not running (%s)\n", sockPath.c_str()); return 1; }
-  timeval tv{ 5, 0 };  // never hang the CLI on a wedged daemon
+  timeval tv{ untilType ? 15 : 5, 0 };  // never hang the CLI on a wedged daemon (a snapshot may first have to start the camera)
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
   std::string msg = request + "\n";
   send(fd, msg.data(), msg.size(), 0);
   // Read the greeting state + reply.
   std::string acc;
   char buf[8192];
-  int lines = 0;
-  while (lines < (wait ? 2 : 1)) {
+  int lines = 0, rc = 0;
+  bool done = false;
+  while (!done) {
     ssize_t n = recv(fd, buf, sizeof buf, 0);
-    if (n <= 0) break;
+    if (n <= 0) { if (untilType) { fprintf(stderr, "no reply from the daemon\n"); rc = 1; } break; }
     acc.append(buf, n);
     size_t pos;
-    while ((pos = acc.find('\n')) != std::string::npos) {
+    while (!done && (pos = acc.find('\n')) != std::string::npos) {
       std::string line = acc.substr(0, pos);
       acc.erase(0, pos + 1);
       lines++;
-      if (lines == (wait ? 2 : 1)) { printf("%s\n", line.c_str()); fflush(stdout); }
+      if (untilType) {
+        json j = json::parse(line, nullptr, false);
+        if (!j.is_object() || (j.value("type", "") != untilType && j.value("type", "") != "error")) continue;  // an "error" reply ends it too (an older daemon: unknown cmd)
+        std::string err = j.value("error", "");
+        if (err.empty()) printf("%s\n", j.value("path", "").c_str());
+        else { fprintf(stderr, "%s\n", err.c_str()); rc = 1; }
+        fflush(stdout);
+        done = true;
+      } else if (lines == (wait ? 2 : 1)) { printf("%s\n", line.c_str()); fflush(stdout); done = true; }
     }
   }
   if (hold) {
@@ -150,7 +165,7 @@ int cmdClient(const std::string& sockPath, const std::string& request, bool wait
     while (recv(fd, buf, sizeof buf, 0) > 0) {}
   }
   close(fd);
-  return 0;
+  return rc;
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +309,23 @@ private:
   std::vector<uchar> previewJpg_; // encode buffer, reused
   clk::time_point previewDue_{};   // next frame at or after this is encoded
   bool previewWritten_ = false;   // a preview.jpg is on disk (to unlink when the preview stops)
+  // Snapshot (`{"cmd":"snapshot"}`): the next output frame (or placeholder
+  // frame) is saved as a PNG under snapDir_; while one is pending the pipeline
+  // runs like for a preview client. Requesters still connected when it is
+  // written get the reply; lastSnapshot_ ({path, time[, error]}) is shown in
+  // the state. Pending state under mu_; the PNG encode + write run on
+  // snapThread_ so the frame loop is not held up.
+  bool snapPending_ = false;
+  double snapSince_ = 0;          // when the pending request arrived (fails after kSnapTimeout)
+  std::vector<int> snapClients_;
+  std::string snapDir_;
+  json lastSnapshot_;
+  std::thread snapThread_;
+  static constexpr double kSnapTimeout = 8;   // seconds: enough to open a slow camera
+  void takeSnapshot(const cv::Mat& bgr);
+  void failStaleSnapshot();
+  void snapshotDone(const std::string& path, const std::string& error, const std::vector<int>& clients);
+  static std::string saveSnapshotPng(const std::string& dir, const cv::Mat& bgr, std::string* err);
   bool hideRawActive_ = false;
   std::string runtimeDir_;
   int misses_ = 0;      // consecutive grab timeouts
@@ -394,6 +426,7 @@ json Daemon::stateJson() {
                { "blockSource", cfg_.blockSource },
                { "blockFit", cfg_.blockFraming.fit }, { "blockZoom", cfg_.blockFraming.zoom }, { "blockPanX", cfg_.blockFraming.panX }, { "blockPanY", cfg_.blockFraming.panY },
                { "panRange", { panRange_.x, panRange_.y } },
+               { "lastSnapshot", lastSnapshot_ },
                { "error", error_ } };
   if (profile_) {
     const auto& f = framing_;
@@ -613,6 +646,7 @@ void Daemon::resetTier(bool keepTier) {
 void Daemon::clientClosed(int client) {
   std::lock_guard<std::mutex> lk(mu_);
   if (previewClients_.erase(client)) { previewOn_ = !previewClients_.empty(); stateDirty_ = true; }
+  snapClients_.erase(std::remove(snapClients_.begin(), snapClients_.end(), client), snapClients_.end());  // the snapshot is still taken
 }
 
 // Runs on the server thread. Requests come from same-uid clients but may be
@@ -668,6 +702,12 @@ std::string Daemon::handle(int client, const std::string& req) {
       previewOn_ = !previewClients_.empty();
       stateDirty_ = true;
       return kOk;
+    }
+    if (cmd == "snapshot") {  // replied to when the frame is written (see takeSnapshot)
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!snapPending_) { snapPending_ = true; snapSince_ = nowSec(); }
+      snapClients_.push_back(client);
+      return "";
     }
     if (cmd == "profile") {
       bool on = boolField("on");
@@ -740,6 +780,91 @@ void Daemon::removePreview() {
   unlink(previewTmp_.c_str());
 }
 
+// Snapshot: <dir>/YYYY-MM-DD_HH-MM-SS.png (a -2, -3 suffix when that name is
+// taken), created exclusively with O_NOFOLLOW so nothing outside the directory
+// can be written whatever is placed at the path. New dirs/files get the user's
+// gid (the setgid hide-raw build would leave them group camerad). Returns the
+// path, or "" with *err set. Runs on snapThread_.
+std::string Daemon::saveSnapshotPng(const std::string& dir, const cv::Mat& bgr, std::string* err) {
+  std::vector<uchar> png;
+  if (bgr.empty() || !cv::imencode(".png", bgr, png, { cv::IMWRITE_PNG_COMPRESSION, 3 })) { *err = "PNG encode failed"; return ""; }
+  std::string parent = dir.substr(0, dir.rfind('/'));   // ~/Pictures may not exist yet either
+  for (const std::string& d : { parent, dir }) {
+    if (mkdir(d.c_str(), 0755) == 0) (void)!chown(d.c_str(), (uid_t)-1, getgid());
+    else if (errno != EEXIST) { *err = "mkdir " + d + ": " + strerror(errno); return ""; }
+  }
+  time_t t = time(nullptr);
+  struct tm tm{};
+  localtime_r(&t, &tm);
+  char stamp[32];
+  strftime(stamp, sizeof stamp, "%Y-%m-%d_%H-%M-%S", &tm);
+  int fd = -1;
+  std::string path;
+  for (int i = 1; i <= 100 && fd < 0; i++) {
+    path = dir + "/" + stamp + (i == 1 ? std::string() : "-" + std::to_string(i)) + ".png";
+    fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0 && errno != EEXIST) { *err = "open " + path + ": " + strerror(errno); return ""; }
+  }
+  if (fd < 0) { *err = "too many snapshots this second"; return ""; }
+  (void)!fchown(fd, (uid_t)-1, getgid());
+  size_t off = 0;
+  while (off < png.size()) {
+    ssize_t n = write(fd, png.data() + off, png.size() - off);
+    if (n <= 0) { *err = "write " + path + ": " + strerror(errno); close(fd); unlink(path.c_str()); return ""; }
+    off += (size_t)n;
+  }
+  close(fd);
+  return path;
+}
+
+// Main thread, with the frame the outputs just got: hand a copy to the worker.
+void Daemon::takeSnapshot(const cv::Mat& bgr) {
+  std::vector<int> clients;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!snapPending_) return;
+    snapPending_ = false;
+    clients.swap(snapClients_);
+  }
+  if (snapThread_.joinable()) snapThread_.join();  // the previous one (~50 ms of PNG work) is normally long done
+  cv::Mat copy = bgr.clone();
+  snapThread_ = std::thread([this, copy, clients] {
+    std::string err, path;
+    try { path = saveSnapshotPng(snapDir_, copy, &err); } catch (const std::exception& e) { err = e.what(); }
+    snapshotDone(path, err, clients);
+  });
+}
+
+// No frame came within kSnapTimeout (no camera, capture failing): fail the request.
+void Daemon::failStaleSnapshot() {
+  std::vector<int> clients;
+  std::string why;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!snapPending_ || nowSec() - snapSince_ < kSnapTimeout) return;
+    snapPending_ = false;
+    clients.swap(snapClients_);
+    why = error_.empty() ? "no frame" : error_;
+  }
+  snapshotDone("", why, clients);
+}
+
+// Any thread: reply to the requesters and show the result in the state.
+void Daemon::snapshotDone(const std::string& path, const std::string& error, const std::vector<int>& clients) {
+  json r = { { "type", "snapshot" }, { "path", path } };
+  if (!error.empty()) r["error"] = error;
+  std::string line = r.dump();
+  for (int c : clients) server_.sendTo(c, line);
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    lastSnapshot_ = json{ { "path", path }, { "time", std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count() } };
+    if (!error.empty()) lastSnapshot_["error"] = error;
+    stateDirty_ = true;
+  }
+  if (error.empty()) fprintf(stderr, "camera-effects-server: snapshot saved to %s\n", path.c_str());
+  else fprintf(stderr, "camera-effects-server: snapshot failed: %s\n", error.c_str());
+}
+
 int Daemon::run() {
   // The shell owns us: exit with it rather than linger as an orphan the next
   // shell cannot manage (it also asks a stray instance to quit, belt and braces).
@@ -759,6 +884,7 @@ int Daemon::run() {
   std::string sockPath = runtimeDir_ + "/ctl.sock";
   previewPath_ = runtimeDir_ + "/preview.jpg";
   previewTmp_ = previewPath_ + ".tmp";
+  snapDir_ = homeDir() + "/Pictures/Camera Effects";
   // Single instance per session (the shell restarts us; a stray manual copy
   // must not fight over the loopback writer).
   int lockFd = open((runtimeDir_ + "/lock").c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
@@ -807,11 +933,12 @@ int Daemon::run() {
     setState(hideRawActive_, fileExists("/etc/udev/rules.d/71-camera-effects-hide-raw.rules"));
 
     flushConfig();
-    bool preview, block;
+    failStaleSnapshot();
+    bool preview, snap, block;
     std::string blockSrc;
     Framing blockFraming;
-    { std::lock_guard<std::mutex> lk(mu_); preview = previewOn_; block = cfg_.block; blockSrc = cfg_.blockSource; blockFraming = cfg_.blockFraming; }
-    bool want = (loop_.isOpen() && consumers_ > 0) || pwActive_ || preview;
+    { std::lock_guard<std::mutex> lk(mu_); preview = previewOn_; snap = snapPending_; block = cfg_.block; blockSrc = cfg_.blockSource; blockFraming = cfg_.blockFraming; }
+    bool want = (loop_.isOpen() && consumers_ > 0) || pwActive_ || preview || snap;  // a pending snapshot runs the pipeline like a preview client
     if (!preview) removePreview();
     // Blocked: the physical camera stays closed (light off) whatever the
     // consumers do; they get the placeholder from block_ instead, on the same
@@ -861,6 +988,7 @@ int Daemon::run() {
         if (loop_.isOpen()) loop_.writeYuyv(yuyv_);
         pwOut_.pushYuyv(yuyv_);
         if (preview) writePreview(card, clk::now());
+        if (snap) takeSnapshot(card);
         countFrame();
       } catch (const std::exception& e) {
         fprintf(stderr, "camera-effects-server: placeholder frame dropped: %s\n", e.what());
@@ -892,6 +1020,7 @@ int Daemon::run() {
           if (loop_.isOpen()) loop_.writeYuyv(yuyv_);
           pwOut_.pushYuyv(yuyv_);
           if (preview) writePreview(out, clk::now());  // after the outputs: never delays them
+          if (snap) takeSnapshot(out);
         } catch (const std::exception& e) {
           fprintf(stderr, "camera-effects-server: frame dropped: %s\n", e.what());
           continue;
@@ -927,6 +1056,7 @@ int Daemon::run() {
   block_.close();
   pwOut_.stop();
   watcher_.stop();
+  if (snapThread_.joinable()) snapThread_.join();
   server_.stop();
   removePreview();
   { std::lock_guard<std::mutex> lk(mu_); if (cfgDirty_) saveConfig(cfg_); }
@@ -1014,9 +1144,10 @@ int main(int argc, char** argv) {
     return cmdClient(sock, json{ { "cmd", "preview" }, { "on", on } }.dump(), true, on);
   }
   if (cmd == "quit") return cmdClient(sock, R"({"cmd":"quit"})", true);
+  if (cmd == "snap") return cmdClient(sock, R"({"cmd":"snapshot"})", true, false, "snapshot");  // prints the PNG path
   if (cmd == "profile") return cmdClient(sock, json{ { "cmd", "profile" }, { "on", argc > 2 && std::string(argv[2]) == "on" } }.dump(), true);
   if (cmd != "run") {
-    fprintf(stderr, "usage: camera-effects-server [run|status|set k=v...|react NAME|camera BUS|preview on (holds while running)|off|profile on|off|quit]\n");
+    fprintf(stderr, "usage: camera-effects-server [run|status|set k=v...|react NAME|camera BUS|snap|preview on (holds while running)|off|profile on|off|quit]\n");
     return 2;
   }
   signal(SIGINT, onSignal);
