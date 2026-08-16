@@ -91,8 +91,8 @@ bool FaceDetector::load(const std::string& modelPath, std::string* err) {
   }
 }
 
-std::vector<cv::Rect2f> FaceDetector::detect(const cv::Mat& small, double toSrc) {
-  std::vector<cv::Rect2f> faces;
+std::vector<Face> FaceDetector::detect(const cv::Mat& small, double toSrc) {
+  std::vector<Face> faces;
   if (!det_ || small.empty()) return faces;
   // Detect at <=320 wide; YuNet is fast enough there and small faces are not
   // what framing cares about.
@@ -106,10 +106,15 @@ std::vector<cv::Rect2f> FaceDetector::detect(const cv::Mat& small, double toSrc)
   if (img->size() != inputSize_) { det_->setInputSize(img->size()); inputSize_ = img->size(); }
   cv::Mat res;
   det_->detect(*img, res);
+  // Rows: x,y,w,h, re_x,re_y, le_x,le_y, nose_x,nose_y, rm_x,rm_y, lm_x,lm_y, score
   double k = toSrc / scale;
-  for (int i = 0; i < res.rows; i++) {
+  for (int i = 0; i < res.rows && res.cols >= 15; i++) {
     const float* r = res.ptr<float>(i);
-    faces.emplace_back((float)(r[0] * k), (float)(r[1] * k), (float)(r[2] * k), (float)(r[3] * k));
+    Face f;
+    f.box = cv::Rect2f((float)(r[0] * k), (float)(r[1] * k), (float)(r[2] * k), (float)(r[3] * k));
+    for (int j = 0; j < 5; j++) f.lm[j] = cv::Point2f((float)(r[4 + 2 * j] * k), (float)(r[5 + 2 * j] * k));
+    f.score = r[14];
+    faces.push_back(f);
   }
   return faces;
 }

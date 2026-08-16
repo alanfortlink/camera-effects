@@ -46,15 +46,22 @@ private:
   cv::Mat sq_, rgb_;
 };
 
+// One detected face: box plus YuNet's 5 landmarks, all in the same coordinates.
+struct Face {
+  cv::Rect2f box;
+  cv::Point2f lm[5];  // right eye, left eye, nose tip, right mouth corner, left mouth corner
+  float score = 0;
+};
+
 // YuNet via OpenCV's FaceDetectorYN (BSD-3). Runs on a downscaled frame.
 class FaceDetector {
 public:
   bool load(const std::string& modelPath, std::string* err);
   bool loaded() const { return det_ != nullptr; }
-  // Face boxes in the coordinates of `small` multiplied by `toSrc` (the caller
+  // Faces in the coordinates of `small` multiplied by `toSrc` (the caller
   // passes a pyramid level of the frame and its scale back to full size).
   // `small` wider than 320 px is resized down (INTER_LINEAR).
-  std::vector<cv::Rect2f> detect(const cv::Mat& small, double toSrc = 1.0);
+  std::vector<Face> detect(const cv::Mat& small, double toSrc = 1.0);
 
 private:
   cv::Ptr<cv::FaceDetectorYN> det_;

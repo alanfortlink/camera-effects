@@ -6,9 +6,10 @@ import qs.Commons
 import qs.Ui
 
 // Bar icon + popup panel for the Iris Camera (the macOS "Video Effects"
-// menu, Omarchy style): live preview, camera picker, one row per effect,
-// reactions, and the "hide raw camera" switches. All state lives in the
-// irisd daemon (see Service.qml); this file only renders and forwards.
+// menu, Omarchy style): live preview, camera picker, one row per effect
+// (switches and Filter/Fun dropdowns), reactions, and the privacy switches
+// (block camera, hide raw camera). All state lives in the irisd daemon (see
+// Service.qml); this file only renders and forwards.
 Panel {
   id: root
   moduleName: "alanfortlink.iris"
@@ -23,6 +24,7 @@ Panel {
   readonly property var cams: svc ? svc.cameras : []
   readonly property bool multiCam: cams.length > 1
   readonly property bool alwaysShow: setting("alwaysShow", true)
+  readonly property bool blocked: svc ? svc.block : false
 
   // The panel's own preview is itself a consumer of the virtual camera, so
   // while it is loaded the daemon reports consumers >= 1 and running = true
@@ -91,6 +93,7 @@ Panel {
     if (!connected) return "Starting…"
     if (svc.deviceMissing) return "Needs setup"
     if (svc.error) return svc.error
+    if (blocked) return "BLOCKED" + (appsConnected ? " · " + appCount + (appCount > 1 ? " apps" : " app") : "")
     var cam = camName(svc.camera)
     var fps = inUse && svc.fps ? " · " + svc.fps + " FPS" : ""
     if (appsConnected) return "In use · " + cam + fps
@@ -134,7 +137,7 @@ Panel {
     var res = svc.state.output ? " · " + svc.state.output.width + "×" + svc.state.output.height : ""
     // Keep it under ~50 monospace caption characters so it never elides.
     var use = appCount > 0 ? appCount + " app" + (appCount > 1 ? "s" : "") + " connected"
-            : previewActive ? "Preview only · camera on while open" : "Idle"
+            : previewActive ? (blocked ? "Preview only · camera blocked" : "Preview only · camera on while open") : "Idle"
     return use + res
   }
 
@@ -146,7 +149,8 @@ Panel {
     active: root.appsConnected
     useActiveColor: true
     activeColor: Color.accent
-    tooltipText: (root.appsConnected ? "Camera in use — effects" : "Camera effects") + " · right-click: Portrait"
+    tooltipText: (root.appsConnected ? (root.blocked ? "Camera blocked — apps get the placeholder" : "Camera in use — effects")
+                                     : (root.blocked ? "Camera blocked" : "Camera effects")) + " · right-click: Portrait"
     onPressed: function(b) {
       if (b === Qt.RightButton && root.svc) root.svc.setSetting("portrait", !root.s.portrait)
       else root.toggle()
@@ -155,26 +159,33 @@ Panel {
 
   onOpenedChanged: if (opened && svc) { svc.refresh(); svc.rescan() }
 
-  // Native file chooser for the background image; falls back to a plain path
-  // field when zenity is not around.
+  // Native file chooser for the background image and the block placeholder;
+  // falls back to a plain path field when zenity is not around.
   Process {
     id: pickProc
     property string picked: ""
     property int exitCode: -1
     property bool streamDone: false
+    property string target: "backgroundImage"   // setting the chosen path goes to
+    property string title: "Background image"
+    property string filter: "Images | *.png *.jpg *.jpeg *.webp *.bmp"
     command: ["sh", "-c",
       'command -v zenity >/dev/null 2>&1 || exit 127; ' +
-      'exec zenity --file-selection --title="Background image" ' +
-      '--file-filter="Images | *.png *.jpg *.jpeg *.webp *.bmp" --file-filter="All files | *"']
-    function begin() {
+      'exec zenity --file-selection --title="$1" --file-filter="$2" --file-filter="All files | *"',
+      "iris-pick", title, filter]
+    // begin(target, title, filter): open the chooser for `target` (a daemon setting key).
+    function begin(t, ti, f) {
       if (running) return
+      target = t || "backgroundImage"
+      title = ti || "Background image"
+      filter = f || "Images | *.png *.jpg *.jpeg *.webp *.bmp"
       picked = ""; exitCode = -1; streamDone = false
       running = true
     }
     function finish() {
       if (exitCode < 0 || !streamDone) return
       if (exitCode === 127) root.pickerMissing = true
-      else if (exitCode === 0 && picked !== "" && root.svc) root.svc.setSetting("backgroundImage", picked)
+      else if (exitCode === 0 && picked !== "" && root.svc) root.svc.setSetting(target, picked)
     }
     stdout: StdioCollector { onStreamFinished: { pickProc.picked = String(text).trim(); pickProc.streamDone = true; pickProc.finish() } }
     onExited: function(code) { pickProc.exitCode = code; pickProc.finish() }
@@ -245,6 +256,56 @@ Panel {
     font.pixelSize: Style.font.caption
     elide: Text.ElideRight
   }
+
+  // Label on the left, a compact dropdown on the right (like the Background row).
+  component LabelDropdownRow: Item {
+    id: ldr
+    property string label: ""
+    property var options: []
+    property string value: ""
+    signal changed(string v)
+    width: parent ? parent.width : 200
+    height: root.rowH
+    Text {
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      text: ldr.label
+      color: root.fg
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+    }
+    Dropdown {
+      anchors.right: parent.right
+      anchors.rightMargin: root.trailInset
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(120)
+      showLabel: false
+      fontFamily: root.fontFamily
+      options: ldr.options
+      value: ldr.value
+      onChanged: function(v) { ldr.changed(v) }
+    }
+  }
+
+  readonly property var filterOpts: [ { value: "none", label: "None" }, { value: "mono", label: "Mono" }, { value: "sepia", label: "Sepia" },
+    { value: "warm", label: "Warm" }, { value: "cool", label: "Cool" }, { value: "vivid", label: "Vivid" }, { value: "soft", label: "Soft" },
+    { value: "sharpen", label: "Sharpen" }, { value: "vintage", label: "Vintage" } ]
+  readonly property var funOpts: [ { value: "none", label: "None" }, { value: "sunglasses", label: "Sunglasses" }, { value: "glasses", label: "Glasses" },
+    { value: "tophat", label: "Top hat" }, { value: "crown", label: "Crown" }, { value: "cat", label: "Cat" }, { value: "halo", label: "Halo" },
+    { value: "headphones", label: "Headphones" }, { value: "flowers", label: "Flowers" } ]
+  readonly property string imageFilter: "Images | *.png *.jpg *.jpeg *.webp *.bmp"
+  readonly property string videoFilter: "Videos | *.mp4 *.mkv *.webm *.mov *.avi *.y4m *.gif"
+  // Block placeholder kind: derived from the source's extension ("card" when
+  // empty); blockKindPick remembers a kind chosen before its file is picked.
+  function blockKindOf(p) {
+    var e = String(p || "").toLowerCase().replace(/^.*\./, "")
+    if (!p) return "card"
+    return ["png", "jpg", "jpeg", "webp", "bmp"].indexOf(e) !== -1 ? "image" : "video"
+  }
+  property string blockKindPick: ""
+  readonly property string blockSourceNow: svc ? svc.blockSource : ""
+  onBlockSourceNowChanged: blockKindPick = ""
+  readonly property string blockKind: blockKindPick !== "" ? blockKindPick : blockKindOf(blockSourceNow)
 
   KeyboardPanel {
     id: panel
@@ -523,9 +584,11 @@ Panel {
               bordered: true
               enabled: !root.pickerMissing
               opacity: enabled ? 1 : 0.5
-              onClicked: pickProc.begin()
+              onClicked: pickProc.begin("backgroundImage", "Background image", root.imageFilter)
             }
           }
+          LabelDropdownRow { label: "Filter"; options: root.filterOpts; value: root.s.filter || "none"; onChanged: function(v) { if (root.svc) root.svc.setSetting("filter", v) } }
+          LabelDropdownRow { label: "Fun"; options: root.funOpts; value: root.s.fun || "none"; onChanged: function(v) { if (root.svc) root.svc.setSetting("fun", v) } }
           SwitchRow {  // switch = hand-gesture triggers; the strip below plays one now
             label: "Reactions · hand gestures"
             checked: !!root.s.reactions
@@ -570,6 +633,75 @@ Panel {
 
           // ---------- Privacy ----------
           PanelSectionHeader { text: "PRIVACY"; foreground: root.fg; fontFamily: root.fontFamily }
+          SwitchRow {  // privacy shutter: the webcam stays closed, apps get a placeholder
+            label: "Block camera"
+            checked: root.blocked
+            onToggled: if (root.svc) root.svc.setSetting("block", !root.blocked)
+          }
+          Item {  // what apps see while blocked: kind dropdown + file (own row, indented)
+            visible: root.blocked
+            width: parent.width
+            height: root.rowH
+            Note {
+              visible: root.blockKind !== "card" && !root.pickerMissing
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(20)
+              anchors.right: blockChoose.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              elide: Text.ElideMiddle
+              font.pixelSize: Style.font.bodySmall
+              color: root.blockSourceNow && root.blockKindPick === "" ? root.fg : root.dim
+              text: root.blockSourceNow && root.blockKindPick === "" ? root.basename(root.blockSourceNow) : "No file chosen"
+            }
+            TextField {  // fallback when there is no zenity to pick with
+              visible: root.blockKind !== "card" && root.pickerMissing
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(20)
+              anchors.right: blockChoose.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              foreground: root.fg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              placeholderText: root.blockKind === "image" ? "/path/to/image.png" : "/path/to/video.mp4"
+              text: root.blockSourceNow
+              onEditingFinished: if (root.svc && text !== "") root.svc.setSetting("blockSource", text)
+            }
+            Button {
+              id: blockChoose
+              visible: root.blockKind !== "card"
+              anchors.right: blockKindDropdown.left
+              anchors.rightMargin: Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Choose…"
+              fontSize: Style.font.bodySmall
+              foreground: root.fg
+              fontFamily: root.fontFamily
+              bordered: true
+              enabled: !root.pickerMissing
+              opacity: enabled ? 1 : 0.5
+              onClicked: pickProc.begin("blockSource", root.blockKind === "image" ? "Placeholder image" : "Placeholder video",
+                                        root.blockKind === "image" ? root.imageFilter : root.videoFilter)
+            }
+            Dropdown {
+              id: blockKindDropdown
+              anchors.right: parent.right
+              anchors.rightMargin: root.trailInset
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(120)
+              showLabel: false
+              fontFamily: root.fontFamily
+              options: [ { value: "card", label: "Built-in card" }, { value: "image", label: "Image" }, { value: "video", label: "Video" } ]
+              value: root.blockKind
+              onChanged: function(v) {
+                if (!root.svc) return
+                if (v === "card") { root.blockKindPick = ""; root.svc.setSetting("blockSource", "") }
+                else if (v !== root.blockKindOf(root.blockSourceNow)) root.blockKindPick = v
+                else root.blockKindPick = ""
+              }
+            }
+          }
           SwitchRow {
             label: root.multiCam ? "Hide all raw cameras from apps" : "Hide raw camera from apps"
             checked: root.svc ? root.svc.hideRaw : false

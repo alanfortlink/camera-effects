@@ -1,8 +1,9 @@
 # Iris
 
 macOS-style camera effects for Omarchy: Center Stage, Portrait, Studio Light,
-backgrounds and hand-gesture reactions on any webcam, published as a virtual
-camera called **"Iris Camera"** that every app can pick.
+backgrounds, colour filters, fun face filters, hand-gesture reactions and a
+privacy shutter on any webcam, published as a virtual camera called
+**"Iris Camera"** that every app can pick.
 
 > Tested only on **Omarchy 4** (Arch Linux, Hyprland, omarchy-shell).
 > Video walkthrough: coming soon.
@@ -46,12 +47,19 @@ omarchy plugin remove alanfortlink.iris
 
 - **Effects**: Center Stage (auto-framing), Portrait (blur, with intensity),
   Studio Light (with intensity), Background (color or image), Mirror.
+- **Filter**: a colour look — Mono, Sepia, Warm, Cool, Vivid, Soft, Sharpen,
+  Vintage (about 1 ms per frame).
+- **Fun**: face accessories that follow your head (up to four faces) —
+  Sunglasses, Glasses, Top hat, Crown, Cat, Halo, Headphones, Flowers.
 - **Reactions**: hearts, thumbs up/down, balloons, confetti, fireworks, rain,
   lasers. Click one, or hold a gesture ~1 s away from your face: heart hands,
   thumbs up/down, peace sign, two peace signs, two thumbs up/down, two rock
   signs (4 s cooldown).
 - **Several cameras**: a source picker and a "Same effects on every camera"
   switch; off, each camera keeps its own settings.
+- **Block camera** (Privacy section): the webcam stays closed (light off) even
+  while apps use Iris Camera; they get the built-in "Camera paused" card, or an
+  image or a looped video of your choice, instead. Global, not per camera.
 - **Hide raw camera from apps** (Privacy section, password on each toggle): USB
   webcams are taken away from your user so apps only see "Iris Camera" (one
   switch for all, plus one per camera); toggling off restores them. This keeps
@@ -77,6 +85,8 @@ Nothing leaves your machine.
 ```bash
 irisd status                          # JSON state (consumers, fps, settings…)
 irisd set portrait=true portraitIntensity=0.7 centerStage=true
+irisd set filter=vintage fun=sunglasses
+irisd set block=true blockSource=/path/to/image-or-video   # blockSource= for the built-in card
 irisd react hearts                    # play a reaction now
 irisd camera <bus-or-/dev/path>       # pick the physical camera (or a video file)
 irisd preview on|off                  # keep the pipeline running without a consumer

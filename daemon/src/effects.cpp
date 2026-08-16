@@ -26,6 +26,60 @@ bool parseHexColor(const std::string& s, unsigned& rgb) {
   return true;
 }
 
+const std::vector<std::string>& Settings::filterNames() {
+  static const std::vector<std::string> n = { "none", "mono", "sepia", "warm", "cool", "vivid", "soft", "sharpen", "vintage" };
+  return n;
+}
+const std::vector<std::string>& Settings::funNames() {
+  static const std::vector<std::string> n = { "none", "sunglasses", "glasses", "tophat", "crown", "cat", "halo", "headphones", "flowers" };
+  return n;
+}
+
+void coverFit(const cv::Mat& img, cv::Mat& dst, const cv::Size& sz) {
+  if (img.size() == sz) { img.copyTo(dst); return; }
+  double s = std::max((double)sz.width / img.cols, (double)sz.height / img.rows);
+  cv::Mat scaled;
+  cv::Size ss(std::max(sz.width, (int)(img.cols * s)), std::max(sz.height, (int)(img.rows * s)));
+  cv::resize(img, scaled, ss, 0, 0, s < 1 ? cv::INTER_AREA : cv::INTER_LINEAR);
+  cv::Rect r((scaled.cols - sz.width) / 2, (scaled.rows - sz.height) / 2, sz.width, sz.height);
+  scaled(r).copyTo(dst);  // dst is reused when it already has the size
+}
+
+void alphaBlit(cv::Mat& frame, const cv::Mat& sprite, double cx, double cy, double scale, double alpha, double rot) {
+  if (sprite.empty() || sprite.type() != CV_8UC4 || frame.type() != CV_8UC3 || !(scale > 0) || alpha <= 0.01) return;  // empty: asset missing
+  cv::Size dst((int)std::max(1.0, sprite.cols * scale), (int)std::max(1.0, sprite.rows * scale));
+  if (dst.width < 2 && dst.height < 2) return;
+  cv::Mat sp;
+  cv::resize(sprite, sp, dst, 0, 0, scale < 1 ? cv::INTER_AREA : cv::INTER_LINEAR);
+  if (std::abs(rot) > 1e-3) {
+    // Rotate into a box large enough for the whole rotated sprite (a wide,
+    // flat sprite would otherwise lose its corners).
+    double c = std::abs(std::cos(rot)), sn = std::abs(std::sin(rot));
+    cv::Size rs((int)std::ceil(sp.cols * c + sp.rows * sn), (int)std::ceil(sp.cols * sn + sp.rows * c));
+    cv::Mat R = cv::getRotationMatrix2D(cv::Point2f(sp.cols / 2.f, sp.rows / 2.f), rot * 180 / CV_PI, 1.0);
+    R.at<double>(0, 2) += (rs.width - sp.cols) / 2.0;
+    R.at<double>(1, 2) += (rs.height - sp.rows) / 2.0;
+    cv::Mat rotated;
+    cv::warpAffine(sp, rotated, R, rs, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0, 0));
+    sp = rotated;
+  }
+  int x0 = (int)std::lround(cx - sp.cols / 2.0), y0 = (int)std::lround(cy - sp.rows / 2.0);
+  cv::Rect r(x0, y0, sp.cols, sp.rows);
+  cv::Rect fr = r & cv::Rect(0, 0, frame.cols, frame.rows);
+  if (fr.empty()) return;
+  cv::Mat roi = frame(fr);
+  cv::Mat sroi = sp(cv::Rect(fr.x - r.x, fr.y - r.y, fr.width, fr.height));
+  for (int y = 0; y < fr.height; y++) {
+    uchar* d = roi.ptr<uchar>(y);
+    const uchar* sr = sroi.ptr<uchar>(y);
+    for (int x = 0; x < fr.width; x++) {
+      float a = sr[x * 4 + 3] / 255.f * (float)alpha;
+      if (a <= 0.003f) continue;
+      for (int c = 0; c < 3; c++) d[x * 3 + c] = (uchar)(d[x * 3 + c] * (1 - a) + sr[x * 4 + c] * a);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Framer (Center Stage)
 
@@ -158,30 +212,8 @@ void Reactions::spawn(Anim& a, const cv::Size& sz) {
 }
 
 void Reactions::blit(cv::Mat& frame, const cv::Mat& sprite, double cx, double cy, double size, double alpha, double rot) {
-  if (sprite.empty() || size < 2 || alpha <= 0.01) return;  // empty: asset missing
-  double s = size / std::max(sprite.cols, sprite.rows);
-  cv::Mat sp;
-  cv::Size dst((int)std::max(1.0, sprite.cols * s), (int)std::max(1.0, sprite.rows * s));
-  cv::resize(sprite, sp, dst, 0, 0, s < 1 ? cv::INTER_AREA : cv::INTER_LINEAR);
-  if (std::abs(rot) > 1e-3) {
-    cv::Mat R = cv::getRotationMatrix2D(cv::Point2f(sp.cols / 2.f, sp.rows / 2.f), rot * 180 / CV_PI, 1.0);
-    cv::warpAffine(sp, sp, R, sp.size(), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0, 0));
-  }
-  int x0 = (int)(cx - sp.cols / 2.0), y0 = (int)(cy - sp.rows / 2.0);
-  cv::Rect r(x0, y0, sp.cols, sp.rows);
-  cv::Rect fr = r & cv::Rect(0, 0, frame.cols, frame.rows);
-  if (fr.empty()) return;
-  cv::Mat roi = frame(fr);
-  cv::Mat sroi = sp(cv::Rect(fr.x - r.x, fr.y - r.y, fr.width, fr.height));
-  for (int y = 0; y < fr.height; y++) {
-    uchar* d = roi.ptr<uchar>(y);
-    const uchar* sr = sroi.ptr<uchar>(y);
-    for (int x = 0; x < fr.width; x++) {
-      float a = sr[x * 4 + 3] / 255.f * (float)alpha;
-      if (a <= 0.003f) continue;
-      for (int c = 0; c < 3; c++) d[x * 3 + c] = (uchar)(d[x * 3 + c] * (1 - a) + sr[x * 4 + c] * a);
-    }
-  }
+  if (sprite.empty() || size < 2) return;
+  alphaBlit(frame, sprite, cx, cy, size / std::max(sprite.cols, sprite.rows), alpha, rot);
 }
 
 namespace {
@@ -227,50 +259,94 @@ void blend8Roi(cv::Mat& frame, const cv::Mat& layer, const cv::Mat& alpha, const
 }
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// OverlayLayer
+
+void OverlayLayer::begin(const cv::Size& sz) { size_ = sz; used_ = false; bbox_ = cv::Rect(); }
+
+void OverlayLayer::ensure() {
+  if (used_) return;
+  if (overlay_.size() != size_) {
+    overlay_.create(size_, CV_8UC3); overlay_.setTo(cv::Scalar(0, 0, 0));
+    overlayA_.create(size_, CV_8UC1); overlayA_.setTo(0);
+  } else if (!dirty_.empty()) {  // clear only what the previous frame drew
+    overlay_(dirty_).setTo(cv::Scalar(0, 0, 0));
+    overlayA_(dirty_).setTo(0);
+  }
+  dirty_ = cv::Rect();
+  used_ = true;
+}
+
+void OverlayLayer::grow(cv::Rect r) { r &= cv::Rect(0, 0, size_.width, size_.height); bbox_ = bbox_.empty() ? r : (bbox_ | r); }
+
+void OverlayLayer::poly(const cv::Point* pts, int n, cv::Scalar col, double a) {
+  ensure();
+  cv::fillConvexPoly(overlay_, pts, n, col, cv::LINE_AA);
+  cv::fillConvexPoly(overlayA_, pts, n, cv::Scalar(a * 255), cv::LINE_AA);
+  cv::Rect r = cv::boundingRect(std::vector<cv::Point>(pts, pts + n));
+  grow(cv::Rect(r.x - 2, r.y - 2, r.width + 4, r.height + 4));
+}
+
+void OverlayLayer::line(cv::Point2f p0, cv::Point2f p1, cv::Scalar col, double a, int th) {
+  ensure();
+  cv::line(overlay_, p0, p1, col, th, cv::LINE_AA);
+  cv::line(overlayA_, p0, p1, cv::Scalar(a * 255), th, cv::LINE_AA);
+  int x0 = (int)std::floor(std::min(p0.x, p1.x)) - th - 2, y0 = (int)std::floor(std::min(p0.y, p1.y)) - th - 2;
+  int x1 = (int)std::ceil(std::max(p0.x, p1.x)) + th + 2, y1 = (int)std::ceil(std::max(p0.y, p1.y)) + th + 2;
+  grow(cv::Rect(x0, y0, x1 - x0, y1 - y0));
+}
+
+void OverlayLayer::dot(cv::Point2f c, int r, cv::Scalar col, double a) {
+  ensure();
+  cv::circle(overlay_, c, r, col, -1, cv::LINE_AA);
+  cv::circle(overlayA_, c, r, cv::Scalar(a * 255), -1, cv::LINE_AA);
+  grow(cv::Rect((int)c.x - r - 2, (int)c.y - r - 2, 2 * r + 5, 2 * r + 5));
+}
+
+void OverlayLayer::ellipse(cv::Point2f c, cv::Size2f axes, double angleDeg, cv::Scalar col, double a, int th) {
+  ensure();
+  cv::ellipse(overlay_, c, cv::Size((int)axes.width, (int)axes.height), angleDeg, 0, 360, col, th, cv::LINE_AA);
+  cv::ellipse(overlayA_, c, cv::Size((int)axes.width, (int)axes.height), angleDeg, 0, 360, cv::Scalar(a * 255), th, cv::LINE_AA);
+  int r = (int)std::ceil(std::max(axes.width, axes.height)) + std::max(th, 0) + 2;
+  grow(cv::Rect((int)c.x - r, (int)c.y - r, 2 * r + 1, 2 * r + 1));
+}
+
+void OverlayLayer::composite(cv::Mat& frame, bool glow) {
+  if (!used_ || bbox_.empty() || frame.size() != size_) return;
+  const cv::Rect frameRect(0, 0, size_.width, size_.height);
+  cv::Rect bbox = bbox_;
+  if (glow) {  // soft halo: blurred copy (at half resolution) added under the crisp layer
+    int k = std::max(3, (int)(size_.height * 0.02) | 1);
+    cv::Rect gr(bbox.x - k, bbox.y - k, bbox.width + 2 * k, bbox.height + 2 * k);
+    gr &= frameRect;
+    cv::Size half((gr.width + 1) / 2, (gr.height + 1) / 2);
+    cv::resize(overlay_(gr), glowC_, half, 0, 0, cv::INTER_LINEAR);
+    cv::resize(overlayA_(gr), glowA_, half, 0, 0, cv::INTER_LINEAR);
+    int kh = std::max(3, (k / 2) | 1);
+    cv::GaussianBlur(glowC_, glowC_, cv::Size(kh, kh), 0);
+    cv::GaussianBlur(glowA_, glowA_, cv::Size(kh, kh), 0);
+    glowA_.convertTo(glowA_, -1, 0.7);
+    cv::Mat gc, ga;  // upsampled halo, blended over the ROI only
+    cv::resize(glowC_, gc, gr.size(), 0, 0, cv::INTER_LINEAR);
+    cv::resize(glowA_, ga, gr.size(), 0, 0, cv::INTER_LINEAR);
+    cv::Mat roi = frame(gr);
+    blend8Roi(roi, gc, ga, cv::Rect(0, 0, gr.width, gr.height));
+    bbox = gr;
+  }
+  blend8Roi(frame, overlay_, overlayA_, bbox);
+  dirty_ = bbox;
+}
+
 void Reactions::render(cv::Mat& frame, double now) {
   const double DUR = 3.6;
   const double W = frame.cols, H = frame.rows;
-  const cv::Rect frameRect(0, 0, frame.cols, frame.rows);
-  // Procedural effects draw into an overlay + alpha layer, composited once so
-  // shapes get real transparency (and a cheap glow where it helps). Only the
-  // union bounding box of what was drawn is cleared and blended.
-  bool usedOverlay = false;
+  // Procedural effects draw into layer_ (overlay + alpha), composited once so
+  // shapes get real transparency (and a cheap glow where it helps).
   bool glow = false;
-  cv::Rect bbox;
-  auto ensureOverlay = [&]() {
-    if (usedOverlay) return;
-    if (overlay_.size() != frame.size()) {
-      overlay_.create(frame.size(), CV_8UC3); overlay_.setTo(cv::Scalar(0, 0, 0));
-      overlayA_.create(frame.size(), CV_8UC1); overlayA_.setTo(0);
-    } else if (!dirty_.empty()) {  // clear only what the previous frame drew
-      overlay_(dirty_).setTo(cv::Scalar(0, 0, 0));
-      overlayA_(dirty_).setTo(0);
-    }
-    dirty_ = cv::Rect();
-    usedOverlay = true;
-  };
-  auto grow = [&](cv::Rect r) { r &= frameRect; bbox = bbox.empty() ? r : (bbox | r); };
-  auto poly = [&](const cv::Point* pts, int n, cv::Scalar col, double a) {
-    ensureOverlay();
-    cv::fillConvexPoly(overlay_, pts, n, col, cv::LINE_AA);
-    cv::fillConvexPoly(overlayA_, pts, n, cv::Scalar(a * 255), cv::LINE_AA);
-    cv::Rect r = cv::boundingRect(std::vector<cv::Point>(pts, pts + n));
-    grow(cv::Rect(r.x - 2, r.y - 2, r.width + 4, r.height + 4));
-  };
-  auto line = [&](cv::Point2f p0, cv::Point2f p1, cv::Scalar col, double a, int th) {
-    ensureOverlay();
-    cv::line(overlay_, p0, p1, col, th, cv::LINE_AA);
-    cv::line(overlayA_, p0, p1, cv::Scalar(a * 255), th, cv::LINE_AA);
-    int x0 = (int)std::floor(std::min(p0.x, p1.x)) - th - 2, y0 = (int)std::floor(std::min(p0.y, p1.y)) - th - 2;
-    int x1 = (int)std::ceil(std::max(p0.x, p1.x)) + th + 2, y1 = (int)std::ceil(std::max(p0.y, p1.y)) + th + 2;
-    grow(cv::Rect(x0, y0, x1 - x0, y1 - y0));
-  };
-  auto dot = [&](cv::Point2f c, int r, cv::Scalar col, double a) {
-    ensureOverlay();
-    cv::circle(overlay_, c, r, col, -1, cv::LINE_AA);
-    cv::circle(overlayA_, c, r, cv::Scalar(a * 255), -1, cv::LINE_AA);
-    grow(cv::Rect((int)c.x - r - 2, (int)c.y - r - 2, 2 * r + 5, 2 * r + 5));
-  };
+  layer_.begin(frame.size());
+  auto poly = [&](const cv::Point* pts, int n, cv::Scalar col, double a) { layer_.poly(pts, n, col, a); };
+  auto line = [&](cv::Point2f p0, cv::Point2f p1, cv::Scalar col, double a, int th) { layer_.line(p0, p1, col, a, th); };
+  auto dot = [&](cv::Point2f c, int r, cv::Scalar col, double a) { layer_.dot(c, r, col, a); };
 
   drainPending();
   for (auto& a : anims_) {
@@ -356,30 +432,137 @@ void Reactions::render(cv::Mat& frame, double now) {
       cv::add(frame, cv::Scalar(90, 60, 30) * k, frame);
     }
   }
-  if (usedOverlay && !bbox.empty()) {
-    if (glow) {  // soft halo: blurred copy (at half resolution) added under the crisp layer
-      int k = std::max(3, (int)(H * 0.02) | 1);
-      cv::Rect gr(bbox.x - k, bbox.y - k, bbox.width + 2 * k, bbox.height + 2 * k);
-      gr &= frameRect;
-      cv::Size half((gr.width + 1) / 2, (gr.height + 1) / 2);
-      cv::resize(overlay_(gr), glowC_, half, 0, 0, cv::INTER_LINEAR);
-      cv::resize(overlayA_(gr), glowA_, half, 0, 0, cv::INTER_LINEAR);
-      int kh = std::max(3, (k / 2) | 1);
-      cv::GaussianBlur(glowC_, glowC_, cv::Size(kh, kh), 0);
-      cv::GaussianBlur(glowA_, glowA_, cv::Size(kh, kh), 0);
-      glowA_.convertTo(glowA_, -1, 0.7);
-      cv::Mat gc, ga;  // upsampled halo, blended over the ROI only
-      cv::resize(glowC_, gc, gr.size(), 0, 0, cv::INTER_LINEAR);
-      cv::resize(glowA_, ga, gr.size(), 0, 0, cv::INTER_LINEAR);
-      cv::Mat roi = frame(gr);
-      blend8Roi(roi, gc, ga, cv::Rect(0, 0, gr.width, gr.height));
-      bbox = gr;
-    }
-    blend8Roi(frame, overlay_, overlayA_, bbox);
-    dirty_ = bbox;
-  }
+  layer_.composite(frame, glow);
   anims_.erase(std::remove_if(anims_.begin(), anims_.end(), [&](const Anim& a) { return a.start >= 0 && now - a.start > DUR; }), anims_.end());
   playing_ = !anims_.empty();
+}
+
+// ---------------------------------------------------------------------------
+// FunOverlay
+
+bool FunOverlay::loadAssets(const std::string& dir, std::string* err) {
+  const char* files[] = { "sunglasses", "glasses", "tophat", "crown", "headphones", "flowers" };
+  bool ok = true;
+  for (auto f : files) {
+    cv::Mat m = cv::imread(dir + "/" + f + ".png", cv::IMREAD_UNCHANGED);
+    if (m.empty() || m.channels() != 4) { if (err) *err = std::string("missing sprite ") + f; ok = false; continue; }
+    // Trim to the glyph's alpha box so the placement sizes refer to the visible shape.
+    cv::Mat a;
+    cv::extractChannel(m, a, 3);
+    cv::Rect r = cv::boundingRect(a > 8);
+    sprites_[f] = r.empty() ? m : m(r).clone();
+  }
+  return ok;
+}
+
+namespace {
+inline cv::Point2f eyeMid(const cv::Point2f* lm) { return (lm[0] + lm[1]) * 0.5f; }
+inline float eyeDist(const cv::Point2f* lm) { return (float)cv::norm(lm[1] - lm[0]); }
+}  // namespace
+
+void FunOverlay::update(const std::vector<Face>& faces, double now) {
+  bool matched[kMaxFaces] = { false };
+  for (size_t i = 0; i < faces.size(); i++) {
+    const Face& f = faces[i];
+    float d = eyeDist(f.lm);
+    if (!(d > 1)) continue;
+    cv::Point2f c = eyeMid(f.lm);
+    // Nearest live track within a face width; each track takes one face.
+    int best = -1;
+    double bestDist = 1e9;
+    for (size_t t = 0; t < tracks_.size(); t++) {
+      if (matched[t]) continue;
+      double dist = cv::norm(eyeMid(tracks_[t].lm) - c);
+      if (dist < 0.9 * std::max(d, tracks_[t].size) && dist < bestDist) { bestDist = dist; best = (int)t; }
+    }
+    if (best < 0) {
+      if ((int)tracks_.size() < kMaxFaces) { tracks_.push_back(Track{}); best = (int)tracks_.size() - 1; }
+      else {  // full: recycle the track unseen for longest (a face that left the frame)
+        best = 0;
+        for (size_t t = 1; t < tracks_.size(); t++) if (!matched[t] && tracks_[t].lastSeen < tracks_[best].lastSeen) best = (int)t;
+        if (matched[best]) continue;
+      }
+      Track& t = tracks_[best];
+      for (int j = 0; j < 5; j++) t.lm[j] = f.lm[j];
+      t.size = d;
+    } else {  // EMA at the detector's cadence: fast enough to follow, slow enough to hide jitter
+      const float a = 0.5f;
+      Track& t = tracks_[best];
+      for (int j = 0; j < 5; j++) t.lm[j] = t.lm[j] * (1 - a) + f.lm[j] * a;
+      t.size = t.size * (1 - a) + d * a;
+    }
+    tracks_[best].lastSeen = now;
+    matched[best] = true;
+  }
+}
+
+void FunOverlay::render(cv::Mat& frame, const std::string& kind, cv::Point2f origin, cv::Point2f scale, double now) {
+  tracks_.erase(std::remove_if(tracks_.begin(), tracks_.end(), [&](const Track& t) { return now - t.lastSeen > kHold; }), tracks_.end());
+  if (tracks_.empty() || kind == "none") return;
+  layer_.begin(frame.size());
+  bool glow = false;
+  for (const Track& t : tracks_) {
+    cv::Point2f lm[5];
+    for (int j = 0; j < 5; j++) lm[j] = cv::Point2f((t.lm[j].x - origin.x) * scale.x, (t.lm[j].y - origin.y) * scale.y);
+    // Eye line from the image-left eye to the image-right eye: roll in
+    // (-90, 90) degrees whichever way the detector labels them.
+    cv::Point2f a = lm[0], b = lm[1];
+    if (a.x > b.x) std::swap(a, b);
+    cv::Point2f ex = b - a;
+    float d = (float)cv::norm(ex);
+    if (d < 4) continue;
+    double roll = std::atan2(ex.y, ex.x);
+    cv::Point2f fx = ex * (1.0f / d);                                   // along the eye line (screen right)
+    cv::Point2f up(fx.y, -fx.x);                                        // perpendicular, towards the top of the head
+    cv::Point2f mid = (a + b) * 0.5f;
+    cv::Point2f nose = lm[2];
+    // Sprite `name` scaled to `width` px, centred at `c`, rotated with the head.
+    auto sprite = [&](const char* name, double width, cv::Point2f c) {
+      auto it = sprites_.find(name);
+      if (it == sprites_.end()) return;
+      alphaBlit(frame, it->second, c.x, c.y, width / it->second.cols, 1.0, -roll);
+    };
+    // Sprite whose bottom edge sits `above` px above the eye line.
+    auto hat = [&](const char* name, double width, double above) {
+      auto it = sprites_.find(name);
+      if (it == sprites_.end()) return;
+      double h = width * it->second.rows / it->second.cols;
+      sprite(name, width, mid + up * (float)(above + h / 2));
+    };
+    if (kind == "sunglasses") sprite("sunglasses", 2.3 * d, mid);
+    else if (kind == "glasses") sprite("glasses", 2.3 * d, mid);
+    else if (kind == "tophat") hat("tophat", 2.6 * d, 0.9 * d);
+    else if (kind == "crown") hat("crown", 2.6 * d, 0.6 * d);
+    else if (kind == "flowers") hat("flowers", 2.6 * d, 0.6 * d);
+    else if (kind == "headphones") sprite("headphones", 3.4 * d, mid + up * (0.1f * d));  // cups at ear level, band over the head
+    else if (kind == "halo") {
+      glow = true;
+      int th = std::max(2, (int)std::lround(0.06 * d));
+      layer_.ellipse(mid + up * (1.6f * d), cv::Size2f(0.9f * d, 0.22f * d), roll * 180 / CV_PI, cv::Scalar(150, 235, 255), 0.92, th);
+    } else if (kind == "cat") {
+      const cv::Scalar fur(45, 45, 50), pink(175, 130, 255), white(245, 245, 245);
+      for (int side = -1; side <= 1; side += 2) {
+        cv::Point2f base = mid + up * (1.35f * d) + fx * (side * 0.9f * d);
+        cv::Point2f apex = base + up * (0.8f * d) + fx * (side * 0.2f * d);
+        cv::Point pts[3] = { base - fx * (0.38f * d), base + fx * (0.38f * d), apex };
+        layer_.poly(pts, 3, fur, 0.95);
+        cv::Point2f base2 = base + up * (0.08f * d);
+        cv::Point2f apex2 = base2 + up * (0.5f * d) + fx * (side * 0.13f * d);
+        cv::Point in[3] = { base2 - fx * (0.2f * d), base2 + fx * (0.2f * d), apex2 };
+        layer_.poly(in, 3, pink, 0.95);
+        // Three whiskers per side, fanning out from beside the nose.
+        int th = std::max(1, (int)std::lround(0.03 * d));
+        for (int j = -1; j <= 1; j++) {
+          cv::Point2f from = nose + fx * (side * 0.28f * d) + up * (j * 0.09f * d - 0.02f * d);
+          cv::Point2f to = from + fx * (side * 1.2f * d) + up * (j * 0.24f * d);
+          layer_.line(from, to, white, 0.85, th);
+        }
+      }
+      cv::Point np[3] = { nose + up * (0.08f * d) - fx * (0.16f * d), nose + up * (0.08f * d) + fx * (0.16f * d), nose - up * (0.14f * d) };
+      layer_.poly(np, 3, pink, 0.95);
+    }
+  }
+  layer_.composite(frame, glow);
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +592,7 @@ bool EffectPipeline::init(const std::string& modelsDir, const std::string& asset
   if (!faces_.load(modelsDir + "/yunet.onnx", &e)) status += "faces: " + e + "; ";
   if (!gestures_.load(modelsDir, &e)) status += "gestures: " + e + "; ";
   if (!reactions_.loadAssets(assetsDir, &e)) status += "assets: " + e + "; ";
+  if (!fun_.loadAssets(assetsDir, &e)) status += "fun assets: " + e + "; ";
   modelStatus_ = status.empty() ? "ok" : status;
   debugGestures_ = getenv("IRIS_DEBUG") != nullptr;
   if (err) *err = status;
@@ -417,6 +601,7 @@ bool EffectPipeline::init(const std::string& modelsDir, const std::string& asset
 
 void EffectPipeline::setSettings(const Settings& s) {
   if (s.centerStage != settings_.centerStage) framer_.reset();
+  if (s.fun != settings_.fun) fun_.reset();
   settings_ = s;
 }
 
@@ -425,12 +610,7 @@ void EffectPipeline::ensureBackground(const cv::Size& sz) {
     if (bgImagePath_ != settings_.backgroundImage || bgImageSize_ != sz || bgImage_.empty()) {
       cv::Mat img = cv::imread(settings_.backgroundImage, cv::IMREAD_COLOR);
       if (img.empty()) { img = cv::Mat(sz, CV_8UC3, cv::Scalar(30, 30, 30)); }
-      // cover-fit
-      double s = std::max((double)sz.width / img.cols, (double)sz.height / img.rows);
-      cv::Mat scaled;
-      cv::resize(img, scaled, cv::Size(std::max(sz.width, (int)(img.cols * s)), std::max(sz.height, (int)(img.rows * s))), 0, 0, cv::INTER_AREA);
-      cv::Rect r((scaled.cols - sz.width) / 2, (scaled.rows - sz.height) / 2, sz.width, sz.height);
-      bgImage_ = scaled(r).clone();
+      coverFit(img, bgImage_, sz);
       bgImagePath_ = settings_.backgroundImage;
       bgImageSize_ = sz;
     }
@@ -531,6 +711,91 @@ void EffectPipeline::applyBackground(cv::Mat& work) {
   work = work_;
 }
 
+namespace {
+// 8-bit factor plane (3 identical channels): dim * (1 - (1 - vig) * strength)
+// with vig = 1 in the middle falling to 0.45 in the corners. Cached by the
+// callers (studio light's background, the vintage filter); a few ms to build.
+void buildVignette(cv::Mat& plane, const cv::Size& sz, float strength, float dim) {
+  plane.create(sz, CV_8UC3);
+  float cx = sz.width / 2.f, cy = sz.height / 2.f, rmax = std::sqrt(cx * cx + cy * cy);
+  for (int y = 0; y < sz.height; y++) {
+    uchar* row = plane.ptr<uchar>(y);
+    for (int x = 0; x < sz.width; x++) {
+      float d = std::sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy)) / rmax;
+      float vig = 1.0f - 0.55f * d * d;
+      uchar f = cv::saturate_cast<uchar>(255.0f * dim * (1.0f - (1.0f - vig) * strength));
+      row[x * 3] = row[x * 3 + 1] = row[x * 3 + 2] = f;
+    }
+  }
+}
+// out = a * f / 255, elementwise 8-bit (may alias).
+void mul8(const cv::Mat& a, const cv::Mat& f, cv::Mat& out) {
+  CV_Assert(a.size() == f.size() && a.type() == CV_8UC3 && f.type() == CV_8UC3);
+  out.create(a.size(), CV_8UC3);
+  const int n = a.cols * 3;
+  cv::parallel_for_(cv::Range(0, a.rows), [&](const cv::Range& r) {
+    for (int y = r.start; y < r.end; y++) {
+      const uchar* pa = a.ptr<uchar>(y);
+      const uchar* pf = f.ptr<uchar>(y);
+      uchar* pd = out.ptr<uchar>(y);
+      for (int i = 0; i < n; i++) { unsigned v = pa[i] * pf[i] + 128; pd[i] = (uchar)((v + (v >> 8)) >> 8); }
+    }
+  });
+}
+}  // namespace
+
+// Colour filters, all 8-bit single passes (~1 ms at 720p): a colour matrix
+// (cv::transform), a per-channel LUT, or a small blur/kernel. The result goes
+// to filt_ (never in place: `work` may still be the capture buffer).
+void EffectPipeline::applyFilter(cv::Mat& work) {
+  const std::string& f = settings_.filter;
+  // Colour matrices act on [B G R 1]. Standard sepia (in BGR order) and the
+  // luma weights used for (de)saturation.
+  static const cv::Matx33f sepia(0.131f, 0.534f, 0.272f, 0.168f, 0.686f, 0.349f, 0.189f, 0.769f, 0.393f);
+  static const cv::Matx33f luma(0.114f, 0.587f, 0.299f, 0.114f, 0.587f, 0.299f, 0.114f, 0.587f, 0.299f);
+  auto sat = [](float s) { return luma * (1 - s) + cv::Matx33f::eye() * s; };
+  if (f == "mono") {
+    cv::cvtColor(work, filtTmp_, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(filtTmp_, filt_, cv::COLOR_GRAY2BGR);
+  } else if (f == "sepia") {
+    cv::transform(work, filt_, sepia);
+  } else if (f == "vivid") {  // more saturation, a touch more contrast (about the mid grey)
+    const float c = 1.08f;
+    cv::Matx33f m = sat(1.45f) * c;
+    cv::Matx34f M(m(0, 0), m(0, 1), m(0, 2), 128 * (1 - c), m(1, 0), m(1, 1), m(1, 2), 128 * (1 - c), m(2, 0), m(2, 1), m(2, 2), 128 * (1 - c));
+    cv::transform(work, filt_, M);
+  } else if (f == "vintage") {  // faded mild sepia, lifted blacks, vignette
+    const float c = 0.92f, lift = 10;
+    cv::Matx33f m = (sepia * 0.5f + sat(0.7f) * 0.5f) * c;
+    cv::Matx34f M(m(0, 0), m(0, 1), m(0, 2), 128 * (1 - c) + lift, m(1, 0), m(1, 1), m(1, 2), 128 * (1 - c) + lift, m(2, 0), m(2, 1), m(2, 2), 128 * (1 - c) + lift);
+    cv::transform(work, filt_, M);
+    if (vig_.size() != work.size()) buildVignette(vig_, work.size(), 0.75f, 1.0f);
+    mul8(filt_, vig_, filt_);
+  } else if (f == "warm" || f == "cool") {  // per-channel gains via one 3-channel LUT
+    if (filtLutFor_ != f || filtLut_.empty()) {
+      filtLut_.create(1, 256, CV_8UC3);
+      float gb = f == "warm" ? 0.90f : 1.10f, gr = f == "warm" ? 1.10f : 0.90f;
+      for (int i = 0; i < 256; i++) {
+        uchar* e = filtLut_.ptr<uchar>(0) + i * 3;
+        e[0] = cv::saturate_cast<uchar>(i * gb); e[1] = (uchar)i; e[2] = cv::saturate_cast<uchar>(i * gr);
+      }
+      filtLutFor_ = f;
+    }
+    cv::LUT(work, filtLut_, filt_);
+  } else if (f == "soft") {  // blend with a quarter-resolution blur, slight lift
+    cv::pyrDown(work, filtSmall_);
+    cv::pyrDown(filtSmall_, filtTmp_);
+    cv::resize(filtTmp_, filtSmall_, work.size(), 0, 0, cv::INTER_LINEAR);
+    cv::addWeighted(work, 0.6, filtSmall_, 0.4, 6, filt_);
+  } else if (f == "sharpen") {  // unsharp mask as one 3x3 kernel
+    static const cv::Matx33f k(0, -0.55f, 0, -0.55f, 1 + 4 * 0.55f, -0.55f, 0, -0.55f, 0);
+    cv::filter2D(work, filt_, -1, k);
+  } else {
+    return;
+  }
+  work = filt_;
+}
+
 // Studio Light. Foreground: lift the midtones with a soft gamma and a touch of
 // warmth (key light) via one 3-channel LUT; background: darken with a vignette
 // (a cached 8-bit factor plane, rebuilt only when the size or intensity
@@ -551,18 +816,7 @@ void EffectPipeline::applyStudioLight(cv::Mat& work) {
   }
   if (darkFactor_.size() != work.size() || darkI_ != I) {
     // dark = flat dim blended with a vignette (1 in the middle, ~0.45 in the corners) by intensity
-    darkFactor_.create(work.size(), CV_8UC3);
-    float cx = work.cols / 2.f, cy = work.rows / 2.f, rmax = std::sqrt(cx * cx + cy * cy);
-    float dim = 1.0f - 0.5f * I;
-    for (int y = 0; y < work.rows; y++) {
-      uchar* row = darkFactor_.ptr<uchar>(y);
-      for (int x = 0; x < work.cols; x++) {
-        float d = std::sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy)) / rmax;
-        float vig = 1.0f - 0.55f * d * d;
-        uchar f = cv::saturate_cast<uchar>(255.0f * dim * (1.0f - (1.0f - vig) * I));
-        row[x * 3] = row[x * 3 + 1] = row[x * 3 + 2] = f;
-      }
-    }
+    buildVignette(darkFactor_, work.size(), I, 1.0f - 0.5f * I);
     darkI_ = I;
   }
   cv::LUT(work, lut_, lit_);
@@ -598,14 +852,15 @@ void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& o
   const bool handRecent = now - lastHandSeen_ < 2.0;
 
   // Cadences (Hz, by tier). Palm detection idles at ~5 Hz until a hand shows
-  // up, then 10 Hz while one is around; YuNet runs only for Center Stage, or
-  // for the hand-on-face check when a palm was found.
+  // up, then 10 Hz while one is around; YuNet runs only for Center Stage and
+  // the fun face filters, or for the hand-on-face check when a palm was found.
   const double palmHz = tier_ == 0 ? (handRecent ? 10 : 5) : (tier_ == 1 ? (handRecent ? 6 : 3) : (handRecent ? 4 : 2));
   const double faceHz = tier_ == 0 ? 10 : (tier_ == 1 ? 6 : 3);
 
   // Faces for Center Stage are found in source coordinates (the crop is chosen
   // from them). srcPyr_ is only built when the source differs from the output.
   bool facesFresh = false;
+  const bool funOn = settings_.fun != "none" && faces_.loaded();
   cv::Rect full = framer_.fullCrop(src.size(), outAspect);
   bool srcIsWork = full == cv::Rect(0, 0, src.cols, src.rows) && src.size() == outSize;
   bool pyrReady = false;  // pyr_ already reset to this frame
@@ -621,12 +876,15 @@ void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& o
     }
     const cv::Mat& s = p->atLeastWide(320, &lvl);
     lastFaces_ = faces_.detect(s, 1.0 / Pyramid::scaleOf(lvl));
+    faceRects_.clear();
+    for (auto& f : lastFaces_) faceRects_.push_back(f.box);
+    if (funOn) fun_.update(lastFaces_, now);
     lastFaceTime_ = now; facesFresh = true;
   };
-  if (settings_.centerStage && faces_.loaded() && now - lastFaceTime_ >= 1.0 / faceHz) detectFaces();
+  if ((settings_.centerStage || funOn) && faces_.loaded() && now - lastFaceTime_ >= 1.0 / faceHz) detectFaces();
   stage(0);  // faces
 
-  cv::Rect crop = settings_.centerStage ? framer_.update(src.size(), lastFaces_, facesFresh, outAspect, dt) : full;
+  cv::Rect crop = settings_.centerStage ? framer_.update(src.size(), faceRects_, facesFresh, outAspect, dt) : full;
   cv::Mat work;
   if (crop == cv::Rect(0, 0, src.cols, src.rows) && src.size() == outSize) work = src;  // passthrough: no copy
   else { cv::resize(src(crop), work_, outSize, 0, 0, cv::INTER_LINEAR); work = work_; }  // LINEAR: 5x cheaper than AREA, invisible after MJPEG
@@ -644,6 +902,13 @@ void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& o
   stage(3);  // background
   if (settings_.studioLight) applyStudioLight(work);
   stage(4);  // studio light
+  // Face accessories: tracks are in source coordinates, mapped through the crop.
+  if (funOn) {
+    if (work.data == src.data) { src.copyTo(work_); work = work_; }  // don't draw into the capture buffer
+    fun_.render(work, settings_.fun, cv::Point2f((float)crop.x, (float)crop.y),
+                cv::Point2f((float)outSize.width / crop.width, (float)outSize.height / crop.height), now);
+  }
+  stage(5);  // fun
 
   // Gesture-triggered reactions, checked on the output frame at palmHz.
   if (palmDue) {
@@ -658,7 +923,7 @@ void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& o
     std::vector<cv::Rect2f> facesWork;
     if (now - lastFaceTime_ < 1.0) {
       double sx = (double)outSize.width / crop.width, sy = (double)outSize.height / crop.height;
-      for (auto& f : lastFaces_) facesWork.emplace_back((f.x - crop.x) * sx, (f.y - crop.y) * sy, f.width * sx, f.height * sy);
+      for (auto& f : faceRects_) facesWork.emplace_back((f.x - crop.x) * sx, (f.y - crop.y) * sy, f.width * sx, f.height * sy);
     }
     std::string g = gestures_.classify(hands, facesWork);
     if (debugGestures_) fprintf(stderr, "gesture: hands=%zu faces=%zu -> '%s'\n", hands.size(), facesWork.size(), g.c_str());
@@ -671,12 +936,14 @@ void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& o
       pendingGesture_.clear();
     }
   }
-  stage(5);  // gestures
+  stage(6);  // gestures
+  if (settings_.filter != "none") applyFilter(work);
+  stage(7);  // colour filter
   if (reactions_.active()) {
     if (work.data == src.data) { src.copyTo(work_); work = work_; }  // don't draw into the capture buffer
     reactions_.render(work, now);
   }
-  stage(6);  // reactions
+  stage(8);  // reactions
   if (settings_.mirror) { cv::flip(work, work.data == src.data ? work_ : work, 1); if (work.data == src.data) work = work_; }
   out = work;
   if (!prof) {
@@ -686,8 +953,9 @@ void EffectPipeline::process(const cv::Mat& src, cv::Mat& out, const cv::Size& o
     if (profN_) { for (auto& a : profAcc_) a = 0; profN_ = 0; }
   } else if (++profN_ == 60) {
     char b[256];
-    snprintf(b, sizeof b, "ms/frame: faces %.1f resize %.1f mask %.1f bg %.1f light %.1f gestures %.1f react %.1f",
-             profAcc_[0] / profN_, profAcc_[1] / profN_, profAcc_[2] / profN_, profAcc_[3] / profN_, profAcc_[4] / profN_, profAcc_[5] / profN_, profAcc_[6] / profN_);
+    snprintf(b, sizeof b, "ms/frame: faces %.1f resize %.1f mask %.1f bg %.1f light %.1f fun %.1f gestures %.1f filter %.1f react %.1f",
+             profAcc_[0] / profN_, profAcc_[1] / profN_, profAcc_[2] / profN_, profAcc_[3] / profN_, profAcc_[4] / profN_, profAcc_[5] / profN_,
+             profAcc_[6] / profN_, profAcc_[7] / profN_, profAcc_[8] / profN_);
     profileLine_ = b;
     for (auto& a : profAcc_) a = 0;
     profN_ = 0;

@@ -1,9 +1,10 @@
 // irisd — system-wide camera effects daemon for Omarchy.
 //
 // Reads a physical webcam, applies effects (Center Stage, Portrait, Studio
-// Light, background replacement, Reactions) and publishes the result as a
-// virtual V4L2 camera ("Iris Camera") that every app can use. Runs the
-// camera only while some app has the virtual camera open.
+// Light, background replacement, colour filters, fun face filters, Reactions)
+// and publishes the result as a virtual V4L2 camera ("Iris Camera") that every
+// app can use. Runs the camera only while some app has the virtual camera
+// open; with "block" on it never opens the camera and feeds a placeholder instead.
 #include <fcntl.h>
 #include <linux/videodev2.h>
 #include <pwd.h>
@@ -29,6 +30,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <thread>
 
+#include "block.hpp"
 #include "capture.hpp"
 #include "effects.hpp"
 #include "json.hpp"
@@ -62,7 +64,8 @@ bool fileExists(const std::string& p) { struct stat st{}; return stat(p.c_str(),
 json settingsToJson(const Settings& s) {
   return json{ { "centerStage", s.centerStage }, { "portrait", s.portrait }, { "portraitIntensity", s.portraitIntensity },
                { "studioLight", s.studioLight }, { "studioLightIntensity", s.studioLightIntensity }, { "background", s.background },
-               { "backgroundImage", s.backgroundImage }, { "backgroundColor", s.backgroundColor }, { "reactions", s.reactions }, { "mirror", s.mirror } };
+               { "backgroundImage", s.backgroundImage }, { "backgroundColor", s.backgroundColor }, { "reactions", s.reactions }, { "mirror", s.mirror },
+               { "filter", s.filter }, { "fun", s.fun } };
 }
 
 void settingsFromJson(const json& j, Settings& s) {
@@ -74,9 +77,13 @@ void settingsFromJson(const json& j, Settings& s) {
   getb("studioLight", s.studioLight); getf("studioLightIntensity", s.studioLightIntensity);
   gets("background", s.background); gets("backgroundImage", s.backgroundImage); gets("backgroundColor", s.backgroundColor);
   getb("reactions", s.reactions); getb("mirror", s.mirror);
+  gets("filter", s.filter); gets("fun", s.fun);
   if (s.background != "none" && s.background != "image" && s.background != "color") s.background = "none";
   unsigned rgb;
   if (!parseHexColor(s.backgroundColor, rgb)) s.backgroundColor = Settings().backgroundColor;
+  auto oneOf = [](const std::vector<std::string>& names, std::string& v) { if (std::find(names.begin(), names.end(), v) == names.end()) v = "none"; };
+  oneOf(Settings::filterNames(), s.filter);
+  oneOf(Settings::funNames(), s.fun);
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +129,11 @@ struct Config {
   // costs 3x a 720p one and is the single biggest item on a weak laptop.
   int capW = 1920, capH = 1080;
   std::string preferredCamera;  // bus info or path
+  // Block camera (privacy shutter): global, not per camera. While on, no
+  // physical camera is opened; consumers get blockSource (image or video
+  // file; "" = the built-in "Camera paused" card) instead.
+  bool block = false;
+  std::string blockSource;
   Settings settings;            // global settings (used when sameForAll, and as the template for new cameras)
   bool sameForAll = true;
   std::map<std::string, Settings> settingsByCamera;  // bus -> settings
@@ -151,6 +163,8 @@ void loadConfig(Config& c) {
     // cameras) need even sizes, so a hand-edited odd value is rounded down.
     c.outW &= ~1; c.outH &= ~1; c.capW &= ~1; c.capH &= ~1;
     if (j.contains("camera") && j["camera"].is_string()) c.preferredCamera = j["camera"];
+    if (j.contains("block") && j["block"].is_boolean()) c.block = j["block"];
+    if (j.contains("blockSource") && j["blockSource"].is_string() && blockSourceValid(j["blockSource"])) c.blockSource = j["blockSource"];
     if (j.contains("settings")) settingsFromJson(j["settings"], c.settings);
     if (j.contains("sameForAll") && j["sameForAll"].is_boolean()) c.sameForAll = j["sameForAll"];
     if (j.contains("settingsByCamera") && j["settingsByCamera"].is_object()) {
@@ -168,6 +182,8 @@ void saveConfig(const Config& c) {
              { "output", { { "width", c.outW }, { "height", c.outH }, { "fps", c.fps } } },
              { "capture", { { "width", c.capW }, { "height", c.capH } } },
              { "camera", c.preferredCamera },
+             { "block", c.block },
+             { "blockSource", c.blockSource },
              { "sameForAll", c.sameForAll },
              { "settings", settingsToJson(c.settings) },
              { "settingsByCamera", byCam } };
@@ -196,6 +212,7 @@ private:
   V4L2Capture cap_;
   FileCapture file_;   // dev/test source when the selected "camera" is a file path
   bool useFile_ = false;
+  BlockFeed block_;    // placeholder source while cfg_.block is on
   std::atomic<int> consumers_{0};
   std::atomic<bool> stateDirty_{true};
   // State shown to clients. Written by the main thread and read by the
@@ -310,6 +327,8 @@ json Daemon::stateJson() {
                { "reactions", Reactions::names() },
                { "reactionsActive", reactionsActive_ },
                { "hideRaw", hideRawActive_ },
+               { "block", cfg_.block },
+               { "blockSource", cfg_.blockSource },
                { "error", error_ } };
 }
 
@@ -527,7 +546,17 @@ std::string Daemon::handle(const std::string& req) {
           cfg_.sameForAll = v;
         }
         if (j.contains("camera") && j["camera"].is_string()) cfg_.preferredCamera = j["camera"];
-        if (j.contains("settings") && j["settings"].is_object()) settingsFromJson(j["settings"], effectiveSettings());
+        if (j.contains("settings") && j["settings"].is_object()) {
+          const json& sj = j["settings"];
+          settingsFromJson(sj, effectiveSettings());
+          // Global (not per camera) keys travel in the same object: `irisd set block=true blockSource=/path`.
+          if (sj.contains("block") && sj["block"].is_boolean()) cfg_.block = sj["block"];
+          if (sj.contains("blockSource") && sj["blockSource"].is_string()) {
+            std::string p = sj["blockSource"], why;
+            if (blockSourceValid(p, &why)) cfg_.blockSource = p;
+            else { saveConfig(cfg_); stateDirty_ = true; return json{ { "type", "error" }, { "error", "blockSource: " + why } }.dump(); }
+          }
+        }
         saveConfig(cfg_);
       }
       stateDirty_ = true;
@@ -631,10 +660,17 @@ int Daemon::run() {
     if (now - lastPwCheck > std::chrono::seconds(1)) { lastPwCheck = now; setState(pwStatus_, pwOut_.maintain(nowSec())); }
     setState(hideRawActive_, fileExists("/etc/udev/rules.d/71-iris-hide-raw.rules"));
 
-    bool preview;
-    { std::lock_guard<std::mutex> lk(mu_); preview = forcePreview_; }
+    bool preview, block;
+    std::string blockSrc;
+    { std::lock_guard<std::mutex> lk(mu_); preview = forcePreview_; block = cfg_.block; blockSrc = cfg_.blockSource; }
     bool want = (loop_.isOpen() && consumers_ > 0) || pwActive_ || preview;
-    if (want && !captureOpen()) {
+    // Blocked: the physical camera stays closed (light off) whatever the
+    // consumers do; they get the placeholder from block_ instead, on the same
+    // on-demand terms.
+    bool stopped = false;
+    if (block && captureOpen()) { captureClose(); resetTier(false); fprintf(stderr, "irisd: blocked: camera released\n"); }
+    if (block_.active() && (!block || !want)) { block_.close(); setError(""); stopped = !want; }
+    if (want && !block && !captureOpen()) {
       if (openCapture(&err)) {
         setError("");
         misses_ = 0;
@@ -645,19 +681,41 @@ int Daemon::run() {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
       }
     }
-    if (!want && captureOpen()) {
-      captureClose();
-      resetTier(false);  // idle: back to full quality for the next opener
+    if (want && block) {
+      bool was = block_.active();
+      block_.open(blockSrc, cv::Size(cfg_.outW, cfg_.outH), cfg_.fps);
+      if (!was) fprintf(stderr, "irisd: blocked: showing %s\n", blockSrc.empty() ? "the built-in card" : blockSrc.c_str());
+      setError(block_.error());
+    }
+    if (!want && captureOpen()) { captureClose(); resetTier(false); stopped = true; }
+    if (stopped) {
       // Leave black behind so the next opener doesn't see a stale frame.
       cv::Mat black(cfg_.outH, cfg_.outW, CV_8UC3, cv::Scalar(0, 0, 0));
       if (loop_.isOpen()) loop_.write(black);
       pwOut_.clear();
       fprintf(stderr, "irisd: idle\n");
     }
-    setState(running_, captureOpen());
+    setState(running_, captureOpen() || block_.active());
     if (running_ != wasRunning) { wasRunning = running_; frames = 0; fpsT0 = now; setState(fps_, 0.0); }
+    auto countFrame = [&]() {
+      frames++;
+      auto dt = std::chrono::duration<double>(now - fpsT0).count();
+      if (dt >= 1.0) { setState(fps_, frames / dt); frames = 0; fpsT0 = now; }
+    };
 
-    if (running_) {
+    if (block_.active()) {
+      // Placeholder: no effects, no tier control; block_.next() paces the loop.
+      try {
+        cv::cvtColor(block_.next(), yuyv_, cv::COLOR_BGR2YUV_YUYV);
+        if (loop_.isOpen()) loop_.writeYuyv(yuyv_);
+        pwOut_.pushYuyv(yuyv_);
+        countFrame();
+      } catch (const std::exception& e) {
+        fprintf(stderr, "irisd: placeholder frame dropped: %s\n", e.what());
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+      }
+      setState(reactionsActive_, fx_.reactionsActive());
+    } else if (running_) {
       cv::Mat out;
       double decodeMs = 0;
       if (nextFrame(frame, &decodeMs, 200)) {
@@ -690,9 +748,7 @@ int Daemon::run() {
         setState(gesture_, fx_.lastGesture());
         setState(reactionsActive_, fx_.reactionsActive());
         setState(profileLine_, fx_.profileLine());
-        frames++;
-        auto dt = std::chrono::duration<double>(now - fpsT0).count();
-        if (dt >= 1.0) { setState(fps_, frames / dt); frames = 0; fpsT0 = now; }
+        countFrame();
       } else {
         // Camera unplugged or stalled: reopen.
         if (++misses_ > 15) { misses_ = 0; captureClose(); rescanCameras(); }
@@ -709,6 +765,7 @@ int Daemon::run() {
     }
   }
   captureClose();
+  block_.close();
   pwOut_.stop();
   watcher_.stop();
   server_.stop();

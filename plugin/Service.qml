@@ -24,6 +24,8 @@ Item {
   readonly property string loopbackLabel: state.loopbackLabel || "Iris Camera"
   readonly property string error: state.error || ""
   readonly property bool hideRaw: !!state.hideRaw
+  readonly property bool block: !!state.block                // camera blocked: placeholder instead of the webcam (global)
+  readonly property string blockSource: state.blockSource || ""  // "" = built-in card, else an image/video path
   readonly property int fps: state.fps || 0
   readonly property string gesture: state.gesture || ""
   readonly property var reactionNames: state.reactions || ["hearts", "thumbsup", "thumbsdown", "balloons", "confetti", "fireworks", "rain", "lasers"]
