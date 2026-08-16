@@ -64,7 +64,9 @@ Click the bar icon to open the panel (right-click toggles Portrait). The bar ico
 | Panel section | What it does |
 | --- | --- |
 | Preview | Live view of what apps see. Drag to pan, scroll to zoom. The shutter button takes a snapshot after a 3·2·1 countdown. |
-| Video | Center Stage, Zoom, Fit, Portrait, Studio Light, Background, Filter, Effects, Reactions, Rotate, Mirror preview, Mirror output. |
+| Video | Camera, Center Stage, Zoom, Fit, Rotate, Mirror preview, Mirror output, and Reset (this camera back to the defaults). |
+| Look | Portrait, Studio Light, Background (a colour, an image or a looped video) and Filter. |
+| Fun | Effects (sunglasses, mask, hats, cat ears, blur, pixelate…), Ambience (endless rain, snow, sparkles, confetti or bubbles) and Reactions. |
 | Privacy | Block camera and Hide raw camera (see below). |
 | Footer | Which apps are using the camera right now, and the output resolution. |
 

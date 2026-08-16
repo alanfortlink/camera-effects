@@ -72,8 +72,9 @@ bool fileExists(const std::string& p) { struct stat st{}; return stat(p.c_str(),
 json settingsToJson(const Settings& s) {
   return json{ { "centerStage", s.centerStage }, { "centerStageIntensity", s.centerStageIntensity }, { "portrait", s.portrait }, { "portraitIntensity", s.portraitIntensity },
                { "studioLight", s.studioLight }, { "studioLightIntensity", s.studioLightIntensity }, { "background", s.background },
-               { "backgroundImage", s.backgroundImage }, { "backgroundColor", s.backgroundColor }, { "reactions", s.reactions }, { "mirror", s.mirror },
-               { "rotate", s.rotate }, { "filter", s.filter }, { "fun", s.fun },
+               { "backgroundImage", s.backgroundImage }, { "backgroundVideo", s.backgroundVideo }, { "backgroundColor", s.backgroundColor },
+               { "reactions", s.reactions }, { "mirror", s.mirror },
+               { "rotate", s.rotate }, { "filter", s.filter }, { "fun", s.fun }, { "ambience", s.ambience },
                { "fit", s.fit }, { "zoom", s.zoom }, { "panX", s.panX }, { "panY", s.panY } };
 }
 
@@ -101,18 +102,31 @@ void settingsFromJson(const json& j, Settings& s) {
   getb("studioLight", s.studioLight); getf("studioLightIntensity", s.studioLightIntensity);
   gets("background", s.background); gets("backgroundImage", s.backgroundImage); gets("backgroundColor", s.backgroundColor);
   getb("reactions", s.reactions); getb("mirror", s.mirror);
-  gets("filter", s.filter); gets("fun", s.fun);
+  gets("filter", s.filter); gets("fun", s.fun); gets("ambience", s.ambience);
+  // Config written before the two dropdowns merged: hideFace moved into fun.
+  if (j.contains("hideFace") && j["hideFace"].is_string() && s.fun == "none") {
+    std::string h = j["hideFace"];
+    if (Settings::isFaceCover(h)) s.fun = h;
+  }
+  // The background clip is a path like blockSource: absolute, an existing
+  // regular file. Only checked when it is in this object, so a file that went
+  // away does not silently drop the setting on the next unrelated change.
+  if (j.contains("backgroundVideo") && j["backgroundVideo"].is_string()) {
+    std::string v = j["backgroundVideo"];
+    if (v.empty() || blockSourceValid(v)) s.backgroundVideo = v;
+  }
   if (j.contains("rotate") && j["rotate"].is_number()) {
     double r = j["rotate"].get<double>();
     s.rotate = r == 90 || r == 180 || r == 270 ? (int)r : 0;
   }
   framingFromJson(j, "", s.fit, s.zoom, s.panX, s.panY);
-  if (s.background != "none" && s.background != "image" && s.background != "color") s.background = "none";
+  if (s.background != "none" && s.background != "image" && s.background != "color" && s.background != "video") s.background = "none";
   unsigned rgb;
   if (!parseHexColor(s.backgroundColor, rgb)) s.backgroundColor = Settings().backgroundColor;
   auto oneOf = [](const std::vector<std::string>& names, std::string& v) { if (std::find(names.begin(), names.end(), v) == names.end()) v = "none"; };
   oneOf(Settings::filterNames(), s.filter);
   oneOf(Settings::funNames(), s.fun);
+  oneOf(Settings::ambienceNames(), s.ambience);
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +292,7 @@ private:
   std::vector<CameraInfo> cameras_;
   CameraInfo current_;
   bool running_ = false;
+  bool starting_ = false;   // wanted, but the first frame after (re)opening has not arrived yet
   double fps_ = 0;
   double procMs_ = 0;   // EMA of the displayed per-frame cost: decode + effects + output conversion/write
   int tier_ = 0;        // adaptive quality tier (0 = full, 2 = cheapest), see updateTier()
@@ -294,6 +309,7 @@ private:
   bool csLowRes_ = false;    // Center Stage capture dropped to the output size (tier 2) until a probe at tier 0 shows the full size fits
   bool lowCores_ = false;    // <= 2 hardware threads: never capture above the output size
   std::string error_, loopPath_, pwStatus_ = "off", gesture_, profileLine_;
+  std::string fxError_;        // last non-fatal effect problem shown as error_ (an unreadable background video)
   bool profile_ = false;       // `profile on`: per-stage timings and the framing debug object in the state
   EffectPipeline::FramingInfo framing_;   // last frame's framing (shown while profile_ is on)
   cv::Point2f panRange_;       // pan room of what is shown now (camera framing or placeholder), for the panel's drag
@@ -404,6 +420,7 @@ json Daemon::stateJson() {
   if (shown.bus.empty()) { std::string b = selectedBus(); for (auto& c : cameras_) if (c.bus == b) shown = c; }
   json j = json{ { "type", "state" },
                { "running", running_ },
+               { "starting", starting_ },
                { "consumers", consumers_.load() },
                { "consumerApps", watcher_.apps() },
                { "previewOn", previewOn_ },
@@ -680,6 +697,11 @@ std::string Daemon::handle(int client, const std::string& req) {
         if (j.contains("camera") && j["camera"].is_string()) cfg_.preferredCamera = j["camera"];
         if (j.contains("settings") && j["settings"].is_object()) {
           const json& sj = j["settings"];
+          // Checked before anything is applied so a bad path changes nothing.
+          if (sj.contains("backgroundVideo") && sj["backgroundVideo"].is_string()) {
+            std::string p = sj["backgroundVideo"], why;
+            if (!p.empty() && !blockSourceValid(p, &why)) return json{ { "type", "error" }, { "error", "backgroundVideo: " + why } }.dump();
+          }
           settingsFromJson(sj, effectiveSettings());
           // Global (not per camera) keys travel in the same object: `camera-effects-server set block=true blockSource=/path`.
           if (sj.contains("block") && sj["block"].is_boolean()) cfg_.block = sj["block"];
@@ -691,6 +713,15 @@ std::string Daemon::handle(int client, const std::string& req) {
             else { saveConfigSoon(); stateDirty_ = true; return json{ { "type", "error" }, { "error", "blockSource: " + why } }.dump(); }
           }
         }
+        saveConfigSoon();
+      }
+      stateDirty_ = true;
+      return kOk;
+    }
+    if (cmd == "reset") {  // this camera's effects back to the built-in defaults (block/preview/placeholder are global: untouched)
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        effectiveSettings() = Settings();
         saveConfigSoon();
       }
       stateDirty_ = true;
@@ -971,6 +1002,9 @@ int Daemon::run() {
       setState(panRange_, block_.panRange());
     }
     if (!want && captureOpen()) { captureClose(); resetTier(false); stopped = true; }
+    // "Starting" drives the panel's busy indicator: something wants frames but
+    // the camera is still opening (a USB reopen costs a second or two).
+    setState(starting_, want && !block && !captureOpen());
     if (stopped) {
       // Leave black behind so the next opener doesn't see a stale frame.
       cv::Mat black(cfg_.outH, cfg_.outW, CV_8UC3, cv::Scalar(0, 0, 0));
@@ -1006,6 +1040,7 @@ int Daemon::run() {
       double decodeMs = 0;
       if (nextFrame(frame, &decodeMs, 200)) {
         misses_ = 0;
+        setState(starting_, false);   // frames are flowing again
         Settings s;
         std::string preferred;
         { std::lock_guard<std::mutex> lk(mu_); s = effectiveSettings(); preferred = cfg_.preferredCamera; }
@@ -1013,10 +1048,10 @@ int Daemon::run() {
         // Camera switch requested?
         if (!preferred.empty() && preferred != current_.bus && preferred != current_.path) {
           CameraInfo c = pickCamera();
-          if (useFile_ || fileExists(preferred) || (!c.path.empty() && c.path != current_.path)) { captureClose(); continue; }
+          if (useFile_ || fileExists(preferred) || (!c.path.empty() && c.path != current_.path)) { setState(starting_, true); captureClose(); continue; }
         }
         // Center Stage toggled: the camera is reopened at the size it needs.
-        if (!useFile_ && wantedCapture() != capOpened_) { captureClose(); continue; }
+        if (!useFile_ && wantedCapture() != capOpened_) { setState(starting_, true); captureClose(); continue; }
         auto p0 = clk::now();
         // A bad frame or setting must not take the daemon down mid-call: log and skip the frame.
         try {
@@ -1033,6 +1068,14 @@ int Daemon::run() {
         }
         double loopMs = std::chrono::duration<double, std::milli>(clk::now() - p0).count();
         updateTier(decodeMs, loopMs, nowSec());  // also updates procMs_ (shown with the next publish)
+        {  // a non-fatal effect problem (unreadable background video) is shown while it lasts
+          std::string e = fx_.effectError();
+          if (e != fxError_) {
+            if (!e.empty()) setError(e);
+            else if (error_ == fxError_) setError(std::string());
+            fxError_ = e;
+          }
+        }
         setState(gesture_, fx_.lastGesture());
         setState(reactionsActive_, fx_.reactionsActive());
         setState(profileLine_, fx_.profileLine());
@@ -1149,11 +1192,12 @@ int main(int argc, char** argv) {
     bool on = argc > 2 && std::string(argv[2]) == "on";
     return cmdClient(sock, json{ { "cmd", "preview" }, { "on", on } }.dump(), true, on);
   }
+  if (cmd == "reset") return cmdClient(sock, R"({"cmd":"reset"})", true);
   if (cmd == "quit") return cmdClient(sock, R"({"cmd":"quit"})", true);
   if (cmd == "snap") return cmdClient(sock, R"({"cmd":"snapshot"})", true, false, "snapshot");  // prints the PNG path
   if (cmd == "profile") return cmdClient(sock, json{ { "cmd", "profile" }, { "on", argc > 2 && std::string(argv[2]) == "on" } }.dump(), true);
   if (cmd != "run") {
-    fprintf(stderr, "usage: camera-effects-server [run|status|set k=v...|react NAME|camera BUS|snap|preview on (holds while running)|off|profile on|off|quit]\n");
+    fprintf(stderr, "usage: camera-effects-server [run|status|set k=v...|reset|react NAME|camera BUS|snap|preview on (holds while running)|off|profile on|off|quit]\n");
     return 2;
   }
   signal(SIGINT, onSignal);

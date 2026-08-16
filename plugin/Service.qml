@@ -14,6 +14,7 @@ Item {
   // ---- daemon state (mirrors the JSON pushed by camera-effects-server) ----
   property var state: ({})
   readonly property bool connected: sockConnected
+  readonly property bool starting: !!state.starting   // camera opening/reopening: the panel shows a busy indicator
   readonly property bool running: !!state.running          // camera is being read + processed right now
   readonly property int consumers: state.consumers || 0     // apps holding the virtual camera open
   readonly property var consumerApps: state.consumerApps || []   // their process names
@@ -80,6 +81,9 @@ Item {
   function selectCamera(busOrPath) { return send({ cmd: "set", camera: busOrPath }) }
   function react(name) { return send({ cmd: "react", name: name }) }
   function rescan() { return send({ cmd: "rescan" }) }
+  // Every effect of the current camera back to the built-in defaults (the
+  // global block / placeholder / preview-mirror settings are not touched).
+  function reset() { return send({ cmd: "reset" }) }
   // The daemon saves its next output frame as a PNG under ~/Pictures/Camera Effects
   // and reports it in the state (lastSnapshot): see noteSnapshot for what happens then.
   function snapshot() { return send({ cmd: "snapshot" }) }

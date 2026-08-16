@@ -21,6 +21,23 @@ Panel {
 
   // The shell mounts our service at startup (kinds: service); calling
   // ensureService() from a binding would mutate the registry it reads (loop).
+  // The panel closes only when the user says so (bar icon, Esc, IPC) or when the
+  // bar hands the popout to another widget — not on a stray click outside, and
+  // never while a file/colour chooser is up (that click lands on the dialog).
+  function close() {
+    if (!allowClose) return
+    allowClose = false
+    controller.hide()
+  }
+  function userClose() { allowClose = true; close() }
+  function toggle() { if (opened) userClose(); else open() }
+  function closeForPopoutSwitch() { allowClose = true; popoutSwitchClosing = true; controller.hide(); Qt.callLater(function() { popoutSwitchClosing = false }) }
+  property bool allowClose: false
+  property bool resetConfirm: false
+  // The daemon wants frames but the camera is still opening (a USB reopen after
+  // a Center Stage / capture-size change costs a second or two).
+  readonly property bool busy: !!svc && svc.starting
+
   readonly property var svc: bar && bar.shell ? bar.shell.serviceFor("alanfortlink.camera-effects") : null
   readonly property bool inUse: svc ? svc.running : false
   readonly property bool connected: svc ? svc.connected : false
@@ -129,7 +146,7 @@ Panel {
   IpcHandler {
     target: root.ipcTarget
     function open() { root.open() }
-    function close() { root.close() }
+    function close() { root.userClose() }
     function show() { root.open() }
     function hide() { root.close() }
     function toggle() { root.toggle() }
@@ -314,19 +331,35 @@ Panel {
     }
   }
 
+  // Intensity slider. `released` fires while dragging too (throttled to ~20 Hz)
+  // so the effect follows the handle instead of jumping at the end; the final
+  // value is always sent on release.
   component IntensityRow: Item {
+    id: intensity
     property real value: 0.6
     signal released(real v)
     width: parent ? parent.width : 200
     height: root.rowH * 0.8
+    property real pending: -1
+    Timer {
+      id: liveThrottle
+      interval: 50
+      repeat: false
+      function flush() { if (intensity.pending >= 0) { intensity.released(intensity.pending); intensity.pending = -1 } }
+      onTriggered: flush()
+    }
     PanelSlider {
       bar: root.bar
       anchors.fill: parent
       anchors.leftMargin: Style.space(20)
       anchors.rightMargin: root.trailInset
       minimum: 0.05; maximum: 1; step: 0.05
-      value: parent.value
-      onReleased: function(v) { parent.released(v) }
+      value: intensity.value
+      onMoved: function(v) {
+        intensity.pending = v
+        if (!liveThrottle.running) { liveThrottle.flush(); liveThrottle.start() }
+      }
+      onReleased: function(v) { liveThrottle.stop(); intensity.pending = -1; intensity.released(v) }
     }
   }
 
@@ -374,8 +407,11 @@ Panel {
     { value: "warm", label: "Warm" }, { value: "cool", label: "Cool" }, { value: "vivid", label: "Vivid" }, { value: "soft", label: "Soft" },
     { value: "sharpen", label: "Sharpen" }, { value: "vintage", label: "Vintage" } ]
   readonly property var funOpts: [ { value: "none", label: "None" }, { value: "sunglasses", label: "Sunglasses" }, { value: "glasses", label: "Glasses" },
-    { value: "tophat", label: "Top hat" }, { value: "crown", label: "Crown" }, { value: "cat", label: "Cat" }, { value: "halo", label: "Halo" },
-    { value: "headphones", label: "Headphones" }, { value: "flowers", label: "Flowers" } ]
+    { value: "mask", label: "Mask" }, { value: "tophat", label: "Top hat" }, { value: "crown", label: "Crown" },
+    { value: "cat", label: "Cat" }, { value: "halo", label: "Halo" }, { value: "flowers", label: "Flowers" },
+    { value: "blur", label: "Blur" }, { value: "pixelate", label: "Pixelate" } ]
+  readonly property var ambienceOpts: [ { value: "none", label: "None" }, { value: "rain", label: "Rain" }, { value: "snow", label: "Snow" },
+    { value: "sparkles", label: "Sparkles" }, { value: "confetti", label: "Confetti" }, { value: "bubbles", label: "Bubbles" } ]
   readonly property var fitOpts: [ { value: "cover", label: "Cover" }, { value: "contain", label: "Contain" }, { value: "stretch", label: "Stretch" } ]
   readonly property var rotateOpts: [ { value: "0", label: "Off" }, { value: "90", label: "90°" }, { value: "180", label: "180°" }, { value: "270", label: "270°" } ]
   readonly property string imageFilter: "Images | *.png *.jpg *.jpeg *.webp *.bmp"
@@ -423,8 +459,24 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onCloseRequested: root.close()
+      blocked: root.resetConfirm   // the dialog owns the keyboard while it is up
+      onCloseRequested: root.userClose()
       onTabRequested: function(direction) { root.switchPanel(direction) }
+      Keys.onPressed: function(event) { if (resetDialog.handleKey(event)) event.accepted = true }
+
+      // Reset asks first: it clears every effect of the selected camera.
+      ConfirmDialog {
+        id: resetDialog
+        anchors.fill: parent
+        z: 10
+        opened: root.resetConfirm
+        message: "Reset all effects for this camera?"
+        confirmText: "Reset"
+        foreground: root.fg
+        fontFamily: root.fontFamily
+        onCanceled: root.resetConfirm = false
+        onConfirmed: { root.resetConfirm = false; if (root.svc) root.svc.reset() }
+      }
 
       // ---------- Fixed top: hero · setup · preview ----------
       Column {
@@ -529,12 +581,52 @@ Panel {
             anchors.fill: parent
             color: "#000000"
             visible: !root.inUse || !previewLoader.item || !previewLoader.item.ready
-            Text {
+            Column {
               anchors.centerIn: parent
-              text: root.connected && root.svc && root.svc.camera && root.svc.camera.name ? "Starting camera…" : "No camera"
-              color: Qt.rgba(1, 1, 1, 0.5)  // the box is always black
+              spacing: Style.space(8)
+              Text {
+                id: startSpinner
+                anchors.horizontalCenter: parent.horizontalCenter
+                visible: root.busy
+                text: "󰑐"
+                color: Qt.rgba(1, 1, 1, 0.7)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                RotationAnimation on rotation {
+                  running: startSpinner.visible
+                  loops: Animation.Infinite
+                  from: 0; to: 360; duration: 1200
+                }
+              }
+              Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: root.busy ? "Starting camera…"
+                    : root.connected && root.svc && root.svc.camera && root.svc.camera.name ? "Camera idle" : "No camera"
+                color: Qt.rgba(1, 1, 1, 0.5)  // the box is always black
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+          // Reopening (Center Stage flips the capture size, or the camera is
+          // switched): keep the last frame, dim it and spin over it instead of
+          // looking frozen.
+          Rectangle {
+            anchors.fill: parent
+            visible: root.busy && !!previewLoader.item && previewLoader.item.ready
+            color: Qt.rgba(0, 0, 0, 0.45)
+            Text {
+              id: reopenSpinner
+              anchors.centerIn: parent
+              text: "󰑐"
+              color: Qt.rgba(1, 1, 1, 0.85)
               font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
+              font.pixelSize: Style.font.title
+              RotationAnimation on rotation {
+                running: reopenSpinner.visible
+                loops: Animation.Infinite
+                from: 0; to: 360; duration: 1200
+              }
             }
           }
           MouseArea {  // drag pans, wheel zooms, double-click resets (the camera's framing, or the placeholder's while blocked)
@@ -829,7 +921,19 @@ Panel {
                 width: Style.space(120)
                 minimum: 1; maximum: 4; step: 0.1
                 value: root.zoomNow
-                onReleased: function(v) { root.setFraming({ zoom: Math.round(v * 10) / 10 }) }
+                property real pending: -1
+                Timer {
+                  id: zoomThrottle
+                  interval: 50
+                  repeat: false
+                  function flush() { if (zoomSlider.pending >= 0) { root.setFraming({ zoom: Math.round(zoomSlider.pending * 10) / 10 }); zoomSlider.pending = -1 } }
+                  onTriggered: flush()
+                }
+                onMoved: function(v) {   // follow the handle while dragging (throttled), not only on release
+                  zoomSlider.pending = v
+                  if (!zoomThrottle.running) { zoomThrottle.flush(); zoomThrottle.start() }
+                }
+                onReleased: function(v) { zoomThrottle.stop(); zoomSlider.pending = -1; root.setFraming({ zoom: Math.round(v * 10) / 10 }) }
                 onRightClicked: root.setFraming({ zoom: 1 })
               }
             }
@@ -849,6 +953,23 @@ Panel {
             }
             SwitchRow { label: "Mirror preview (only here)"; checked: root.svc ? root.svc.previewMirror : true; onToggled: if (root.svc) root.svc.send({ cmd: "set", settings: { previewMirror: !root.svc.previewMirror } }) }
             SwitchRow { label: "Mirror output (for everyone)"; checked: !!root.s.mirror; onToggled: if (root.svc) root.svc.setSetting("mirror", !root.s.mirror) }
+            Item {  // every effect of this camera back to the built-in defaults (the global privacy settings stay)
+              width: parent.width
+              height: root.rowH
+              Button {
+                anchors.right: parent.right
+                anchors.rightMargin: root.trailInset
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Reset"
+                fontSize: Style.font.bodySmall
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                bordered: true
+                enabled: !!root.svc
+                opacity: enabled ? 1 : 0.5
+                onClicked: root.resetConfirm = true
+              }
+            }
           }
 
           // ---------- Look: portrait · light · background · filter ----------
@@ -922,7 +1043,7 @@ Panel {
                   width: Style.space(96)
                   showLabel: false
                   fontFamily: root.fontFamily
-                  options: [ { value: "none", label: "None" }, { value: "color", label: "Color" }, { value: "image", label: "Image" } ]
+                  options: [ { value: "none", label: "None" }, { value: "color", label: "Color" }, { value: "image", label: "Image" }, { value: "video", label: "Video" } ]
                   value: root.s.background || "none"
                   onChanged: function(v) { if (root.svc) root.svc.setSetting("background", v) }
                 }
@@ -1007,6 +1128,51 @@ Panel {
                 onClicked: pickProc.begin("backgroundImage", "Background image", root.imageFilter)
               }
             }
+            Item {  // Background video: elided file name + chooser (own row, like the image one)
+              visible: root.s.background === "video"
+              width: parent.width
+              height: root.rowH
+              Note {
+                visible: !root.pickerMissing
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(20)
+                anchors.right: chooseVideoBtn.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                elide: Text.ElideMiddle
+                font.pixelSize: Style.font.bodySmall
+                color: root.s.backgroundVideo ? root.fg : root.dim
+                text: root.s.backgroundVideo ? root.basename(root.s.backgroundVideo) : "No video chosen"
+              }
+              TextField {  // fallback when there is no zenity to pick with
+                visible: root.pickerMissing
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(20)
+                anchors.right: chooseVideoBtn.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                foreground: root.fg
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                placeholderText: "/path/to/video.mp4"
+                text: root.s.backgroundVideo || ""
+                onEditingFinished: if (root.svc) root.svc.setSetting("backgroundVideo", text)
+              }
+              Button {
+                id: chooseVideoBtn
+                anchors.right: parent.right
+                anchors.rightMargin: root.trailInset
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Choose…"
+                fontSize: Style.font.bodySmall
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                bordered: true
+                enabled: !root.pickerMissing
+                opacity: enabled ? 1 : 0.5
+                onClicked: pickProc.begin("backgroundVideo", "Background video", root.videoFilter)
+              }
+            }
             LabelDropdownRow { label: "Filter"; options: root.filterOpts; value: root.s.filter || "none"; onChanged: function(v) { if (root.svc) root.svc.setSetting("filter", v) } }
           }
 
@@ -1018,6 +1184,12 @@ Panel {
             spacing: Style.space(6)
 
             LabelDropdownRow { label: "Effects"; options: root.funOpts; value: root.s.fun || "none"; onChanged: function(v) { if (root.svc) root.svc.setSetting("fun", v) } }
+            LabelDropdownRow {  // endless particles over everything (rain, snow, …)
+              label: "Ambience"
+              options: root.ambienceOpts
+              value: root.s.ambience || "none"
+              onChanged: function(v) { if (root.svc) root.svc.setSetting("ambience", v) }
+            }
             SwitchRow {  // switch = hand-gesture triggers; the strip below plays one now
               label: "Reactions · hand gestures"
               checked: !!root.s.reactions

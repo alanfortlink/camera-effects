@@ -31,7 +31,13 @@ const std::vector<std::string>& Settings::filterNames() {
   return n;
 }
 const std::vector<std::string>& Settings::funNames() {
-  static const std::vector<std::string> n = { "none", "sunglasses", "glasses", "tophat", "crown", "cat", "halo", "headphones", "flowers" };
+  static const std::vector<std::string> n = { "none", "sunglasses", "glasses", "mask", "tophat", "crown", "cat", "halo", "flowers",
+                                             "blur", "pixelate" };  // the last two cover the face
+  return n;
+}
+
+const std::vector<std::string>& Settings::ambienceNames() {
+  static const std::vector<std::string> n = { "none", "rain", "snow", "sparkles", "confetti", "bubbles" };
   return n;
 }
 
@@ -499,7 +505,7 @@ void Reactions::render(cv::Mat& frame, double now) {
 // FunOverlay
 
 bool FunOverlay::loadAssets(const std::string& dir, std::string* err) {
-  const char* files[] = { "sunglasses", "glasses", "tophat", "crown", "headphones", "flowers" };
+  const char* files[] = { "sunglasses", "glasses", "tophat", "crown", "flowers", "mask" };
   bool ok = true;
   for (auto f : files) {
     cv::Mat m = cv::imread(dir + "/" + f + ".png", cv::IMREAD_UNCHANGED);
@@ -588,11 +594,11 @@ void FunOverlay::render(cv::Mat& frame, const std::string& kind, cv::Point2f ori
       sprite(name, width, mid + up * (float)(above + h / 2));
     };
     if (kind == "sunglasses") sprite("sunglasses", 2.3 * d, mid);
+    else if (kind == "mask") sprite("mask", 2.6 * d, mid - up * (0.35f * d));   // disguise over eyes, nose and mouth
     else if (kind == "glasses") sprite("glasses", 2.3 * d, mid);
     else if (kind == "tophat") hat("tophat", 2.6 * d, 0.9 * d);
     else if (kind == "crown") hat("crown", 2.6 * d, 0.6 * d);
     else if (kind == "flowers") hat("flowers", 2.6 * d, 0.6 * d);
-    else if (kind == "headphones") sprite("headphones", 3.4 * d, mid + up * (0.1f * d));  // cups at ear level, band over the head
     else if (kind == "halo") {
       glow = true;
       int th = std::max(2, (int)std::lround(0.06 * d));
@@ -621,6 +627,227 @@ void FunOverlay::render(cv::Mat& frame, const std::string& kind, cv::Point2f ori
     }
   }
   layer_.composite(frame, glow);
+}
+
+// ---------------------------------------------------------------------------
+// FaceCover (Hide face)
+
+void FaceCover::update(const std::vector<Face>& faces, double now) {
+  bool matched[kMaxFaces] = { false };
+  for (const Face& f : faces) {
+    if (!(f.box.width > 1 && f.box.height > 1)) continue;
+    cv::Point2f c(f.box.x + f.box.width / 2, f.box.y + f.box.height / 2);
+    // Nearest live track within a face width; each track takes one face.
+    int best = -1;
+    double bestDist = 1e9;
+    for (size_t t = 0; t < tracks_.size(); t++) {
+      if (matched[t]) continue;
+      double dist = cv::norm(tracks_[t].c - c);
+      if (dist < 0.9 * std::max(f.box.width, tracks_[t].w) && dist < bestDist) { bestDist = dist; best = (int)t; }
+    }
+    if (best < 0) {
+      if ((int)tracks_.size() < kMaxFaces) { tracks_.push_back(Track{}); best = (int)tracks_.size() - 1; }
+      else {  // full: recycle the track unseen for longest
+        best = 0;
+        for (size_t t = 1; t < tracks_.size(); t++) if (!matched[t] && tracks_[t].lastSeen < tracks_[best].lastSeen) best = (int)t;
+        if (matched[best]) continue;
+      }
+      Track& t = tracks_[best];
+      t.c = c; t.w = f.box.width; t.h = f.box.height;
+    } else {  // EMA at the detector's cadence, like FunOverlay
+      const float a = 0.5f;
+      Track& t = tracks_[best];
+      t.c = t.c * (1 - a) + c * a;
+      t.w = t.w * (1 - a) + f.box.width * a;
+      t.h = t.h * (1 - a) + f.box.height * a;
+    }
+    tracks_[best].lastSeen = now;
+    matched[best] = true;
+  }
+}
+
+void FaceCover::render(cv::Mat& frame, const std::string& kind, cv::Point2f origin, cv::Point2f scale, double now) {
+  tracks_.erase(std::remove_if(tracks_.begin(), tracks_.end(), [&](const Track& t) { return now - t.lastSeen > kHold; }), tracks_.end());
+  if (tracks_.empty() || kind == "none") return;
+  layer_.begin(frame.size());
+  for (const Track& t : tracks_) {
+    // An ellipse a little wider and taller than the box, centred slightly
+    // above its centre (the box stops at the chin, the forehead is above it).
+    cv::Point2f c((t.c.x - origin.x) * scale.x, (t.c.y - origin.y) * scale.y);
+    float w = t.w * scale.x * 1.35f, h = t.h * scale.y * 1.5f;
+    c.y -= t.h * scale.y * 0.08f;
+    if (!(w > 6 && h > 6)) continue;
+    cv::Rect box((int)std::lround(c.x - w / 2) - 1, (int)std::lround(c.y - h / 2) - 1, (int)std::lround(w) + 2, (int)std::lround(h) + 2);
+    cv::Rect r = box & cv::Rect(0, 0, frame.cols, frame.rows);
+    if (r.width < 6 || r.height < 6) continue;
+    cv::Mat roi = frame(r);
+    if (kind == "blur") {  // heavy blur: box blur at ~1/10 of the ROI, back up bilinear
+      cv::Size ss(std::max(2, r.width / 10), std::max(2, r.height / 10));
+      cv::resize(roi, small_, ss, 0, 0, cv::INTER_AREA);
+      cv::blur(small_, small_, cv::Size(3, 3));
+      cv::resize(small_, cover_, r.size(), 0, 0, cv::INTER_LINEAR);
+    } else if (kind == "pixelate") {
+      cv::Size ss(12, std::max(2, (int)std::lround(12.0 * r.height / r.width)));
+      cv::resize(roi, small_, ss, 0, 0, cv::INTER_AREA);
+      cv::resize(small_, cover_, r.size(), 0, 0, cv::INTER_NEAREST);
+    } else {
+      continue;
+    }
+    // Feathered elliptical alpha, built on the ROI (a few thousand pixels).
+    alpha_.create(r.size(), CV_8UC1);
+    alpha_.setTo(0);
+    cv::ellipse(alpha_, cv::Point((int)std::lround(c.x) - r.x, (int)std::lround(c.y) - r.y), cv::Size((int)(w / 2), (int)(h / 2)), 0, 0, 360, cv::Scalar(255), -1, cv::LINE_AA);
+    int k = std::max(3, (int)(std::min(w, h) * 0.1) | 1);
+    cv::GaussianBlur(alpha_, alpha_, cv::Size(k, k), 0);
+    blend8Roi(roi, cover_, alpha_, cv::Rect(0, 0, r.width, r.height));
+  }
+  layer_.composite(frame, false);
+}
+
+// ---------------------------------------------------------------------------
+// Ambience
+
+namespace {
+const cv::Scalar kConfettiPalette[6] = { {90, 90, 255}, {60, 200, 255}, {110, 230, 90}, {255, 170, 60}, {255, 90, 220}, {60, 240, 240} };
+}  // namespace
+
+void Ambience::respawn(Particle& p, bool initial) {
+  std::uniform_real_distribution<float> U(0, 1);
+  const float W = (float)size_.width, H = (float)size_.height;
+  p.phase = U(rng_) * 6.28f;
+  p.x = W * U(rng_);
+  if (kind_ == "rain") {
+    p.y = initial ? H * U(rng_) : -H * (0.02f + 0.3f * U(rng_));
+    p.vy = H * (1.1f + 0.8f * U(rng_));
+    p.vx = -H * 0.07f;
+    p.size = H * (0.03f + 0.035f * U(rng_));
+  } else if (kind_ == "snow") {
+    p.y = initial ? H * U(rng_) : -H * (0.02f + 0.2f * U(rng_));
+    p.vy = H * (0.09f + 0.16f * U(rng_));
+    p.vx = W * (U(rng_) - 0.5f) * 0.03f;
+    p.size = H * (0.004f + 0.008f * U(rng_));
+  } else if (kind_ == "sparkles") {
+    p.y = initial ? H * U(rng_) : H * (0.05f + 0.9f * U(rng_));
+    p.vy = -H * (0.01f + 0.03f * U(rng_));
+    p.vx = W * (U(rng_) - 0.5f) * 0.02f;
+    p.size = H * (0.006f + 0.012f * U(rng_));
+    p.spin = 1.6f + 2.4f * U(rng_);          // twinkle rate
+  } else if (kind_ == "confetti") {
+    p.y = initial ? H * U(rng_) : -H * (0.02f + 0.25f * U(rng_));
+    p.vy = H * (0.22f + 0.28f * U(rng_));
+    p.vx = W * (U(rng_) - 0.5f) * 0.1f;
+    p.size = H * (0.011f + 0.011f * U(rng_));
+    p.rot = U(rng_) * 6.28f;
+    p.spin = 3.0f + 3.0f * U(rng_);
+    p.color = kConfettiPalette[(int)(U(rng_) * 6) % 6];
+  } else {  // bubbles
+    p.y = initial ? H * U(rng_) : H * (1.02f + 0.2f * U(rng_));
+    p.vy = -H * (0.09f + 0.16f * U(rng_));
+    p.vx = W * (U(rng_) - 0.5f) * 0.02f;
+    p.size = H * (0.012f + 0.03f * U(rng_));
+  }
+}
+
+void Ambience::build(const std::string& kind, const cv::Size& sz) {
+  kind_ = kind;
+  size_ = sz;
+  int n = kind == "rain" ? 130 : kind == "snow" ? 110 : kind == "sparkles" ? 70 : kind == "confetti" ? 90 : 40;
+  parts_.assign(n, Particle{});
+  for (auto& p : parts_) { p.color = cv::Scalar(255, 255, 255); respawn(p, true); }
+}
+
+void Ambience::render(cv::Mat& frame, const std::string& kind, double now, double dt) {
+  if (kind == "none") { if (!parts_.empty()) reset(); return; }
+  if (kind != kind_ || size_ != frame.size()) build(kind, frame.size());
+  const float W = (float)size_.width, H = (float)size_.height;
+  const float d = (float)std::clamp(dt, 0.001, 0.2);
+  layer_.begin(frame.size());
+  for (Particle& p : parts_) {
+    p.x += p.vx * d;
+    p.y += p.vy * d;
+    if (kind_ == "rain") {
+      layer_.line(cv::Point2f(p.x, p.y), cv::Point2f(p.x - W * 0.004f, p.y + p.size), cv::Scalar(255, 235, 205), 0.42, std::max(1, (int)(H * 0.0025)));
+      if (p.y > H + p.size) respawn(p, false);
+    } else if (kind_ == "snow") {
+      float x = p.x + std::sin((float)now * 0.9f + p.phase) * W * 0.012f;
+      layer_.dot(cv::Point2f(x, p.y), std::max(1, (int)std::lround(p.size)), cv::Scalar(250, 250, 255), 0.8);
+      if (p.y > H + p.size) respawn(p, false);
+    } else if (kind_ == "sparkles") {
+      double tw = 0.5 + 0.5 * std::sin(now * p.spin + p.phase);
+      double a = 0.15 + 0.75 * tw * tw;
+      int r = std::max(1, (int)std::lround(p.size * (0.6 + 0.4 * tw)));
+      layer_.dot(cv::Point2f(p.x, p.y), r, cv::Scalar(210, 240, 255), a);
+      if (tw > 0.7) {  // a short cross of light on the bright half of the twinkle
+        float l = p.size * 2.6f * (float)tw;
+        layer_.line(cv::Point2f(p.x - l, p.y), cv::Point2f(p.x + l, p.y), cv::Scalar(220, 245, 255), a * 0.7, 1);
+        layer_.line(cv::Point2f(p.x, p.y - l), cv::Point2f(p.x, p.y + l), cv::Scalar(220, 245, 255), a * 0.7, 1);
+      }
+      if (p.y < -p.size * 3) respawn(p, false);
+    } else if (kind_ == "confetti") {
+      p.rot += p.spin * d;
+      float flip = std::cos((float)now * 6.0f + p.phase);   // 3D tumble: squash one axis
+      cv::Point2f c(p.x + std::sin((float)now * 2.4f + p.phase) * W * 0.008f, p.y);
+      cv::Point2f ax(std::cos(p.rot) * p.size, std::sin(p.rot) * p.size);
+      cv::Point2f ay(-std::sin(p.rot) * p.size * 0.55f * flip, std::cos(p.rot) * p.size * 0.55f * flip);
+      cv::Point pts[4] = { c - ax - ay, c + ax - ay, c + ax + ay, c - ax + ay };
+      layer_.poly(pts, 4, p.color, 0.92);
+      if (p.y > H + p.size * 2) respawn(p, false);
+    } else {  // bubbles: a thin ring with a highlight
+      float x = p.x + std::sin((float)now * 0.8f + p.phase) * W * 0.01f;
+      int th = std::max(1, (int)(H * 0.0025));
+      layer_.ellipse(cv::Point2f(x, p.y), cv::Size2f(p.size, p.size * 0.92f), 0, cv::Scalar(255, 240, 220), 0.5, th);
+      layer_.dot(cv::Point2f(x - p.size * 0.35f, p.y - p.size * 0.35f), std::max(1, (int)(p.size * 0.18f)), cv::Scalar(255, 255, 255), 0.55);
+      if (p.y < -p.size * 2) respawn(p, false);
+    }
+  }
+  layer_.composite(frame, false);
+}
+
+// ---------------------------------------------------------------------------
+// VideoBackground
+
+void VideoBackground::close() {
+  if (cap_.isOpened()) cap_.release();
+  path_.clear();
+  raw_.release();
+  out_.release();
+  next_ = retryAt_ = 0;
+}
+
+const cv::Mat* VideoBackground::frame(const std::string& path, const cv::Size& sz, double now) {
+  if (path.empty()) { if (!path_.empty()) close(); error_ = "no background video chosen"; return nullptr; }
+  if (path != path_) { close(); path_ = path; error_.clear(); }
+  if (!cap_.isOpened()) {
+    if (now < retryAt_) return nullptr;
+    bool ok = false;
+    try { ok = cap_.open(path) && cap_.isOpened(); } catch (const std::exception&) { ok = false; }
+    if (!ok) { retryAt_ = now + 2.0; error_ = "background video not readable"; return nullptr; }
+    double f = cap_.get(cv::CAP_PROP_FPS);
+    period_ = f > 1 && f < 240 ? 1.0 / f : 1.0 / 30;
+    next_ = 0;
+    error_.clear();
+    out_.release();
+  }
+  if (out_.empty() || now >= next_) {  // at most one decode per output frame
+    bool ok = false;
+    try {
+      ok = cap_.read(raw_) && !raw_.empty();
+      if (!ok) { cap_.set(cv::CAP_PROP_POS_FRAMES, 0); ok = cap_.read(raw_) && !raw_.empty(); }  // loop
+    } catch (const std::exception&) { ok = false; }
+    if (!ok) {
+      cap_.release();
+      retryAt_ = now + 2.0;
+      error_ = "background video not readable";
+      return out_.empty() ? nullptr : &out_;
+    }
+    next_ = (next_ < now ? now : next_) + period_;
+    coverFit(raw_, out_, sz);
+    size_ = sz;
+  } else if (size_ != sz && !raw_.empty()) {
+    coverFit(raw_, out_, sz);
+    size_ = sz;
+  }
+  return out_.empty() ? nullptr : &out_;
 }
 
 // ---------------------------------------------------------------------------
@@ -660,7 +887,21 @@ bool EffectPipeline::init(const std::string& modelsDir, const std::string& asset
 void EffectPipeline::setSettings(const Settings& s) {
   if (s.centerStage != settings_.centerStage || s.rotate != settings_.rotate) framer_.reset();
   if (s.fun != settings_.fun || s.rotate != settings_.rotate) fun_.reset();  // face tracks are in (rotated) source coordinates
+  if (Settings::isFaceCover(s.fun) != Settings::isFaceCover(settings_.fun) || s.rotate != settings_.rotate) hide_.reset();
+  if (s.background != "video") { bgVideo_.close(); effectError_.clear(); }
   settings_ = s;
+}
+
+void EffectPipeline::ensureColorBackground(const cv::Size& sz) {
+  unsigned rgb = 0x1e1e2e;
+  const std::string& c = settings_.backgroundColor;
+  parseHexColor(c, rgb);  // validated when the setting is read; default if not
+  cv::Scalar col((rgb) & 0xff, (rgb >> 8) & 0xff, (rgb >> 16) & 0xff);
+  if (bgImage_.empty() || bgImageSize_ != sz || bgImagePath_ != c) {
+    bgImage_ = cv::Mat(sz, CV_8UC3, col);
+    bgImagePath_ = c;
+    bgImageSize_ = sz;
+  }
 }
 
 void EffectPipeline::ensureBackground(const cv::Size& sz) {
@@ -673,15 +914,7 @@ void EffectPipeline::ensureBackground(const cv::Size& sz) {
       bgImageSize_ = sz;
     }
   } else if (settings_.background == "color") {
-    unsigned rgb = 0x1e1e2e;
-    const std::string& c = settings_.backgroundColor;
-    parseHexColor(c, rgb);  // validated when the setting is read; default if not
-    cv::Scalar col((rgb) & 0xff, (rgb >> 8) & 0xff, (rgb >> 16) & 0xff);
-    if (bgImage_.empty() || bgImageSize_ != sz || bgImagePath_ != c) {
-      bgImage_ = cv::Mat(sz, CV_8UC3, col);
-      bgImagePath_ = c;
-      bgImageSize_ = sz;
-    }
+    ensureColorBackground(sz);
   }
 }
 
@@ -717,9 +950,15 @@ void EffectPipeline::computeMask(const cv::Mat& work) {
   cv::cvtColor(mask8_, mask3_, cv::COLOR_GRAY2BGR);  // 3-channel so the blends are plain elementwise loops
 }
 
-void EffectPipeline::applyBackground(cv::Mat& work) {
+void EffectPipeline::applyBackground(cv::Mat& work, double now) {
   cv::Mat bg;
-  if (settings_.background == "image" || settings_.background == "color") {
+  if (settings_.background == "video") {
+    // A looped clip behind the person, exactly like the image case. An
+    // unreadable file falls back to the colour background and is reported.
+    const cv::Mat* v = bgVideo_.frame(settings_.backgroundVideo, work.size(), now);
+    if (v) { bg = *v; effectError_.clear(); }
+    else { effectError_ = bgVideo_.error(); ensureColorBackground(work.size()); bg = bgImage_; }
+  } else if (settings_.background == "image" || settings_.background == "color") {
     ensureBackground(work.size());
     bg = bgImage_;
   } else if (settings_.portrait) {
@@ -936,7 +1175,10 @@ void EffectPipeline::process(const cv::Mat& src0, cv::Mat& out, const cv::Size& 
   // Faces for Center Stage are found in source coordinates (the crop is chosen
   // from them). srcPyr_ is only built when the source differs from the output.
   bool facesFresh = false;
-  const bool funOn = settings_.fun != "none" && faces_.loaded();
+  // One dropdown: accessories decorate the face, the three cover modes hide it.
+  const bool coverOn = Settings::isFaceCover(settings_.fun) && faces_.loaded();
+  const bool funOn = settings_.fun != "none" && !coverOn && faces_.loaded();
+  const bool hideOn = coverOn;
   bool srcIsWork = geom.passthrough(src.size(), outSize);
   bool pyrReady = false;  // pyr_ already reset to this frame
   auto detectFaces = [&]() {
@@ -954,9 +1196,10 @@ void EffectPipeline::process(const cv::Mat& src0, cv::Mat& out, const cv::Size& 
     faceRects_.clear();
     for (auto& f : lastFaces_) faceRects_.push_back(f.box);
     if (funOn) fun_.update(lastFaces_, now);
+    if (hideOn) hide_.update(lastFaces_, now);
     lastFaceTime_ = now; facesFresh = true;
   };
-  if ((settings_.centerStage || funOn) && faces_.loaded() && now - lastFaceTime_ >= 1.0 / faceHz) detectFaces();
+  if ((settings_.centerStage || funOn || hideOn) && faces_.loaded() && now - lastFaceTime_ >= 1.0 / faceHz) detectFaces();
   stage(0);  // faces
 
   if (settings_.centerStage) geom.crop = framer_.update(src.size(), faceRects_, facesFresh, outSize, dt, settings_.zoom, settings_.centerStageIntensity);
@@ -988,14 +1231,20 @@ void EffectPipeline::process(const cv::Mat& src0, cv::Mat& out, const cv::Size& 
   bool needMask = settings_.portrait || settings_.studioLight || settings_.background != "none";
   if (needMask) computeMask(work);
   stage(2);  // mask
-  if (settings_.portrait || settings_.background != "none") applyBackground(work);
+  if (settings_.portrait || settings_.background != "none") applyBackground(work, now);
   stage(3);  // background
   if (settings_.studioLight) applyStudioLight(work);
   stage(4);  // studio light
-  // Face accessories: tracks are in source coordinates, mapped through the crop.
+  // Tracks (hide face, accessories) are in source coordinates, mapped through the crop.
+  const cv::Point2f trackOrigin((float)(crop.x - dst.x / sx), (float)(crop.y - dst.y / sy)), trackScale((float)sx, (float)sy);
+  if (hideOn) {
+    if (work.data == src.data) { src.copyTo(work_); work = work_; }  // don't draw into the capture buffer
+    hide_.render(work, settings_.fun, trackOrigin, trackScale, now);
+  }
+  stage(9);  // hide face
   if (funOn) {
     if (work.data == src.data) { src.copyTo(work_); work = work_; }  // don't draw into the capture buffer
-    fun_.render(work, settings_.fun, cv::Point2f((float)(crop.x - dst.x / sx), (float)(crop.y - dst.y / sy)), cv::Point2f((float)sx, (float)sy), now);
+    fun_.render(work, settings_.fun, trackOrigin, trackScale, now);
   }
   stage(5);  // fun
 
@@ -1025,6 +1274,12 @@ void EffectPipeline::process(const cv::Mat& src0, cv::Mat& out, const cv::Size& 
   stage(6);  // gestures
   if (settings_.filter != "none") applyFilter(work);
   stage(7);  // colour filter
+  // Ambience: an endless overlay, skipped on the cheapest tier.
+  if (settings_.ambience != "none" && tier_ < 2) {
+    if (work.data == src.data) { src.copyTo(work_); work = work_; }  // don't draw into the capture buffer
+    ambience_.render(work, settings_.ambience, now, dt);
+  } else if (settings_.ambience == "none") ambience_.reset();
+  stage(10);  // ambience
   if (reactions_.active()) {
     if (work.data == src.data) { src.copyTo(work_); work = work_; }  // don't draw into the capture buffer
     reactions_.render(work, now);
@@ -1039,9 +1294,9 @@ void EffectPipeline::process(const cv::Mat& src0, cv::Mat& out, const cv::Size& 
     if (profN_) { for (auto& a : profAcc_) a = 0; profN_ = 0; }
   } else if (++profN_ == 60) {
     char b[256];
-    snprintf(b, sizeof b, "ms/frame: faces %.1f resize %.1f mask %.1f bg %.1f light %.1f fun %.1f gestures %.1f filter %.1f react %.1f",
-             profAcc_[0] / profN_, profAcc_[1] / profN_, profAcc_[2] / profN_, profAcc_[3] / profN_, profAcc_[4] / profN_, profAcc_[5] / profN_,
-             profAcc_[6] / profN_, profAcc_[7] / profN_, profAcc_[8] / profN_);
+    snprintf(b, sizeof b, "ms/frame: faces %.1f resize %.1f mask %.1f bg %.1f light %.1f hide %.1f fun %.1f gestures %.1f filter %.1f ambience %.1f react %.1f",
+             profAcc_[0] / profN_, profAcc_[1] / profN_, profAcc_[2] / profN_, profAcc_[3] / profN_, profAcc_[4] / profN_, profAcc_[9] / profN_,
+             profAcc_[5] / profN_, profAcc_[6] / profN_, profAcc_[7] / profN_, profAcc_[10] / profN_, profAcc_[8] / profN_);
     profileLine_ = b;
     for (auto& a : profAcc_) a = 0;
     profN_ = 0;
