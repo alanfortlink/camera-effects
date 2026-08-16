@@ -636,6 +636,11 @@ Panel {
             fontFamily: root.fontFamily
           }
           SwitchRow { label: "Center Stage"; checked: !!root.s.centerStage; onToggled: if (root.svc) root.svc.setSetting("centerStage", !root.s.centerStage) }
+          IntensityRow {  // how tight / how eagerly it follows: left = calm and wide, right = tight and snappy
+            visible: !!root.s.centerStage
+            value: root.s.centerStageIntensity !== undefined ? root.s.centerStageIntensity : 0.5
+            onReleased: function(v) { if (root.svc) root.svc.setSetting("centerStageIntensity", v) }
+          }
           Item {  // Zoom: label · value · slider (right-click the slider resets; the preview's wheel steps it too)
             width: parent.width
             height: root.rowH

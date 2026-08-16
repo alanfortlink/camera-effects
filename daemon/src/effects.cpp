@@ -130,7 +130,8 @@ cv::Rect Framer::fullCrop(const cv::Size& src, double outAspect) const {
   return cv::Rect((int)((src.width - w) / 2), (int)((src.height - h) / 2), (int)w, (int)h);
 }
 
-cv::Rect Framer::update(const cv::Size& src, const std::vector<cv::Rect2f>& faces, bool facesFresh, const cv::Size& out, double dt, double minZoom) {
+cv::Rect Framer::update(const cv::Size& src, const std::vector<cv::Rect2f>& faces, bool facesFresh, const cv::Size& out, double dt, double minZoom, double intensity) {
+  const double I = std::clamp(intensity, 0.0, 1.0);
   now_ += dt;
   const double outAspect = (double)out.width / std::max(1, out.height);
   cv::Rect full = fullCrop(src, outAspect);
@@ -139,7 +140,8 @@ cv::Rect Framer::update(const cv::Size& src, const std::vector<cv::Rect2f>& face
   // the source is no bigger than the output (an upscale, but that is what a
   // 720p Center Stage is: framing beats sharpness at desk distance).
   const double ratio = (double)full.height / std::max(1, out.height);
-  const double maxZoom = ratio >= 1.5 ? 3.0 : (ratio > 1.0 ? 1.8 : 1.6);
+  const double hwZoom = ratio >= 1.5 ? 3.0 : (ratio > 1.0 ? 1.8 : 1.6);
+  const double maxZoom = 1.0 + (hwZoom - 1.0) * (0.4 + 0.6 * I);   // intensity scales how far in we go
   minZoom = std::clamp(minZoom, 1.0, 4.0);
   const double hRest = full.height / minZoom;                        // "nobody in view": the user's own zoom, centred
   const double hMin = std::min(hRest, full.height / maxZoom);
@@ -158,12 +160,15 @@ cv::Rect Framer::update(const cv::Size& src, const std::vector<cv::Rect2f>& face
         x0 = std::min(x0, f.x); y0 = std::min(y0, f.y); x1 = std::max(x1, f.x + f.width); y1 = std::max(y1, f.y + f.height);
         maxFaceH = std::max(maxFaceH, f.height);
       }
-      double nh = std::max((double)(y1 - y0) + 1.4 * maxFaceH, ((x1 - x0) + 2.0 * maxFaceH) / outAspect);
+      // Tightness: 3.6 face heights (loose) at intensity 0 down to 1.8 (tight) at 1.
+      const double heights = 3.6 - 1.8 * I;
+      double nh = std::max((double)(y1 - y0) + (heights - 1.0) * maxFaceH, ((x1 - x0) + (heights - 0.4) * maxFaceH) / outAspect);
       double ncx = (x0 + x1) / 2.0;
       double ncy = y0 - 0.35 * maxFaceH + nh / 2;  // centre of the ideal frame: kept when the zoom limits make the crop larger
       nh = std::clamp(nh, hMin, hRest);
       // Deadband so tiny detector jitter doesn't move the frame.
-      if (std::abs(ncx - tcx_) > 0.035 * h_ || std::abs(ncy - tcy_) > 0.035 * h_ || std::abs(nh - th_) > 0.06 * h_) {
+      const double dead = 0.055 - 0.03 * I;
+      if (std::abs(ncx - tcx_) > dead * h_ || std::abs(ncy - tcy_) > dead * h_ || std::abs(nh - th_) > 1.7 * dead * h_) {
         tcx_ = ncx; tcy_ = ncy; th_ = nh;
       }
     } else if (now_ - lastFaceTime_ > 1.5) {
@@ -172,8 +177,8 @@ cv::Rect Framer::update(const cv::Size& src, const std::vector<cv::Rect2f>& face
   }
   th_ = std::clamp(th_, hMin, hRest);  // the user's zoom changed under us
   // Ease: pan fairly quick, zoom-in slower than zoom-out.
-  double aPan = 1 - std::exp(-dt / 0.35);
-  double aZoom = 1 - std::exp(-dt / (th_ > h_ ? 0.5 : 1.0));
+  double aPan = 1 - std::exp(-dt / (0.65 - 0.4 * I));                          // 0.65 s (calm) .. 0.25 s (snappy)
+  double aZoom = 1 - std::exp(-dt / (th_ > h_ ? (0.8 - 0.4 * I) : (1.5 - 0.9 * I)));
   cx_ += (tcx_ - cx_) * aPan; cy_ += (tcy_ - cy_) * aPan; h_ += (th_ - h_) * aZoom;
   h_ = std::min(h_, (double)full.height);
   double w = h_ * outAspect;
@@ -954,7 +959,7 @@ void EffectPipeline::process(const cv::Mat& src0, cv::Mat& out, const cv::Size& 
   if ((settings_.centerStage || funOn) && faces_.loaded() && now - lastFaceTime_ >= 1.0 / faceHz) detectFaces();
   stage(0);  // faces
 
-  if (settings_.centerStage) geom.crop = framer_.update(src.size(), faceRects_, facesFresh, outSize, dt, settings_.zoom);
+  if (settings_.centerStage) geom.crop = framer_.update(src.size(), faceRects_, facesFresh, outSize, dt, settings_.zoom, settings_.centerStageIntensity);
   const cv::Rect crop = geom.crop, dst = geom.dst;
   framing_.geom = geom; framing_.src = src.size(); framing_.faces = (int)faceRects_.size();
   framing_.face = cv::Rect();

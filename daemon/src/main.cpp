@@ -70,7 +70,7 @@ bool fileExists(const std::string& p) { struct stat st{}; return stat(p.c_str(),
 // Settings <-> JSON
 
 json settingsToJson(const Settings& s) {
-  return json{ { "centerStage", s.centerStage }, { "portrait", s.portrait }, { "portraitIntensity", s.portraitIntensity },
+  return json{ { "centerStage", s.centerStage }, { "centerStageIntensity", s.centerStageIntensity }, { "portrait", s.portrait }, { "portraitIntensity", s.portraitIntensity },
                { "studioLight", s.studioLight }, { "studioLightIntensity", s.studioLightIntensity }, { "background", s.background },
                { "backgroundImage", s.backgroundImage }, { "backgroundColor", s.backgroundColor }, { "reactions", s.reactions }, { "mirror", s.mirror },
                { "rotate", s.rotate }, { "filter", s.filter }, { "fun", s.fun },
@@ -97,7 +97,7 @@ void settingsFromJson(const json& j, Settings& s) {
   auto getb = [&](const char* k, bool& v) { if (j.contains(k) && j[k].is_boolean()) v = j[k]; };
   auto getf = [&](const char* k, float& v) { if (j.contains(k) && j[k].is_number()) v = std::clamp(j[k].get<float>(), 0.f, 1.f); };
   auto gets = [&](const char* k, std::string& v) { if (j.contains(k) && j[k].is_string()) v = j[k]; };
-  getb("centerStage", s.centerStage); getb("portrait", s.portrait); getf("portraitIntensity", s.portraitIntensity);
+  getb("centerStage", s.centerStage); getf("centerStageIntensity", s.centerStageIntensity); getb("portrait", s.portrait); getf("portraitIntensity", s.portraitIntensity);
   getb("studioLight", s.studioLight); getf("studioLightIntensity", s.studioLightIntensity);
   gets("background", s.background); gets("backgroundImage", s.backgroundImage); gets("backgroundColor", s.backgroundColor);
   getb("reactions", s.reactions); getb("mirror", s.mirror);

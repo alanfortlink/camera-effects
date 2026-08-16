@@ -14,6 +14,7 @@
 // User-facing effect settings. Mirrors what the shell panel shows.
 struct Settings {
   bool centerStage = false;
+  float centerStageIntensity = 0.5f;  // 0 = loose/slow framing, 1 = tight/quick
   bool portrait = false;            // background blur
   float portraitIntensity = 0.6f;   // 0..1
   bool studioLight = false;
@@ -32,7 +33,7 @@ struct Settings {
   float zoom = 1;                   // 1..4
   float panX = 0, panY = 0;         // -1..1
   bool operator==(const Settings& o) const {
-    return centerStage == o.centerStage && portrait == o.portrait && portraitIntensity == o.portraitIntensity &&
+    return centerStage == o.centerStage && centerStageIntensity == o.centerStageIntensity && portrait == o.portrait && portraitIntensity == o.portraitIntensity &&
            studioLight == o.studioLight && studioLightIntensity == o.studioLightIntensity && background == o.background &&
            backgroundImage == o.backgroundImage && backgroundColor == o.backgroundColor && reactions == o.reactions && mirror == o.mirror &&
            rotate == o.rotate && filter == o.filter && fun == o.fun && fit == o.fit && zoom == o.zoom && panX == o.panX && panY == o.panY;
@@ -116,7 +117,8 @@ public:
   // Returns the crop rect (in src coordinates) for this frame. `minZoom` is
   // the user's zoom: the framer never shows more than the full crop / minZoom
   // (and no less than full / maxZoom, see effects.cpp).
-  cv::Rect update(const cv::Size& src, const std::vector<cv::Rect2f>& faces, bool facesFresh, const cv::Size& out, double dt, double minZoom);
+  // `intensity` (0..1) scales how tight, how far in and how quickly the framer follows.
+  cv::Rect update(const cv::Size& src, const std::vector<cv::Rect2f>& faces, bool facesFresh, const cv::Size& out, double dt, double minZoom, double intensity = 0.5);
   cv::Rect fullCrop(const cv::Size& src, double outAspect) const;
 
 private:
