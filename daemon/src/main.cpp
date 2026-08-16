@@ -4,7 +4,11 @@
 // effects (Center Stage, Portrait, Studio Light, background replacement,
 // colour filters, fun face filters, Reactions) and publishes the result as a
 // virtual V4L2 camera ("Camera Effects") that every app can use. Runs the camera only while some app has the virtual camera
-// open; with "block" on it never opens the camera and feeds a placeholder instead.
+// open (or a control client asked for the preview); with "block" on it never
+// opens the camera and feeds a placeholder instead. The panel's preview is a
+// small JPEG the daemon writes to the runtime dir while a preview is wanted:
+// the loopback lets a single reader negotiate the format, so a second reader
+// (the panel) would see nothing while an app streams.
 #include <fcntl.h>
 #include <linux/videodev2.h>
 #include <pwd.h>
@@ -26,6 +30,7 @@
 #include <fstream>
 #include <mutex>
 #include <map>
+#include <set>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <thread>
@@ -110,7 +115,9 @@ void settingsFromJson(const json& j, Settings& s) {
 // ---------------------------------------------------------------------------
 // Client mode: talk to a running daemon.
 
-int cmdClient(const std::string& sockPath, const std::string& request, bool wait) {
+// `hold`: stay connected after the reply until the daemon goes away or we are
+// killed (used by `preview on`, whose effect lasts as long as the connection).
+int cmdClient(const std::string& sockPath, const std::string& request, bool wait, bool hold = false) {
   sockaddr_un addr{};
   if (sockPath.size() >= sizeof(addr.sun_path)) { fprintf(stderr, "socket path too long: %s\n", sockPath.c_str()); return 1; }
   int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -134,8 +141,13 @@ int cmdClient(const std::string& sockPath, const std::string& request, bool wait
       std::string line = acc.substr(0, pos);
       acc.erase(0, pos + 1);
       lines++;
-      if (lines == (wait ? 2 : 1)) { printf("%s\n", line.c_str()); }
+      if (lines == (wait ? 2 : 1)) { printf("%s\n", line.c_str()); fflush(stdout); }
     }
+  }
+  if (hold) {
+    tv = timeval{ 0, 0 };  // block for good; state pushes are read and dropped
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    while (recv(fd, buf, sizeof buf, 0) > 0) {}
   }
   close(fd);
   return 0;
@@ -273,13 +285,24 @@ private:
   // are flushed by the main loop (and on exit). Both under mu_.
   bool cfgDirty_ = false;
   double cfgSavedAt_ = 0;
-  bool forcePreview_ = false;  // keep running even without consumers (debug)
+  // Clients (by connection id) that asked for the preview: while any is
+  // connected the pipeline runs even without consumers and previewPath_ is
+  // kept fresh (previewOn_ mirrors !previewClients_.empty(), under mu_).
+  std::set<int> previewClients_;
+  bool previewOn_ = false;
+  std::string previewPath_, previewTmp_;   // preview.jpg and the .tmp it is renamed from
+  cv::Mat previewSmall_;          // downscaled frame, reused
+  std::vector<uchar> previewJpg_; // encode buffer, reused
+  clk::time_point previewDue_{};   // next frame at or after this is encoded
+  bool previewWritten_ = false;   // a preview.jpg is on disk (to unlink when the preview stops)
   bool hideRawActive_ = false;
   std::string runtimeDir_;
   int misses_ = 0;      // consecutive grab timeouts
   cv::Size capOpened_;  // size the current capture was asked for (reopen when the wanted size changes)
   cv::Size capActual_;  // what the device actually delivers (shown in the state)
   cv::Mat yuyv_;        // output frame converted once for both writers
+  void writePreview(const cv::Mat& bgr, clk::time_point now);
+  void removePreview();
 
   // Capture thread: grab + decode run off the processing thread into a
   // depth-1 "latest frame" slot (drop-oldest), so the decode overlaps with
@@ -314,7 +337,8 @@ private:
   Settings& effectiveSettings();
   std::string selectedBus();
   static bool cameraHidden(const CameraInfo& c) { return !c.key.empty() && fileExists("/etc/udev/rules.d/71-camera-effects-hide-" + c.key + ".rules"); }
-  std::string handle(const std::string& req);
+  std::string handle(int client, const std::string& req);
+  void clientClosed(int client);
   void rescanCameras();
   CameraInfo pickCamera();
   bool openCapture(std::string* err);
@@ -347,6 +371,7 @@ json Daemon::stateJson() {
   json j = json{ { "type", "state" },
                { "running", running_ },
                { "consumers", consumers_.load() },
+               { "previewOn", previewOn_ },
                { "camera", { { "path", shown.path }, { "name", shown.name }, { "bus", shown.bus }, { "key", shown.key } } },
                { "cameras", cams },
                { "loopback", loopPath_ },
@@ -586,9 +611,14 @@ void Daemon::resetTier(bool keepTier) {
   if (tier_ != 0 || csLowRes_) { fx_.setTier(0); setState(tier_, 0); setState(csLowRes_, false); }
 }
 
+void Daemon::clientClosed(int client) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (previewClients_.erase(client)) { previewOn_ = !previewClients_.empty(); stateDirty_ = true; }
+}
+
 // Runs on the server thread. Requests come from same-uid clients but may be
 // malformed: every field is type-checked and nothing here may throw.
-std::string Daemon::handle(const std::string& req) {
+std::string Daemon::handle(int client, const std::string& req) {
   static const std::string kOk = R"({"type":"ok"})";
   auto error = [](const char* what) { return json{ { "type", "error" }, { "error", what } }.dump(); };
   try {
@@ -633,7 +663,13 @@ std::string Daemon::handle(const std::string& req) {
       return kOk;
     }
     if (cmd == "rescan") { rescanCameras(); stateDirty_ = true; return kOk; }
-    if (cmd == "preview") { std::lock_guard<std::mutex> lk(mu_); forcePreview_ = boolField("on"); stateDirty_ = true; return kOk; }
+    if (cmd == "preview") {  // per client: on until it says off or disconnects
+      std::lock_guard<std::mutex> lk(mu_);
+      if (boolField("on")) previewClients_.insert(client); else previewClients_.erase(client);
+      previewOn_ = !previewClients_.empty();
+      stateDirty_ = true;
+      return kOk;
+    }
     if (cmd == "profile") {
       bool on = boolField("on");
       fx_.setProfile(on);
@@ -665,6 +701,46 @@ bool ensureRuntimeDir(const std::string& dir, std::string* err) {
   return true;
 }
 
+// Preview for the panel: the output frame downscaled to fit 640x360, JPEG
+// (quality 70, ~1 ms), ~15 Hz (a due time advanced by 66 ms per write, so a
+// source with jittery frame times still averages that rate instead of losing
+// every borderline frame), written to preview.jpg in the runtime dir (a
+// private 0700 dir of ours, see ensureRuntimeDir) via a temp file + rename so
+// a reader always gets a whole image. Buffers are reused.
+void Daemon::writePreview(const cv::Mat& bgr, clk::time_point now) {
+  if (bgr.empty() || now < previewDue_) return;
+  previewDue_ = std::max(previewDue_ + std::chrono::milliseconds(66), now - std::chrono::milliseconds(33));  // no backlog after a stall
+  double sc = std::min(1.0, std::min(640.0 / bgr.cols, 360.0 / bgr.rows));
+  cv::Size sz(std::max(2, (int)std::lround(bgr.cols * sc)), std::max(2, (int)std::lround(bgr.rows * sc)));
+  const cv::Mat* src = &bgr;
+  if (sz != bgr.size()) { cv::resize(bgr, previewSmall_, sz, 0, 0, cv::INTER_AREA); src = &previewSmall_; }
+  try {
+    if (!cv::imencode(".jpg", *src, previewJpg_, { cv::IMWRITE_JPEG_QUALITY, 70 })) return;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "camera-effects-server: preview encode failed: %s\n", e.what());
+    return;
+  }
+  int fd = open(previewTmp_.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (fd < 0) return;
+  (void)!fchown(fd, (uid_t)-1, getgid());  // the setgid (hide-raw) build would leave it group camerad
+  size_t off = 0;
+  while (off < previewJpg_.size()) {
+    ssize_t n = write(fd, previewJpg_.data() + off, previewJpg_.size() - off);
+    if (n <= 0) { close(fd); unlink(previewTmp_.c_str()); return; }
+    off += (size_t)n;
+  }
+  close(fd);
+  if (rename(previewTmp_.c_str(), previewPath_.c_str()) == 0) previewWritten_ = true;
+  else unlink(previewTmp_.c_str());
+}
+
+void Daemon::removePreview() {
+  if (!previewWritten_) return;
+  previewWritten_ = false;
+  unlink(previewPath_.c_str());
+  unlink(previewTmp_.c_str());
+}
+
 int Daemon::run() {
   // The shell owns us: exit with it rather than linger as an orphan the next
   // shell cannot manage (it also asks a stray instance to quit, belt and braces).
@@ -682,16 +758,19 @@ int Daemon::run() {
   std::string err;
   if (!ensureRuntimeDir(runtimeDir_, &err)) { fprintf(stderr, "camera-effects-server: %s\n", err.c_str()); return 1; }
   std::string sockPath = runtimeDir_ + "/ctl.sock";
+  previewPath_ = runtimeDir_ + "/preview.jpg";
+  previewTmp_ = previewPath_ + ".tmp";
   // Single instance per session (the shell restarts us; a stray manual copy
   // must not fight over the loopback writer).
   int lockFd = open((runtimeDir_ + "/lock").c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
   if (lockFd < 0 || flock(lockFd, LOCK_EX | LOCK_NB) < 0) { fprintf(stderr, "camera-effects-server: another instance is running\n"); return 3; }
+  previewWritten_ = true; removePreview();  // a stale one from a crashed instance
 
   if (!fx_.init(cfg_.modelsDir, cfg_.assetsDir, &err)) fprintf(stderr, "models: %s\n", err.c_str());
   else if (!err.empty()) fprintf(stderr, "models (degraded): %s\n", err.c_str());
   fx_.setSettings(cfg_.settings);
 
-  if (!server_.start(sockPath, [this](const std::string& r) { return handle(r); }, &err)) { fprintf(stderr, "control socket: %s\n", err.c_str()); return 1; }
+  if (!server_.start(sockPath, [this](int c, const std::string& r) { return handle(c, r); }, [this](int c) { clientClosed(c); }, &err)) { fprintf(stderr, "control socket: %s\n", err.c_str()); return 1; }
 
   // Native PipeWire camera node for portal-based apps (best effort).
   if (pwOut_.start(cfg_.outW, cfg_.outH, cfg_.fps, cfg_.label, [this](bool on) { pwActive_ = on; stateDirty_ = true; }, &err)) setState(pwStatus_, std::string("ok"));
@@ -732,8 +811,9 @@ int Daemon::run() {
     bool preview, block;
     std::string blockSrc;
     Framing blockFraming;
-    { std::lock_guard<std::mutex> lk(mu_); preview = forcePreview_; block = cfg_.block; blockSrc = cfg_.blockSource; blockFraming = cfg_.blockFraming; }
+    { std::lock_guard<std::mutex> lk(mu_); preview = previewOn_; block = cfg_.block; blockSrc = cfg_.blockSource; blockFraming = cfg_.blockFraming; }
     bool want = (loop_.isOpen() && consumers_ > 0) || pwActive_ || preview;
+    if (!preview) removePreview();
     // Blocked: the physical camera stays closed (light off) whatever the
     // consumers do; they get the placeholder from block_ instead, on the same
     // on-demand terms.
@@ -777,9 +857,11 @@ int Daemon::run() {
     if (block_.active()) {
       // Placeholder: no effects, no tier control; block_.next() paces the loop.
       try {
-        cv::cvtColor(block_.next(), yuyv_, cv::COLOR_BGR2YUV_YUYV);
+        const cv::Mat& card = block_.next();
+        cv::cvtColor(card, yuyv_, cv::COLOR_BGR2YUV_YUYV);
         if (loop_.isOpen()) loop_.writeYuyv(yuyv_);
         pwOut_.pushYuyv(yuyv_);
+        if (preview) writePreview(card, clk::now());
         countFrame();
       } catch (const std::exception& e) {
         fprintf(stderr, "camera-effects-server: placeholder frame dropped: %s\n", e.what());
@@ -810,6 +892,7 @@ int Daemon::run() {
           cv::cvtColor(out, yuyv_, cv::COLOR_BGR2YUV_YUYV);
           if (loop_.isOpen()) loop_.writeYuyv(yuyv_);
           pwOut_.pushYuyv(yuyv_);
+          if (preview) writePreview(out, clk::now());  // after the outputs: never delays them
         } catch (const std::exception& e) {
           fprintf(stderr, "camera-effects-server: frame dropped: %s\n", e.what());
           continue;
@@ -846,6 +929,7 @@ int Daemon::run() {
   pwOut_.stop();
   watcher_.stop();
   server_.stop();
+  removePreview();
   { std::lock_guard<std::mutex> lk(mu_); if (cfgDirty_) saveConfig(cfg_); }
   return 0;
 }
@@ -924,11 +1008,16 @@ int main(int argc, char** argv) {
     return cmdClient(sock, json{ { "cmd", "set" }, { "settings", s } }.dump(), true);
   }
   if (cmd == "camera" && argc > 2) return cmdClient(sock, json{ { "cmd", "set" }, { "camera", argv[2] } }.dump(), true);
-  if (cmd == "preview") return cmdClient(sock, json{ { "cmd", "preview" }, { "on", argc > 2 && std::string(argv[2]) == "on" } }.dump(), true);
+  if (cmd == "preview") {
+    // The preview is per connection: `on` holds the connection (and so the
+    // pipeline and preview.jpg) until this process exits.
+    bool on = argc > 2 && std::string(argv[2]) == "on";
+    return cmdClient(sock, json{ { "cmd", "preview" }, { "on", on } }.dump(), true, on);
+  }
   if (cmd == "quit") return cmdClient(sock, R"({"cmd":"quit"})", true);
   if (cmd == "profile") return cmdClient(sock, json{ { "cmd", "profile" }, { "on", argc > 2 && std::string(argv[2]) == "on" } }.dump(), true);
   if (cmd != "run") {
-    fprintf(stderr, "usage: camera-effects-server [run|status|set k=v...|react NAME|camera BUS|preview on|off|profile on|off|quit]\n");
+    fprintf(stderr, "usage: camera-effects-server [run|status|set k=v...|react NAME|camera BUS|preview on (holds while running)|off|profile on|off|quit]\n");
     return 2;
   }
   signal(SIGINT, onSignal);

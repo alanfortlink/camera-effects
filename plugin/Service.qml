@@ -16,6 +16,7 @@ Item {
   readonly property bool connected: sockConnected
   readonly property bool running: !!state.running          // camera is being read + processed right now
   readonly property int consumers: state.consumers || 0     // apps holding the virtual camera open
+  readonly property bool previewOn: !!state.previewOn       // some client (our panel) is watching the preview: pipeline runs, preview.jpg is written
   readonly property var settings: state.settings || ({})   // effective settings for the current camera
   readonly property bool sameForAll: state.sameForAll !== false
   readonly property var cameras: state.cameras || []
@@ -46,6 +47,7 @@ Item {
 
   readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/camera-effects"
   readonly property string socketPath: runtimeDir + "/ctl.sock"
+  readonly property string previewPath: runtimeDir + "/preview.jpg"   // written by the daemon while previewWanted (see Preview.qml)
   readonly property string homeDir: Quickshell.env("HOME") || ""
   readonly property string libDir: homeDir + "/.local/lib/camera-effects"
   readonly property string setupScript: libDir + "/camera-effects-setup"
@@ -74,6 +76,10 @@ Item {
   function react(name) { return send({ cmd: "react", name: name }) }
   function rescan() { return send({ cmd: "rescan" }) }
   function refresh() { return send({ cmd: "get" }) }
+  // The preview is per control connection (it ends when the connection does):
+  // remember it so a reconnect asks again.
+  property bool previewWanted: false
+  function setPreview(on) { previewWanted = !!on; return send({ cmd: "preview", on: previewWanted }) }
 
   // Privileged operations go through pkexec so the shell's polkit agent asks
   // for the password.
@@ -232,6 +238,7 @@ Item {
       }
       onConnectionStateChanged: {
         root.sockConnectedChanged()
+        if (connected && root.previewWanted) root.setPreview(true)
         if (!connected) {
           root.state = ({})
           if (root.orphanQuit) { root.orphanQuit = false; restartTimer.interval = 1000; restartTimer.restart() }

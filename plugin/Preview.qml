@@ -1,53 +1,60 @@
 import QtQuick
-import QtMultimedia
 
-// Live preview of the virtual camera. Loaded only while the panel is open so
-// the shell holds the camera for as short a time as possible. Reads the
-// *processed* feed (the loopback device), so what you see is what apps get.
+// Live preview of the virtual camera. Loaded only while the panel is open.
+// Shows the *processed* feed: the daemon writes a small JPEG of every output
+// frame (~15 Hz) to preview.jpg in its runtime dir while a preview is wanted
+// (Service.setPreview), which this polls. Not a reader of the loopback
+// device, so it works while an app streams from it too (v4l2loopback lets one
+// reader negotiate the format at a time).
 Item {
   id: root
-  property string deviceLabel: "Camera Effects"
-  property string devicePath: ""
+  property string path: ""   // .../camera-effects/preview.jpg
   // True when the daemon already mirrors the output (settings.mirror). The
   // preview always shows you a mirror view of yourself, so it flips the feed
   // itself only when the feed is not mirrored already.
   property bool mirror: false
-  readonly property bool ready: cam.active && vo.videoSink && vo.videoSink.videoSize.width > 0
+  readonly property bool ready: shown.status === Image.Ready && shown.implicitWidth > 0
 
-  MediaDevices { id: devs }
+  // Two images, front and back: the next frame loads into the back one and
+  // is only shown once it decoded (a failed load — the file not written yet,
+  // or renamed mid-read — keeps the last good frame). No flicker, no tearing.
+  property bool frontIsA: true
+  readonly property Image shown: frontIsA ? imgA : imgB
+  readonly property Image back: frontIsA ? imgB : imgA
+  property int tick: 0
 
-  function pickDevice() {
-    var list = devs.videoInputs
-    for (var i = 0; i < list.length; i++) if (list[i].description === deviceLabel) return list[i]
-    for (var j = 0; j < list.length; j++) if (String(list[j].id) === devicePath) return list[j]
-    return null
+  function poll() {
+    if (path === "" || back.status === Image.Loading) return
+    tick++
+    back.source = "file://" + path + "?" + tick   // a new URL each time: the same one would not reload
+  }
+  function loaded(img) {
+    if (img === back && img.status === Image.Ready && img.implicitWidth > 0) frontIsA = (img === imgA)
   }
 
-  function start() {
-    var d = pickDevice()
-    if (!d) { retry.start(); return }
-    cam.cameraDevice = d
-    cam.start()
-  }
-
-  Camera {
-    id: cam
-    onErrorOccurred: function(e, msg) { console.warn("camera preview:", msg); retry.start() }
-  }
-  CaptureSession { camera: cam; videoOutput: vo }
-  VideoOutput {
-    id: vo
+  Image {
+    id: imgA
     anchors.fill: parent
-    fillMode: VideoOutput.PreserveAspectCrop
+    visible: root.frontIsA
+    cache: false
+    asynchronous: true
+    fillMode: Image.PreserveAspectCrop
     // Mirror like a real mirror, whatever the output setting is.
-    transform: Scale { origin.x: vo.width / 2; xScale: root.mirror ? 1 : -1 }
+    transform: Scale { origin.x: imgA.width / 2; xScale: root.mirror ? 1 : -1 }
+    onStatusChanged: root.loaded(imgA)
+  }
+  Image {
+    id: imgB
+    anchors.fill: parent
+    visible: !root.frontIsA
+    cache: false
+    asynchronous: true
+    fillMode: Image.PreserveAspectCrop
+    transform: Scale { origin.x: imgB.width / 2; xScale: root.mirror ? 1 : -1 }
+    onStatusChanged: root.loaded(imgB)
   }
 
-  // The loopback only shows up in Qt's device list once the daemon has
-  // primed it; poll briefly if it isn't there yet.
-  Timer { id: retry; interval: 700; repeat: false; onTriggered: root.start() }
-  Connections { target: devs; function onVideoInputsChanged() { if (!cam.active) root.start() } }
-
-  Component.onCompleted: start()
-  Component.onDestruction: cam.stop()
+  // The daemon refreshes the file every 66 ms; poll at the same rate. Runs
+  // only while this component exists (the panel is open).
+  Timer { interval: 66; repeat: true; running: root.path !== ""; triggeredOnStart: true; onTriggered: root.poll() }
 }

@@ -51,14 +51,16 @@ Panel {
   Timer { id: zoomTouched; interval: 400; onTriggered: root.zoomLive = root.zoomNow }
   Component.onCompleted: zoomLive = zoomNow
 
-  // The panel's own preview is itself a consumer of the virtual camera, so
-  // while it is loaded the daemon reports consumers >= 1 and running = true
-  // even when no app is watching. Assumption: the preview counts as exactly
-  // one consumer; everything above that is a real app. (The daemon does not
-  // tag consumers, so this is the best the UI can do on its own.)
+  // The preview is served by the daemon (a JPEG it writes while we ask for
+  // it, see Preview.qml), not read from the virtual camera: consumers are
+  // all real apps. While the panel is open the daemon runs the pipeline for
+  // the preview even with no app watching (svc.previewOn).
   readonly property bool previewActive: previewLoader.active
-  readonly property int appCount: svc ? Math.max(0, svc.consumers - (previewActive ? 1 : 0)) : 0
+  onPreviewActiveChanged: if (svc) svc.setPreview(previewActive)
+  Component.onDestruction: if (svc && previewActive) svc.setPreview(false)
+  readonly property int appCount: svc ? svc.consumers : 0
   readonly property bool appsConnected: appCount > 0
+  readonly property bool previewOnly: !!svc && svc.previewOn && !appsConnected
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(fg, 1.45)
@@ -122,7 +124,7 @@ Panel {
     var cam = camName(svc.camera)
     var fps = inUse && svc.fps ? " · " + svc.fps + " FPS" : ""
     if (appsConnected) return "In use · " + cam + fps
-    if (previewActive && inUse) return "Preview · " + cam + fps
+    if (previewOnly && inUse) return "Preview · " + cam + fps
     return "Idle · " + cam
   }
   function glyph(name) {
@@ -162,7 +164,7 @@ Panel {
     var res = svc.state.output ? " · " + svc.state.output.width + "×" + svc.state.output.height : ""
     // Keep it under ~50 monospace caption characters so it never elides.
     var use = appCount > 0 ? appCount + " app" + (appCount > 1 ? "s" : "") + " connected"
-            : previewActive ? (blocked ? "Preview only · camera blocked" : "Preview only · camera on while open") : "Idle"
+            : previewOnly && inUse ? (blocked ? "Preview only · camera blocked" : "Preview only · camera on while open") : "Idle"
     return use + res
   }
 
@@ -428,14 +430,12 @@ Panel {
             Loader {
               id: previewLoader
               anchors.fill: parent
-              // Only hold the camera open while the panel is on screen; the
-              // preview is itself a consumer of the virtual camera, which is
-              // what wakes the daemon so you can see the effects live.
+              // Only while the panel is on screen: previewActive asks the
+              // daemon to run the pipeline (camera on) and write the preview.
               active: root.opened && previewBox.visible
               source: Qt.resolvedUrl("Preview.qml")
               onLoaded: {
-                item.deviceLabel = root.svc.loopbackLabel
-                item.devicePath = root.svc.loopback
+                item.path = root.svc.previewPath
                 // Keep the preview a mirror view of yourself whatever the
                 // output setting is: undo the flip only when the feed
                 // itself is already mirrored.

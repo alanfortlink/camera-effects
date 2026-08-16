@@ -73,7 +73,10 @@ desktop) opens the real camera only while an app holds the virtual one, so the
 camera light stays off otherwise. Frames go to a v4l2loopback device
 (`/dev/video20`, created at boot by a small systemd unit) and to a PipeWire
 camera node for portal-based apps. The panel talks to the daemon over
-`$XDG_RUNTIME_DIR/camera-effects/ctl.sock`; settings live in `~/.config/camera-effects/config.json`.
+`$XDG_RUNTIME_DIR/camera-effects/ctl.sock`; its preview is the processed feed as
+the daemon serves it (a small JPEG next to the socket, refreshed ~15 times a
+second while the panel is open), so it stays live while apps stream. Settings
+live in `~/.config/camera-effects/config.json`.
 The only privileged parts are `camera-effects-setup` (device at boot, hide rules) and, when
 hiding is on, a root-owned copy of the daemon, both in `/usr/local/lib/camera-effects/`.
 Nothing leaves your machine.
@@ -89,7 +92,7 @@ camera-effects-server set block=true blockSource=/path/to/image-or-video   # blo
 camera-effects-server set blockZoom=2 blockPanX=1 blockFit=cover           # frame the placeholder
 camera-effects-server react hearts                    # play a reaction now
 camera-effects-server camera <bus-or-/dev/path>       # pick the physical camera (or a video file)
-camera-effects-server preview on|off                  # keep the pipeline running without a consumer
+camera-effects-server preview on                      # run the pipeline without a consumer (and write preview.jpg) while this command runs
 ```
 
 ## Troubleshooting and limits
