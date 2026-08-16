@@ -507,7 +507,7 @@ Panel {
             }
           }
           SwitchRow {  // switch = hand-gesture triggers; the strip below plays one now
-            label: "Reactions"
+            label: "Reactions · hand gestures"
             checked: !!root.s.reactions
             onToggled: if (root.svc) root.svc.setSetting("reactions", !root.s.reactions)
           }
@@ -516,13 +516,13 @@ Panel {
             spacing: Style.space(2)
             Row {
               x: Style.space(20)
-              spacing: Style.space(4)
+              spacing: Style.space(6)
               Repeater {
                 model: root.reactionList
                 delegate: Item {
                   required property string modelData
-                  width: Style.space(20); height: Style.space(20)
-                  Text { anchors.centerIn: parent; text: root.glyph(modelData); font.pixelSize: Style.space(13) }
+                  width: Style.space(24); height: Style.space(24)
+                  Text { anchors.centerIn: parent; text: root.glyph(modelData); font.pixelSize: Style.space(14) }
                   MouseArea {
                     id: reactArea
                     anchors.fill: parent
@@ -539,7 +539,7 @@ Panel {
             Note {
               x: Style.space(20)
               width: parent.width - Style.space(20)
-              text: "Click to play · switch enables hand gestures"
+              text: "Click to play"
             }
           }
           SwitchRow { label: "Mirror"; checked: !!root.s.mirror; onToggled: if (root.svc) root.svc.setSetting("mirror", !root.s.mirror) }
