@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "tank.camera",
+  "name": "Camera",
+  "version": "0.1.0",
+  "author": "tank",
+  "license": "MIT",
+  "description": "System-wide camera effects (Center Stage, Portrait, Studio Light, Backgrounds, Reactions) exposed as the \"Omarchy Camera\" virtual webcam, with a Control-Center-style panel.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "plugin/Service.qml",
+    "barWidget": "plugin/Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Camera",
+    "description": "Camera effects panel with live preview; the icon lights up while an app is using the camera.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "alwaysShow": true
+    },
+    "schema": [
+      {
+        "key": "alwaysShow",
+        "type": "boolean",
+        "label": "Show icon even when no app is using the camera",
+        "defaultValue": true
+      }
+    ]
+  }
+}

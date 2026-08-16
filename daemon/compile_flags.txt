@@ -1,0 +1,10 @@
+-std=c++17
+-I/usr/include/opencv5
+-I/usr/include/onnxruntime
+-I/usr/include/pipewire-0.3
+-I/usr/include/spa-0.2
+-D_REENTRANT
+-fno-strict-aliasing
+-fno-strict-overflow
+-Isrc
+-Ithird_party

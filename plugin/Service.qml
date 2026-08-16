@@ -1,0 +1,210 @@
+import QtQuick
+import Quickshell
+import Quickshell.Io
+
+// Headless service: owns the camfxd daemon (starts it, restarts it if it dies)
+// and keeps a control connection to it. Everything the panel shows comes from
+// the daemon's state pushes; everything the panel changes goes through set().
+Item {
+  id: root
+
+  property var shell: null
+  property var manifest: null
+
+  // ---- daemon state (mirrors the JSON pushed by camfxd) ----
+  property var state: ({})
+  readonly property bool connected: sockConnected
+  readonly property bool running: !!state.running          // camera is being read + processed right now
+  readonly property int consumers: state.consumers || 0     // apps holding the virtual camera open
+  readonly property var settings: state.settings || ({})   // effective settings for the current camera
+  readonly property bool sameForAll: state.sameForAll !== false
+  readonly property var cameras: state.cameras || []
+  readonly property var camera: state.camera || ({})
+  readonly property string loopback: state.loopback || ""
+  readonly property string loopbackLabel: state.loopbackLabel || "Omarchy Camera"
+  readonly property string error: state.error || ""
+  readonly property bool hideRaw: !!state.hideRaw
+  readonly property int fps: state.fps || 0
+  readonly property string gesture: state.gesture || ""
+  readonly property var reactionNames: state.reactions || ["hearts", "thumbsup", "thumbsdown", "balloons", "confetti", "fireworks", "rain", "lasers"]
+  readonly property bool deviceMissing: error.indexOf("virtual camera device missing") !== -1
+  property string daemonLog: ""
+  property int restarts: 0
+
+  readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omarchy-camera"
+  readonly property string socketPath: runtimeDir + "/ctl.sock"
+  readonly property string homeDir: Quickshell.env("HOME") || ""
+  readonly property string libDir: homeDir + "/.local/lib/omarchy-camera"
+  readonly property string setupScript: libDir + "/omarchy-camera-setup"
+  readonly property string daemonBinary: libDir + "/camfxd"
+  readonly property string privilegedBinary: "/usr/local/lib/omarchy-camera/camfxd"
+  // The plugin checkout (this file lives in <repo>/plugin/).
+  readonly property string repoDir: String(Qt.resolvedUrl("..")).replace(/^file:\/\//, "").replace(/\/$/, "")
+  property bool installed: false   // daemon binary present in ~/.local/lib
+
+  // ---- commands ----
+  function send(obj) {
+    if (!sockConnected) return false
+    sock.write(JSON.stringify(obj) + "\n")
+    sock.flush()
+    return true
+  }
+  function set(patch) { return send({ cmd: "set", settings: patch }) }
+  function setSetting(key, value) { var p = {}; p[key] = value; return set(p) }
+  function setSameForAll(v) { return send({ cmd: "set", sameForAll: !!v }) }
+  function selectCamera(busOrPath) { return send({ cmd: "set", camera: busOrPath }) }
+  function react(name) { return send({ cmd: "react", name: name }) }
+  function rescan() { return send({ cmd: "rescan" }) }
+  function refresh() { return send({ cmd: "get" }) }
+
+  // Privileged operations go through pkexec so the shell's polkit agent asks
+  // for the password.
+  //   runSetup("install")                    create the virtual camera (now + boot)
+  //   runSetup("hide-all", true|false)       hide/unhide every physical camera
+  //   runSetup("hide-camera", key, on)       hide/unhide one USB camera
+  function runSetup(what, a, b) {
+    if (setupProc.running) return
+    var args = ["pkexec", setupScript]
+    if (what === "install") args.push("install")
+    else if (what === "hide-all") args = args.concat(a ? ["hide-raw", "on", daemonBinary] : ["hide-raw", "off"])
+    else if (what === "hide-camera") args = args.concat(b ? ["hide-raw", "on", daemonBinary, String(a)] : ["hide-raw", "off", String(a)])
+    else return
+    setupOutput = ""
+    setupProc.command = args
+    setupProc.running = true
+  }
+  property bool setupBusy: setupProc.running || installProc.running
+  property string setupOutput: ""
+
+  Process {
+    id: setupProc
+    stdout: StdioCollector { onStreamFinished: root.setupOutput = String(text).trim() }
+    stderr: StdioCollector { onStreamFinished: if (String(text).trim() !== "") root.setupOutput = String(text).trim() }
+    onExited: function(code) {
+      Qt.callLater(root.refresh)
+      restartTimer.restart()  // hide rules switch the daemon binary; a restart picks it up
+    }
+  }
+
+  // First run from a plain `omarchy plugin add`: build + install the user
+  // half (no password), then create the device (password).
+  function install() {
+    if (installProc.running) return
+    installProc.command = ["sh", "-c", 'cd "$1" && ./install.sh --no-root 2>&1', "camfx-install", repoDir]
+    installProc.running = true
+  }
+  Process {
+    id: installProc
+    stdout: StdioCollector { onStreamFinished: root.setupOutput = String(text).trim().split("\n").slice(-3).join("\n") }
+    onExited: function(code) {
+      root.installed = code === 0
+      if (code === 0) { restartTimer.restart(); Qt.callLater(function() { root.runSetup("install") }) }
+      else root.setupOutput = "install failed (" + code + "):\n" + root.setupOutput
+    }
+  }
+  Process {
+    id: probeProc
+    command: ["sh", "-c", 'test -x "$1"', "probe", root.daemonBinary]
+    onExited: function(code) { root.installed = code === 0; if (code === 0 && !daemon.running) restartTimer.restart() }
+  }
+
+  // ---- daemon lifecycle ----
+  // Prefer the privileged (setgid camerad) copy while any camera is hidden,
+  // otherwise the user's own build.
+  function daemonCommand() {
+    return ["sh", "-c",
+      'if ls /etc/udev/rules.d/71-omarchy-camera-hide-*.rules >/dev/null 2>&1 && [ -x "$1" ]; then exec "$1" run; fi; ' +
+      'if [ -x "$2" ]; then exec "$2" run; fi; exec camfxd run',
+      "camfxd-launch", privilegedBinary, daemonBinary]
+  }
+
+  Process {
+    id: daemon
+    command: root.daemonCommand()
+    running: false
+    stderr: SplitParser {
+      onRead: function(line) {
+        var l = root.daemonLog + line + "\n"
+        if (l.length > 4000) l = l.slice(l.length - 4000)
+        root.daemonLog = l
+      }
+    }
+    onExited: function(code, status) {
+      root.state = ({})
+      if (code === 127) { root.installed = false; probeProc.running = true; return }  // not installed yet
+      root.restarts += 1
+      restartTimer.interval = code === 3 ? 5000 : Math.min(10000, 1000 + root.restarts * 1000)  // 3 = another instance holds the lock
+      restartTimer.restart()
+    }
+  }
+
+  Timer {
+    id: restartTimer
+    interval: 1000
+    repeat: false
+    onTriggered: {
+      if (daemon.running) { daemon.signal(15); return }   // restart requested (setup changed things)
+      daemon.command = root.daemonCommand()
+      daemon.running = true
+    }
+  }
+
+  // Reset the backoff once the daemon has been alive for a while.
+  Timer { interval: 60000; running: daemon.running; repeat: false; onTriggered: root.restarts = 0 }
+
+  // ---- control connection ----
+  // Quickshell's Socket cannot recover from a refused connection (the inner
+  // QLocalSocket never emits `disconnected`, so `connected = true` is a no-op
+  // afterwards). Recreate the Socket object for every attempt instead.
+  property var sock: null
+  readonly property bool sockConnected: sock ? sock.connected === true : false
+
+  Component {
+    id: sockComp
+    Socket {
+      path: root.socketPath
+      connected: true
+      parser: SplitParser {
+        onRead: function(line) {
+          try {
+            var msg = JSON.parse(line)
+            if (msg && msg.type === "state") root.state = msg
+          } catch (e) { /* reply we don't care about */ }
+        }
+      }
+      onConnectionStateChanged: {
+        root.sockConnectedChanged()
+        if (!connected) { root.state = ({}); reconnectTimer.restart() }
+      }
+      onError: function(err) { reconnectTimer.restart() }
+    }
+  }
+
+  function connectSocket() {
+    if (sock) { sock.destroy(); sock = null }
+    sock = sockComp.createObject(root)
+    sockConnectedChanged()
+  }
+
+  Timer {
+    id: reconnectTimer
+    interval: 800
+    repeat: false
+    onTriggered: if (!root.sockConnected) root.connectSocket()
+  }
+  Timer {
+    interval: 3000
+    running: !root.sockConnected
+    repeat: true
+    onTriggered: if (!root.sockConnected) root.connectSocket()
+  }
+
+  Component.onCompleted: {
+    probeProc.running = true
+    daemon.running = true
+    connectSocket()
+  }
+  Component.onDestruction: {
+    if (daemon.running) daemon.signal(15)
+  }
+}

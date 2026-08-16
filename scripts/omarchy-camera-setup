@@ -1,0 +1,187 @@
+#!/bin/bash
+# omarchy-camera-setup — the privileged half of the Omarchy Camera plugin.
+# Invoked through pkexec by the shell plugin (or sudo by install.sh).
+#
+#   install                         create the virtual camera now and at every boot
+#   uninstall                       remove the boot unit, the device and all hide rules
+#   hide-raw on <camfxd> [<key>]    hide physical webcams from apps (all, or one USB camera by
+#                                   key "usb-<vid>-<pid>-<serial>"); only camfxd may read them
+#   hide-raw off [<key>]            make physical webcams (all, or that one) visible again
+#   status                          print JSON status
+set -euo pipefail
+
+LABEL="Omarchy Camera"
+NR=20
+UNIT=/etc/systemd/system/omarchy-camera-device.service
+MODLOAD=/etc/modules-load.d/omarchy-camera.conf
+RULES_DIR=/etc/udev/rules.d
+RULE_ALL=$RULES_DIR/71-omarchy-camera-hide-raw.rules
+LIBDIR=/usr/local/lib/omarchy-camera
+GROUP=camerad
+
+need_root() { [[ $EUID -eq 0 ]] || { echo "must run as root (pkexec/sudo)" >&2; exit 1; }; }
+
+# `list` prints "OUTPUT \t CAPTURE \t NAME" rows with padded fields.
+device_path() { v4l2loopback-ctl list 2>/dev/null | awk -F'\t' -v l="$LABEL" '{ gsub(/ +$/, "", $1); gsub(/ +$/, "", $3) } $3==l {print $1; exit}'; }
+
+ensure_tools() {
+  local pkgs=()
+  command -v v4l2loopback-ctl >/dev/null || pkgs+=(v4l2loopback-utils)
+  modinfo v4l2loopback >/dev/null 2>&1 || pkgs+=(v4l2loopback-dkms)
+  if ((${#pkgs[@]})); then
+    echo "Installing ${pkgs[*]}…"
+    pacman -S --noconfirm --needed "${pkgs[@]}"
+  fi
+}
+
+cmd_install() {
+  need_root
+  ensure_tools
+  echo v4l2loopback > "$MODLOAD"
+  modprobe v4l2loopback 2>/dev/null || true
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=Omarchy Camera virtual video device
+After=systemd-modules-load.service
+ConditionPathExists=/dev/v4l2loopback
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Idempotent: only add the device if a loopback with our label is not there yet.
+ExecStart=/bin/sh -c 'v4l2loopback-ctl list 2>/dev/null | grep -q "$LABEL" || v4l2loopback-ctl add -n "$LABEL" -x 1 -o 16 /dev/video$NR'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable omarchy-camera-device.service >/dev/null 2>&1 || true
+  systemctl restart omarchy-camera-device.service
+  # udev needs a moment to apply the ACL for the seat user
+  sleep 0.3
+  echo "virtual camera: $(device_path)"
+}
+
+raw_devices() {
+  # every video4linux node that is not a virtual (loopback) device
+  local d
+  for d in /sys/class/video4linux/video*; do
+    [[ -e $d ]] || continue
+    case "$(readlink -f "$d")" in */devices/virtual/*) continue;; esac
+    echo "/dev/$(basename "$d")"
+  done
+}
+
+# Root-owned setgid copy of the daemon: the only thing allowed to read hidden webcams.
+install_privileged_daemon() {
+  local bin=$1
+  [[ -x $bin ]] || { echo "camfxd binary not found: $bin" >&2; exit 1; }
+  getent group "$GROUP" >/dev/null || groupadd -r "$GROUP"
+  install -d -m 755 "$LIBDIR"
+  install -m 2755 -o root -g "$GROUP" "$bin" "$LIBDIR/camfxd"
+}
+
+# udev match for one USB camera from our key "usb-<vid>-<pid>[-<serial>]".
+key_match() {
+  local key=$1 vid pid serial
+  IFS=- read -r _ vid pid serial <<<"$key"
+  [[ -n $vid && -n $pid ]] || { echo "bad camera key: $key" >&2; exit 2; }
+  local m="ATTRS{idVendor}==\"$vid\", ATTRS{idProduct}==\"$pid\""
+  [[ -n $serial ]] && m+=", ATTRS{serial}==\"$serial\""
+  echo "$m"
+}
+
+# Our key for a physical device node, same format as the daemon uses.
+device_key() {
+  local base; base=$(readlink -f "/sys/class/video4linux/$(basename "$1")/device")/..
+  local vid pid serial
+  vid=$(cat "$base/idVendor" 2>/dev/null || true); pid=$(cat "$base/idProduct" 2>/dev/null || true)
+  serial=$(cat "$base/serial" 2>/dev/null | tr ' /' '__' || true)
+  [[ -n $vid && -n $pid ]] || return 0
+  echo "usb-$vid-$pid${serial:+-$serial}"
+}
+
+# Re-evaluate udev for cameras and fix ACL/group state to match the rules.
+# udev applies rules asynchronously and never removes ACLs it added, so after
+# settling we enforce the state the rules describe.
+reapply() {
+  udevadm control --reload
+  udevadm trigger --subsystem-match=video4linux --action=change
+  udevadm settle --timeout=5 || true
+  local d key hidden
+  for d in $(raw_devices); do
+    hidden=false
+    [[ -f $RULE_ALL ]] && hidden=true
+    key=$(device_key "$d")
+    [[ -n $key && -f $RULES_DIR/71-omarchy-camera-hide-$key.rules ]] && hidden=true
+    if $hidden; then
+      chgrp "$GROUP" "$d" 2>/dev/null || true; chmod 0660 "$d" 2>/dev/null || true
+      setfacl -b "$d" 2>/dev/null || true
+    else
+      chgrp video "$d" 2>/dev/null || true
+    fi
+  done
+}
+
+cmd_hide_raw() {
+  need_root
+  local mode=${1:-}
+  case "$mode" in
+    on)
+      local bin=${2:-} key=${3:-}
+      install_privileged_daemon "$bin"
+      if [[ -z $key ]]; then
+        cat > "$RULE_ALL" <<EOF
+# Omarchy Camera: physical webcams are read by the effects daemon only; apps use the
+# virtual "Omarchy Camera" device instead. Toggle "Hide raw cameras" in the panel to restore.
+SUBSYSTEM=="video4linux", DEVPATH!="/devices/virtual/*", TAG-="uaccess", GROUP="$GROUP", MODE="0660"
+EOF
+        echo "raw cameras hidden"
+      else
+        local match; match=$(key_match "$key")
+        cat > "$RULES_DIR/71-omarchy-camera-hide-$key.rules" <<EOF
+# Omarchy Camera: this webcam is read by the effects daemon only (see the Camera panel).
+SUBSYSTEM=="video4linux", $match, TAG-="uaccess", GROUP="$GROUP", MODE="0660"
+EOF
+        echo "camera $key hidden"
+      fi
+      reapply
+      ;;
+    off)
+      local key=${2:-}
+      if [[ -z $key ]]; then rm -f "$RULE_ALL"; echo "raw cameras visible"
+      else rm -f "$RULES_DIR/71-omarchy-camera-hide-$key.rules"; echo "camera $key visible"; fi
+      reapply
+      ;;
+    *) echo "usage: hide-raw on <camfxd> [<key>] | hide-raw off [<key>]" >&2; exit 2;;
+  esac
+}
+
+cmd_uninstall() {
+  need_root
+  rm -f "$RULES_DIR"/71-omarchy-camera-hide-*.rules
+  reapply || true
+  systemctl disable --now omarchy-camera-device.service >/dev/null 2>&1 || true
+  rm -f "$UNIT" "$MODLOAD"
+  systemctl daemon-reload
+  local dev; dev=$(device_path)
+  [[ -n $dev ]] && v4l2loopback-ctl delete "$dev" || true
+  rm -rf "$LIBDIR"
+  echo "removed"
+}
+
+cmd_status() {
+  local dev; dev=$(device_path 2>/dev/null || true)
+  local hide=false; [[ -f $RULE_ALL ]] && hide=true
+  local unit=false; [[ -f $UNIT ]] && unit=true
+  local per; per=$(ls "$RULES_DIR"/71-omarchy-camera-hide-usb-*.rules 2>/dev/null | sed 's|.*/71-omarchy-camera-hide-||;s|\.rules$||' | paste -sd, - || true)
+  printf '{"device":"%s","hideRaw":%s,"hiddenCameras":"%s","bootUnit":%s}\n' "$dev" "$hide" "$per" "$unit"
+}
+
+case "${1:-}" in
+  install) cmd_install;;
+  uninstall) cmd_uninstall;;
+  hide-raw) shift; cmd_hide_raw "$@";;
+  status) cmd_status;;
+  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
+esac
