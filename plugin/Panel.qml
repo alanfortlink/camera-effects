@@ -393,9 +393,18 @@ Panel {
   readonly property string blockKind: blockKindPick !== "" ? blockKindPick : blockKindOf(blockSourceNow)
 
   // Everything on the card except the preview, in the card's own coordinates:
-  // what the preview must leave room for (see previewBox.roomH).
+  // what the preview must leave room for (see previewBox.roomH). The tab
+  // content is the only part that changes, so the card is exactly as tall as
+  // the tab in front.
   readonly property real restH: topBlock.implicitHeight + Style.space(6) + previewNote.blockH + Style.space(10)
+                                + tabStrip.height + scopeNote.blockH + Style.space(8)
                                 + body.implicitHeight + footerBlock.height
+
+  // The settings live in four tabs; the panel remembers the last one for as
+  // long as it stays loaded (nothing persisted: a fresh panel starts on Video).
+  readonly property var tabs: [ { key: "video", label: "Video" }, { key: "look", label: "Look" },
+                                { key: "fun", label: "Fun" }, { key: "privacy", label: "Privacy" } ]
+  property string tab: "video"
 
   KeyboardPanel {
     id: panel
@@ -404,12 +413,11 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    // Hero and preview stay put at the top; below them two columns (camera
-    // and framing | video effects and privacy) scroll when the screen is
-    // short. The screen governs both axes (no cap, like network/bluetooth);
-    // the status footer is pinned under the ScrollView so it never scrolls
-    // or clips away.
-    contentWidth: panel.fittedContentWidth(Style.space(700))
+    // Hero and preview stay put at the top; under them a tab strip and the
+    // active tab's rows, which scroll when the screen is short. The screen
+    // governs both axes (no cap, like network/bluetooth); the status footer is
+    // pinned under the ScrollView so it never scrolls or clips away.
+    contentWidth: panel.fittedContentWidth(Style.space(400))
     contentHeight: panel.fittedContentHeight(root.restH + previewRow.height)
 
     PanelKeyCatcher {
@@ -657,11 +665,84 @@ Panel {
         text: root.centerStageOn ? "Center Stage frames automatically" : "Drag to pan · scroll to zoom"
       }
 
-      // ---------- Scrolling body: two columns ----------
-      ScrollView {
-        id: scrollArea
+      // ---------- Tabs: Video · Look · Fun · Privacy ----------
+      Item {
+        id: tabStrip
         anchors.top: previewNote.bottom
         anchors.topMargin: Style.space(10)
+        anchors.left: parent.left
+        anchors.right: parent.right
+        // A fixed height, not the labels' implicit one: this feeds root.restH,
+        // and a Text's implicitHeight read inside that chain trips the
+        // binding-loop detector (same reason as previewNote above).
+        height: Style.space(26)
+
+        PanelSeparator {  // baseline the active tab's underline sits on
+          anchors.bottom: parent.bottom
+          foreground: root.fg
+        }
+        Row {
+          anchors.fill: parent
+          Repeater {
+            model: root.tabs
+            delegate: Item {
+              id: tabItem
+              required property var modelData
+              readonly property bool current: root.tab === tabItem.modelData.key
+              width: tabStrip.width / root.tabs.length
+              height: tabStrip.height
+              Text {
+                id: tabLabel
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.verticalCenterOffset: -Style.space(1)
+                text: tabItem.modelData.label
+                color: tabItem.current ? Color.accent : (tabArea.containsMouse ? root.fg : root.dim)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: tabItem.current
+              }
+              Rectangle {  // 2px accent underline under the active label
+                anchors.bottom: parent.bottom
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: Math.round(tabLabel.implicitWidth) + Style.space(12)
+                height: Style.space(2)
+                radius: height / 2
+                color: Color.accent
+                visible: tabItem.current
+              }
+              MouseArea {
+                id: tabArea
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.tab = tabItem.modelData.key
+              }
+            }
+          }
+        }
+      }
+      // Which camera the effect tabs are editing, when the cameras do not
+      // share their settings. Fixed height, like previewNote and for the same
+      // reason (it feeds root.restH).
+      Note {
+        id: scopeNote
+        readonly property real blockH: visible ? height + Style.space(4) : 0
+        anchors.top: tabStrip.bottom
+        anchors.topMargin: visible ? Style.space(4) : 0
+        height: visible ? Math.ceil(noteMetrics.height) : 0
+        visible: root.multiCam && !!root.svc && !root.svc.sameForAll && root.tab !== "privacy"
+        text: root.svc ? "Settings for " + root.shortName(root.svc.camera) : ""
+      }
+
+      // ---------- Tab content ----------
+      // All four Columns stay built so switching tabs is instant; only the
+      // active one is visible, and only its height counts towards the card
+      // (an invisible Column is skipped by its parent's layout).
+      ScrollView {
+        id: scrollArea
+        anchors.top: scopeNote.bottom
+        anchors.topMargin: Style.space(8)
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: footerBlock.top
@@ -680,20 +761,20 @@ Panel {
 
         Item {
           id: body
-          readonly property int gap: Style.space(16)
           width: scrollArea.availableWidth
           implicitWidth: width
-          implicitHeight: Math.max(leftCol.implicitHeight, rightCol.implicitHeight)
+          implicitHeight: videoCol.visible ? videoCol.implicitHeight
+                        : lookCol.visible ? lookCol.implicitHeight
+                        : funCol.visible ? funCol.implicitHeight
+                        : privacyCol.implicitHeight
 
-          // ---------- Left: camera · framing ----------
+          // ---------- Video: camera · framing ----------
           Column {
-            id: leftCol
-            x: 0
-            width: Math.round((body.width - body.gap) * 0.48)
+            id: videoCol
+            width: body.width
+            visible: root.tab === "video"
             spacing: Style.space(6)
 
-            PanelSectionHeader { text: "CAMERA"; foreground: root.fg; fontFamily: root.fontFamily }
-            // ---------- Camera ----------
             Dropdown {
               width: parent.width - root.trailInset
               visible: !!root.svc && (root.multiCam ||
@@ -709,6 +790,12 @@ Panel {
               label: "Same effects on every camera"
               checked: root.svc ? root.svc.sameForAll : true
               onToggled: if (root.svc) root.svc.setSameForAll(!root.svc.sameForAll)
+            }
+            SwitchRow { label: "Center Stage"; checked: !!root.s.centerStage; onToggled: if (root.svc) root.svc.setSetting("centerStage", !root.s.centerStage) }
+            IntensityRow {  // how tight / how eagerly it follows: left = calm and wide, right = tight and snappy
+              visible: !!root.s.centerStage
+              value: root.s.centerStageIntensity !== undefined ? root.s.centerStageIntensity : 0.5
+              onReleased: function(v) { if (root.svc) root.svc.setSetting("centerStageIntensity", v) }
             }
             Item {  // Zoom: label · value · slider (right-click the slider resets; the preview's wheel steps it too)
               width: parent.width
@@ -763,32 +850,13 @@ Panel {
             SwitchRow { label: "Mirror output (for everyone)"; checked: !!root.s.mirror; onToggled: if (root.svc) root.svc.setSetting("mirror", !root.s.mirror) }
           }
 
-          PanelSeparator {  // thin rule between the columns
-            x: leftCol.width + Math.floor((body.gap - width) / 2)
-            width: 1
-            height: body.implicitHeight
-            foreground: root.fg
-          }
-
-          // ---------- Right: video effects · privacy ----------
+          // ---------- Look: portrait · light · background · filter ----------
           Column {
-            id: rightCol
-            x: leftCol.width + body.gap
-            width: body.width - x
+            id: lookCol
+            width: body.width
+            visible: root.tab === "look"
             spacing: Style.space(6)
 
-            // ---------- Video ----------
-            PanelSectionHeader {
-              text: root.multiCam && root.svc && !root.svc.sameForAll ? "VIDEO · " + root.shortName(root.svc.camera).toUpperCase() : "VIDEO"
-              foreground: root.fg
-              fontFamily: root.fontFamily
-            }
-            SwitchRow { label: "Center Stage"; checked: !!root.s.centerStage; onToggled: if (root.svc) root.svc.setSetting("centerStage", !root.s.centerStage) }
-            IntensityRow {  // how tight / how eagerly it follows: left = calm and wide, right = tight and snappy
-              visible: !!root.s.centerStage
-              value: root.s.centerStageIntensity !== undefined ? root.s.centerStageIntensity : 0.5
-              onReleased: function(v) { if (root.svc) root.svc.setSetting("centerStageIntensity", v) }
-            }
             SwitchRow { label: "Portrait"; checked: !!root.s.portrait; onToggled: if (root.svc) root.svc.setSetting("portrait", !root.s.portrait) }
             IntensityRow {
               visible: !!root.s.portrait
@@ -939,6 +1007,15 @@ Panel {
               }
             }
             LabelDropdownRow { label: "Filter"; options: root.filterOpts; value: root.s.filter || "none"; onChanged: function(v) { if (root.svc) root.svc.setSetting("filter", v) } }
+          }
+
+          // ---------- Fun: face accessories · reactions ----------
+          Column {
+            id: funCol
+            width: body.width
+            visible: root.tab === "fun"
+            spacing: Style.space(6)
+
             LabelDropdownRow { label: "Effects"; options: root.funOpts; value: root.s.fun || "none"; onChanged: function(v) { if (root.svc) root.svc.setSetting("fun", v) } }
             SwitchRow {  // switch = hand-gesture triggers; the strip below plays one now
               label: "Reactions · hand gestures"
@@ -976,13 +1053,15 @@ Panel {
                 text: "Click to play"
               }
             }
+          }
 
-            Item { width: parent.width; height: Style.space(6) }
-            PanelSeparator { foreground: root.fg }
-            Item { width: parent.width; height: Style.space(4) }
+          // ---------- Privacy: block camera · hide the raw cameras ----------
+          Column {
+            id: privacyCol
+            width: body.width
+            visible: root.tab === "privacy"
+            spacing: Style.space(6)
 
-            // ---------- Privacy ----------
-            PanelSectionHeader { text: "PRIVACY"; foreground: root.fg; fontFamily: root.fontFamily }
             SwitchRow {  // privacy shutter: the webcam stays closed, apps get a placeholder
               label: "Block camera"
               checked: root.blocked
