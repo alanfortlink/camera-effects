@@ -1,6 +1,6 @@
 # Third-party notices
 
-cames redistributes the following third-party components.
+Camera Effects redistributes the following third-party components.
 
 ## models/yunet.onnx — YuNet face detector (MIT)
 Source: https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet

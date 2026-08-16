@@ -10,7 +10,7 @@ Ort::Env& OrtModel::env() {
     to.SetGlobalIntraOpNumThreads(2);
     to.SetGlobalInterOpNumThreads(1);
     to.SetGlobalSpinControl(0);  // don't spin-wait between frames; give the CPU to the apps
-    return Ort::Env(to, ORT_LOGGING_LEVEL_ERROR, "camesd");
+    return Ort::Env(to, ORT_LOGGING_LEVEL_ERROR, "camera-effects-server");
   }();
   return e;
 }

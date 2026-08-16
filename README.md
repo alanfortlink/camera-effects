@@ -1,9 +1,9 @@
-# cames — CAMera Effects Server
+# Camera Effects
 
 macOS-style camera effects for Omarchy: Center Stage, Portrait, Studio Light,
 backgrounds, colour filters, fun face filters, hand-gesture reactions and a
 privacy shutter on any webcam, published as a virtual camera called
-**"cames Camera"** that every app can pick.
+**"Camera Effects"** that every app can pick.
 
 > Tested only on **Omarchy 4** (Arch Linux, Hyprland, omarchy-shell).
 > Video walkthrough: coming soon.
@@ -18,22 +18,22 @@ omarchy plugin add https://github.com/alanfortlink/camera-effects.git --enable
 A camera icon appears in the bar. Open it and click **Install (build daemon)**:
 it installs missing packages (`onnxruntime`, `v4l2loopback-dkms`; a password
 prompt if any is missing), builds the daemon into `~/.local` (a minute or two;
-log in `~/.cache/cames/install.log`), then asks for your password once more to
-create the virtual camera now and at every boot. Then pick **cames Camera** in
+log in `~/.cache/camera-effects/install.log`), then asks for your password once more to
+create the virtual camera now and at every boot. Then pick **Camera Effects** in
 Chromium, Zoom, Discord, OBS, Firefox… From a terminal, `./install.sh` in the
 checkout does the same.
 
-**Update**: `omarchy plugin update alanfortlink.cames`, then
-`~/.config/omarchy/plugins/alanfortlink.cames/install.sh` (rebuilds and refreshes
+**Update**: `omarchy plugin update alanfortlink.camera-effects`, then
+`~/.config/omarchy/plugins/alanfortlink.camera-effects/install.sh` (rebuilds and refreshes
 the root-owned copies; one prompt). If the daemon stops starting after a system
 update, the panel shows the error and a **Rebuild daemon** button.
 
 **Uninstall** — in this order (the second step deletes `install.sh`):
 
 ```bash
-cd ~/.config/omarchy/plugins/alanfortlink.cames && ./install.sh --uninstall  # one prompt; don't cancel it (it un-hides your webcams)
-omarchy plugin remove alanfortlink.cames
-# checkout already gone?  sudo /usr/local/lib/cames/cames-setup uninstall
+cd ~/.config/omarchy/plugins/alanfortlink.camera-effects && ./install.sh --uninstall  # one prompt; don't cancel it (it un-hides your webcams)
+omarchy plugin remove alanfortlink.camera-effects
+# checkout already gone?  sudo /usr/local/lib/camera-effects/camera-effects-setup uninstall
 ```
 
 ## Using it
@@ -56,50 +56,50 @@ omarchy plugin remove alanfortlink.cames
 - **Several cameras**: a source picker and a "Same effects on every camera"
   switch; off, each camera keeps its own settings.
 - **Block camera** (Privacy section): the webcam stays closed (light off) even
-  while apps use cames Camera; they get the built-in "Camera paused" card, or an
+  while apps use Camera Effects; they get the built-in "Camera paused" card, or an
   image or a looped video of your choice, instead. Global, not per camera.
 - **Hide raw camera from apps** (Privacy section, password on each toggle): USB
-  webcams are taken away from your user so apps only see "cames Camera" (one
+  webcams are taken away from your user so apps only see "Camera Effects" (one
   switch for all, plus one per camera); toggling off restores them. This keeps
   well-behaved apps off the raw feed; it is not protection against malware
   running as you.
 - Right-click the bar icon to toggle Portrait. Bind
-  `omarchy-shell alanfortlink.cames toggle` to a key to open the panel.
+  `omarchy-shell alanfortlink.camera-effects toggle` to a key to open the panel.
 
 ## How it works
 
-`camesd` (C++, OpenCV + small ONNX models, CPU only, ~20 ms per 720p frame on a
+`camera-effects-server` (C++, OpenCV + small ONNX models, CPU only, ~20 ms per 720p frame on a
 desktop) opens the real camera only while an app holds the virtual one, so the
 camera light stays off otherwise. Frames go to a v4l2loopback device
 (`/dev/video20`, created at boot by a small systemd unit) and to a PipeWire
 camera node for portal-based apps. The panel talks to the daemon over
-`$XDG_RUNTIME_DIR/cames/ctl.sock`; settings live in `~/.config/cames/config.json`.
-The only privileged parts are `cames-setup` (device at boot, hide rules) and, when
-hiding is on, a root-owned copy of the daemon, both in `/usr/local/lib/cames/`.
+`$XDG_RUNTIME_DIR/camera-effects/ctl.sock`; settings live in `~/.config/camera-effects/config.json`.
+The only privileged parts are `camera-effects-setup` (device at boot, hide rules) and, when
+hiding is on, a root-owned copy of the daemon, both in `/usr/local/lib/camera-effects/`.
 Nothing leaves your machine.
 
 ## CLI
 
 ```bash
-camesd status                          # JSON state (consumers, fps, settings…)
-camesd set portrait=true portraitIntensity=0.7 centerStage=true
-camesd set filter=vintage fun=sunglasses
-camesd set zoom=1.5 panX=0.3 panY=-0.2 rotate=90 fit=contain   # framing (pan -1..1 within the room the zoom leaves)
-camesd set block=true blockSource=/path/to/image-or-video   # blockSource= for the built-in card
-camesd set blockZoom=2 blockPanX=1 blockFit=cover           # frame the placeholder
-camesd react hearts                    # play a reaction now
-camesd camera <bus-or-/dev/path>       # pick the physical camera (or a video file)
-camesd preview on|off                  # keep the pipeline running without a consumer
+camera-effects-server status                          # JSON state (consumers, fps, settings…)
+camera-effects-server set portrait=true portraitIntensity=0.7 centerStage=true
+camera-effects-server set filter=vintage fun=sunglasses
+camera-effects-server set zoom=1.5 panX=0.3 panY=-0.2 rotate=90 fit=contain   # framing (pan -1..1 within the room the zoom leaves)
+camera-effects-server set block=true blockSource=/path/to/image-or-video   # blockSource= for the built-in card
+camera-effects-server set blockZoom=2 blockPanX=1 blockFit=cover           # frame the placeholder
+camera-effects-server react hearts                    # play a reaction now
+camera-effects-server camera <bus-or-/dev/path>       # pick the physical camera (or a video file)
+camera-effects-server preview on|off                  # keep the pipeline running without a consumer
 ```
 
 ## Troubleshooting and limits
 
-- No icon: `omarchy plugin enable alanfortlink.cames` (or `omarchy-restart-shell`).
+- No icon: `omarchy plugin enable alanfortlink.camera-effects` (or `omarchy-restart-shell`).
 - "Needs setup": click **Set up virtual camera**. If it says v4l2loopback is not
   loadable, reboot (kernel updated) or check `dkms status`.
-- App doesn't list cames Camera: `systemctl status cames-camera-device`,
+- App doesn't list Camera Effects: `systemctl status camera-effects-device`,
   `v4l2loopback-ctl list`; re-run `./install.sh`.
-- Output is 1280x720 @ 30 (editable in `~/.config/cames/config.json`); cameras
+- Output is 1280x720 @ 30 (editable in `~/.config/camera-effects/config.json`); cameras
   that only work through libcamera (Intel IPU6) are not read; no Presenter Overlay.
 - Developing: `./install.sh` from any checkout symlinks it into
   `~/.config/omarchy/plugins`; remove that symlink before `omarchy plugin add`.

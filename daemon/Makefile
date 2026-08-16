@@ -11,7 +11,7 @@ LDFLAGS += $(shell pkg-config --libs libonnxruntime libpipewire-0.3) \
 BUILD ?= build
 SRC := $(wildcard src/*.cpp)
 OBJ := $(patsubst src/%.cpp,$(BUILD)/%.o,$(SRC))
-BIN := $(BUILD)/camesd
+BIN := $(BUILD)/camera-effects-server
 
 all: $(BIN)
 

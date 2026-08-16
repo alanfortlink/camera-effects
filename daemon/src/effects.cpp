@@ -647,7 +647,7 @@ bool EffectPipeline::init(const std::string& modelsDir, const std::string& asset
   if (!reactions_.loadAssets(assetsDir, &e)) status += "assets: " + e + "; ";
   if (!fun_.loadAssets(assetsDir, &e)) status += "fun assets: " + e + "; ";
   modelStatus_ = status.empty() ? "ok" : status;
-  debugGestures_ = getenv("CAMES_DEBUG") != nullptr;
+  debugGestures_ = getenv("CAMERA_EFFECTS_DEBUG") != nullptr;
   if (err) *err = status;
   return segmenter_.loaded();  // the rest degrade gracefully
 }

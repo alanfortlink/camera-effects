@@ -2,7 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Headless service: owns the camesd daemon (starts it, restarts it if it dies)
+// Headless service: owns the camera-effects-server daemon (starts it, restarts it if it dies)
 // and keeps a control connection to it. Everything the panel shows comes from
 // the daemon's state pushes; everything the panel changes goes through set().
 Item {
@@ -11,7 +11,7 @@ Item {
   property var shell: null
   property var manifest: null
 
-  // ---- daemon state (mirrors the JSON pushed by camesd) ----
+  // ---- daemon state (mirrors the JSON pushed by camera-effects-server) ----
   property var state: ({})
   readonly property bool connected: sockConnected
   readonly property bool running: !!state.running          // camera is being read + processed right now
@@ -21,7 +21,7 @@ Item {
   readonly property var cameras: state.cameras || []
   readonly property var camera: state.camera || ({})
   readonly property string loopback: state.loopback || ""
-  readonly property string loopbackLabel: state.loopbackLabel || "cames Camera"
+  readonly property string loopbackLabel: state.loopbackLabel || "Camera Effects"
   readonly property string error: state.error || ""
   readonly property bool hideRaw: !!state.hideRaw
   readonly property bool block: !!state.block                // camera blocked: placeholder instead of the webcam (global)
@@ -44,19 +44,19 @@ Item {
   // missing after a system update, a stale privileged copy); cleared once it talks to us.
   property string daemonError: ""
 
-  readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/cames"
+  readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/camera-effects"
   readonly property string socketPath: runtimeDir + "/ctl.sock"
   readonly property string homeDir: Quickshell.env("HOME") || ""
-  readonly property string libDir: homeDir + "/.local/lib/cames"
-  readonly property string setupScript: libDir + "/cames-setup"
-  readonly property string daemonBinary: libDir + "/camesd"
-  readonly property string privilegedBinary: "/usr/local/lib/cames/camesd"
-  // Root-owned copy of the setup script (installed by `cames-setup install`).
+  readonly property string libDir: homeDir + "/.local/lib/camera-effects"
+  readonly property string setupScript: libDir + "/camera-effects-setup"
+  readonly property string daemonBinary: libDir + "/camera-effects-server"
+  readonly property string privilegedBinary: "/usr/local/lib/camera-effects/camera-effects-server"
+  // Root-owned copy of the setup script (installed by `camera-effects-setup install`).
   // Preferred for pkexec so that what runs as root is not user-writable.
-  readonly property string privilegedSetupScript: "/usr/local/lib/cames/cames-setup"
+  readonly property string privilegedSetupScript: "/usr/local/lib/camera-effects/camera-effects-setup"
   // The plugin checkout (this file lives in <repo>/plugin/).
   readonly property string repoDir: decodeURIComponent(String(Qt.resolvedUrl("..")).replace(/^file:\/\//, "").replace(/\/$/, ""))
-  readonly property string cacheDir: (Quickshell.env("XDG_CACHE_HOME") || (homeDir + "/.cache")) + "/cames"
+  readonly property string cacheDir: (Quickshell.env("XDG_CACHE_HOME") || (homeDir + "/.cache")) + "/camera-effects"
   readonly property string installLog: cacheDir + "/install.log"
   property bool installed: false   // daemon binary present in ~/.local/lib
 
@@ -91,7 +91,7 @@ Item {
     setupOutput = ""
     // The root-owned script copy when it exists (after the first install), else ours.
     setupProc.command = ["sh", "-c", 'if [ -f "$1" ]; then s=$1; else s=$2; fi; shift 2; exec pkexec "$s" "$@"',
-                         "cames-setup-run", privilegedSetupScript, setupScript].concat(args)
+                         "camera-effects-setup-run", privilegedSetupScript, setupScript].concat(args)
     setupProc.running = true
   }
   property bool setupBusy: setupProc.running || installProc.running
@@ -112,14 +112,14 @@ Item {
   // build + install the user half (no password; the build goes to ~/.cache so
   // nothing is written inside the plugin dir, which the shell watches), then
   // create the device / refresh the root-owned copies (password). The whole
-  // output goes to ~/.cache/cames/install.log.
+  // output goes to ~/.cache/camera-effects/install.log.
   function install() {
     if (installProc.running) return
     setupOutput = ""
     daemonError = ""
     installProc.command = ["sh", "-c",
       'mkdir -p "$(dirname "$2")"; cd "$1" && ./install.sh --no-root >"$2" 2>&1; rc=$?; tail -n 4 "$2"; exit $rc',
-      "cames-install", repoDir, installLog]
+      "camera-effects-install", repoDir, installLog]
     installProc.running = true
   }
   Process {
@@ -164,9 +164,9 @@ Item {
   // otherwise the user's own build.
   function daemonCommand() {
     return ["sh", "-c",
-      'if ls /etc/udev/rules.d/71-cames-hide-*.rules >/dev/null 2>&1 && [ -x "$1" ]; then exec "$1" run; fi; ' +
-      'if [ -x "$2" ]; then exec "$2" run; fi; exec camesd run',
-      "camesd-launch", privilegedBinary, daemonBinary]
+      'if ls /etc/udev/rules.d/71-camera-effects-hide-*.rules >/dev/null 2>&1 && [ -x "$1" ]; then exec "$1" run; fi; ' +
+      'if [ -x "$2" ]; then exec "$2" run; fi; exec camera-effects-server run',
+      "camera-effects-launch", privilegedBinary, daemonBinary]
   }
 
   Process {

@@ -1,28 +1,28 @@
 #!/bin/bash
-# cames-setup — the privileged half of the cames Camera plugin.
+# camera-effects-setup — the privileged half of the Camera Effects plugin.
 # Invoked through pkexec by the shell plugin (or sudo by install.sh).
 #
-#   install [<camesd> [<cames-setup>]]  create the virtual camera now and at every boot; also
-#                                   installs a root-owned copy of this script (from <cames-setup>, the
+#   install [<camera-effects-server> [<camera-effects-setup>]]  create the virtual camera now and at every boot; also
+#                                   installs a root-owned copy of this script (from <camera-effects-setup>, the
 #                                   user's copy) for the shell to pkexec and, when hide rules exist,
-#                                   refreshes the privileged daemon copy from <camesd>
-#   uninstall                       remove the boot unit, the device, the hide rules and /usr/local/lib/cames
-#   hide-raw on <camesd> [<key>]    hide physical webcams from apps (all, or one USB camera by
-#                                   key "usb-<vid>-<pid>[-<serial>]"); only camesd may read them
+#                                   refreshes the privileged daemon copy from <camera-effects-server>
+#   uninstall                       remove the boot unit, the device, the hide rules and /usr/local/lib/camera-effects
+#   hide-raw on <camera-effects-server> [<key>]    hide physical webcams from apps (all, or one USB camera by
+#                                   key "usb-<vid>-<pid>[-<serial>]"); only camera-effects-server may read them
 #   hide-raw off [<key>]            make physical webcams (all, or that one) visible again
-#   refresh-daemon <camesd>         refresh the privileged daemon copy only (rules untouched)
+#   refresh-daemon <camera-effects-server>         refresh the privileged daemon copy only (rules untouched)
 #   status                          print JSON status
 set -euo pipefail
 export LC_ALL=C  # the key/serial regexes below are ASCII classes; keep them locale-independent
 
-LABEL="cames Camera"
+LABEL="Camera Effects"
 NR=20
-UNIT=/etc/systemd/system/cames-camera-device.service
-MODLOAD=/etc/modules-load.d/cames.conf
-MODPROBE=/etc/modprobe.d/cames.conf
+UNIT=/etc/systemd/system/camera-effects-device.service
+MODLOAD=/etc/modules-load.d/camera-effects.conf
+MODPROBE=/etc/modprobe.d/camera-effects.conf
 RULES_DIR=/etc/udev/rules.d
-RULE_ALL=$RULES_DIR/71-cames-hide-raw.rules
-LIBDIR=/usr/local/lib/cames
+RULE_ALL=$RULES_DIR/71-camera-effects-hide-raw.rules
+LIBDIR=/usr/local/lib/camera-effects
 GROUP=camerad
 # Camera key as built by the daemon (capture.cpp): 4 hex vid, 4 hex pid, optional
 # serial of [A-Za-z0-9._]{1,64}. Anything else is refused: the key becomes part of a
@@ -59,7 +59,7 @@ cmd_install() {
   modprobe v4l2loopback 2>/dev/null || true
   cat > "$UNIT" <<EOF
 [Unit]
-Description=cames Camera virtual video device
+Description=Camera Effects virtual video device
 After=systemd-modules-load.service
 ConditionPathExists=/dev/v4l2loopback
 
@@ -73,8 +73,8 @@ ExecStart=/bin/sh -c 'v4l2loopback-ctl list 2>/dev/null | grep -q "$LABEL" || v4
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable cames-camera-device.service >/dev/null 2>&1 || true
-  systemctl restart cames-camera-device.service
+  systemctl enable camera-effects-device.service >/dev/null 2>&1 || true
+  systemctl restart camera-effects-device.service
   # A root-owned copy of this script: the shell pkexecs that one (not the
   # user-writable copy in ~/.local) once it exists. Refreshed from the caller's
   # copy (owner-checked) on every install, so `./install.sh` and the panel's
@@ -84,11 +84,11 @@ EOF
     install_privileged_script "$src"
   else
     local self; self=$(readlink -f "$0")
-    [[ $self == "$LIBDIR/cames-setup" ]] || install -m 755 -o root -g root "$self" "$LIBDIR/cames-setup"
+    [[ $self == "$LIBDIR/camera-effects-setup" ]] || install -m 755 -o root -g root "$self" "$LIBDIR/camera-effects-setup"
   fi
   # Cameras hidden => the shell runs the privileged daemon copy: keep it in step
-  # with the build being installed (the caller passes its camesd path).
-  if [[ -n $bin ]] && ls "$RULES_DIR"/71-cames-hide-*.rules >/dev/null 2>&1; then
+  # with the build being installed (the caller passes its camera-effects-server path).
+  if [[ -n $bin ]] && ls "$RULES_DIR"/71-camera-effects-hide-*.rules >/dev/null 2>&1; then
     install_privileged_daemon "$bin"
     echo "privileged daemon refreshed"
   fi
@@ -102,7 +102,7 @@ EOF
   sleep 0.3
   local dev; dev=$(device_path)
   if [[ -z $dev ]]; then
-    echo "the virtual camera was not created: see 'systemctl status cames-camera-device' and 'v4l2loopback-ctl list'" >&2
+    echo "the virtual camera was not created: see 'systemctl status camera-effects-device' and 'v4l2loopback-ctl list'" >&2
     exit 1
   fi
   echo "virtual camera: $dev"
@@ -137,21 +137,21 @@ open_owned_exec() {
 # granting rx to the invoking user only, so other local accounts cannot run it to
 # reach the hidden webcams (hiding a camera must not widen its audience).
 install_privileged_daemon() {
-  open_owned_exec "${1:-}" "camesd binary"
+  open_owned_exec "${1:-}" "camera-effects-server binary"
   local caller=${PKEXEC_UID:-${SUDO_UID:-0}}
   getent group "$GROUP" >/dev/null || groupadd -r "$GROUP"
   install -d -m 755 "$LIBDIR"
   # install replaces the destination inode, so no stale ACL survives from a previous copy
-  install -m 2750 -o root -g "$GROUP" /dev/fd/3 "$LIBDIR/camesd"
+  install -m 2750 -o root -g "$GROUP" /dev/fd/3 "$LIBDIR/camera-effects-server"
   exec 3<&-
-  [[ $caller -eq 0 ]] || setfacl -m "u:$caller:rx" "$LIBDIR/camesd"
+  [[ $caller -eq 0 ]] || setfacl -m "u:$caller:rx" "$LIBDIR/camera-effects-server"
 }
 
 # Root-owned copy of this script (what the shell pkexecs), from the caller's copy.
 install_privileged_script() {
-  open_owned_exec "${1:-}" "cames-setup script"
+  open_owned_exec "${1:-}" "camera-effects-setup script"
   install -d -m 755 "$LIBDIR"
-  install -m 755 -o root -g root /dev/fd/3 "$LIBDIR/cames-setup"
+  install -m 755 -o root -g root /dev/fd/3 "$LIBDIR/camera-effects-setup"
   exec 3<&-
 }
 
@@ -198,7 +198,7 @@ reapply() {
     hidden=false
     [[ -f $RULE_ALL ]] && is_usb_capture "$d" && hidden=true
     key=$(device_key "$d")
-    [[ -n $key && -f $RULES_DIR/71-cames-hide-$key.rules ]] && hidden=true
+    [[ -n $key && -f $RULES_DIR/71-camera-effects-hide-$key.rules ]] && hidden=true
     if $hidden; then
       chgrp "$GROUP" "$d" 2>/dev/null || true; chmod 0660 "$d" 2>/dev/null || true
       setfacl -b "$d" 2>/dev/null || true
@@ -219,15 +219,15 @@ cmd_hide_raw() {
       if [[ -z $key ]]; then
         # Only USB capture cameras: not tuners, capture cards or codec (M2M) nodes.
         cat > "$RULE_ALL" <<EOF
-# cames Camera: physical webcams are read by the effects daemon only; apps use the
-# virtual "cames Camera" device instead. Toggle "Hide raw cameras" in the panel to restore.
+# Camera Effects: physical webcams are read by the effects daemon only; apps use the
+# virtual "Camera Effects" device instead. Toggle "Hide raw cameras" in the panel to restore.
 SUBSYSTEM=="video4linux", SUBSYSTEMS=="usb", ENV{ID_V4L_CAPABILITIES}=="*:capture:*", TAG-="uaccess", GROUP="$GROUP", MODE="0660"
 EOF
         echo "raw cameras hidden"
       else
         local match; match=$(key_match "$key")
-        cat > "$RULES_DIR/71-cames-hide-$key.rules" <<EOF
-# cames Camera: this webcam is read by the effects daemon only (see the Camera panel).
+        cat > "$RULES_DIR/71-camera-effects-hide-$key.rules" <<EOF
+# Camera Effects: this webcam is read by the effects daemon only (see the Camera panel).
 SUBSYSTEM=="video4linux", $match, TAG-="uaccess", GROUP="$GROUP", MODE="0660"
 EOF
         echo "camera $key hidden"
@@ -237,10 +237,10 @@ EOF
     off)
       local key=${2:-}
       if [[ -z $key ]]; then rm -f "$RULE_ALL"; echo "raw cameras visible"
-      else valid_key "$key"; rm -f "$RULES_DIR/71-cames-hide-$key.rules"; echo "camera $key visible"; fi
+      else valid_key "$key"; rm -f "$RULES_DIR/71-camera-effects-hide-$key.rules"; echo "camera $key visible"; fi
       reapply
       ;;
-    *) echo "usage: hide-raw on <camesd> [<key>] | hide-raw off [<key>]" >&2; exit 2;;
+    *) echo "usage: hide-raw on <camera-effects-server> [<key>] | hide-raw off [<key>]" >&2; exit 2;;
   esac
 }
 
@@ -254,23 +254,23 @@ cmd_refresh_daemon() {
 cmd_uninstall() {
   need_root
   # Hide rules first: with them gone, reapply hands the webcams back to group video.
-  rm -f "$RULES_DIR"/71-cames-hide-*.rules
+  rm -f "$RULES_DIR"/71-camera-effects-hide-*.rules
   reapply || true
-  systemctl disable --now cames-camera-device.service >/dev/null 2>&1 || true
+  systemctl disable --now camera-effects-device.service >/dev/null 2>&1 || true
   rm -f "$UNIT" "$MODLOAD" "$MODPROBE"
   systemctl daemon-reload
   local dev; dev=$(device_path)
   [[ -n $dev ]] && v4l2loopback-ctl delete "$dev" || true
   rm -rf "$LIBDIR"
   echo "removed: device, boot unit, hide rules, $LIBDIR"
-  echo "left in place: group $GROUP, ~/.config/cames/config.json, packages (v4l2loopback-dkms/-utils, onnxruntime); the module stays loaded until reboot"
+  echo "left in place: group $GROUP, ~/.config/camera-effects/config.json, packages (v4l2loopback-dkms/-utils, onnxruntime); the module stays loaded until reboot"
 }
 
 cmd_status() {
   local dev; dev=$(device_path 2>/dev/null || true)
   local hide=false; [[ -f $RULE_ALL ]] && hide=true
   local unit=false; [[ -f $UNIT ]] && unit=true
-  local per; per=$(ls "$RULES_DIR"/71-cames-hide-usb-*.rules 2>/dev/null | sed 's|.*/71-cames-hide-||;s|\.rules$||' | paste -sd, - || true)
+  local per; per=$(ls "$RULES_DIR"/71-camera-effects-hide-usb-*.rules 2>/dev/null | sed 's|.*/71-camera-effects-hide-||;s|\.rules$||' | paste -sd, - || true)
   printf '{"device":"%s","hideRaw":%s,"hiddenCameras":"%s","bootUnit":%s}\n' "$dev" "$hide" "$per" "$unit"
 }
 

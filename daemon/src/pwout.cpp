@@ -58,7 +58,7 @@ bool PipeWireOutput::startImpl(int w, int h, int fps, const std::string& label, 
   onActive_ = std::move(onActive);
   failed_ = false;
   pw_init(nullptr, nullptr);
-  loop_ = pw_thread_loop_new("camesd-pw", nullptr);
+  loop_ = pw_thread_loop_new("camera-effects-pw", nullptr);
   if (!loop_) { if (err) *err = "pw_thread_loop_new failed"; return false; }
   context_ = pw_context_new(pw_thread_loop_get_loop(loop_), nullptr, 0);
   if (!context_) { if (err) *err = "pw_context_new failed"; stop(); return false; }
@@ -74,10 +74,10 @@ bool PipeWireOutput::startImpl(int w, int h, int fps, const std::string& label, 
       PW_KEY_MEDIA_ROLE, "Camera",
       PW_KEY_MEDIA_TYPE, "Video",
       PW_KEY_MEDIA_CATEGORY, "Capture",
-      PW_KEY_NODE_NAME, "cames-camera",
+      PW_KEY_NODE_NAME, "camera-effects",
       PW_KEY_NODE_DESCRIPTION, label.c_str(),
       PW_KEY_NODE_NICK, label.c_str(),
-      PW_KEY_DEVICE_API, "camesd",
+      PW_KEY_DEVICE_API, "camera-effects-server",
       PW_KEY_NODE_DRIVER, "true",
       nullptr);
   pw_properties_setf(props, PW_KEY_NODE_RATE, "1/%d", fps_);
@@ -129,7 +129,7 @@ std::string PipeWireOutput::maintain(double now) {
   }
   okSince_ = -1;
   if (stream_) {  // just failed: tear down now, come back after the backoff
-    fprintf(stderr, "camesd: pipewire stream lost, reconnecting in %.0f s\n", backoff_);
+    fprintf(stderr, "camera-effects-server: pipewire stream lost, reconnecting in %.0f s\n", backoff_);
     stop();
     status_ = "reconnecting";
     retryAt_ = now + backoff_;
@@ -140,7 +140,7 @@ std::string PipeWireOutput::maintain(double now) {
   if (now < retryAt_) return status_;
   std::string err;
   if (start(w_, h_, fps_, label_, onActive_, &err)) {
-    fprintf(stderr, "camesd: pipewire output back\n");
+    fprintf(stderr, "camera-effects-server: pipewire output back\n");
     return status_;  // "ok"
   }
   status_ = err;
@@ -151,7 +151,7 @@ std::string PipeWireOutput::maintain(double now) {
 
 void PipeWireOutput::onStateChanged(int old, int state, const char* error) {
   bool streaming = state == PW_STREAM_STATE_STREAMING;
-  if (error) fprintf(stderr, "camesd: pipewire stream error: %s\n", error);
+  if (error) fprintf(stderr, "camera-effects-server: pipewire stream error: %s\n", error);
   // Error, or dropped back to unconnected after having been up: the owner's
   // maintain() re-creates the node (nothing may be torn down from this thread).
   if (state == PW_STREAM_STATE_ERROR || (state == PW_STREAM_STATE_UNCONNECTED && old > PW_STREAM_STATE_CONNECTING)) failed_ = true;
@@ -163,7 +163,7 @@ void PipeWireOutput::onStateChanged(int old, int state, const char* error) {
 
 void PipeWireOutput::onCoreError(uint32_t id, int, int res, const char* message) {
   if (id != PW_ID_CORE) return;
-  fprintf(stderr, "camesd: pipewire core error: %s (%d)\n", message ? message : "", res);
+  fprintf(stderr, "camera-effects-server: pipewire core error: %s (%d)\n", message ? message : "", res);
   failed_ = true;
 }
 

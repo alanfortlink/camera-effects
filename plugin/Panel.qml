@@ -5,20 +5,20 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Bar icon + popup panel for the cames Camera (the macOS "Video Effects"
+// Bar icon + popup panel for the Camera Effects (the macOS "Video Effects"
 // menu, Omarchy style): live preview (drag to pan, wheel to zoom), camera
 // picker, one row per effect (switches, the Zoom slider, Fit/Filter/Effects/
 // Rotate dropdowns), reactions, and the privacy switches
-// (block camera, hide raw camera). All state lives in the camesd daemon (see
+// (block camera, hide raw camera). All state lives in the camera-effects-server daemon (see
 // Service.qml); this file only renders and forwards.
 Panel {
   id: root
-  moduleName: "alanfortlink.cames"
-  ipcTarget: "alanfortlink.cames"
+  moduleName: "alanfortlink.camera-effects"
+  ipcTarget: "alanfortlink.camera-effects"
 
   // The shell mounts our service at startup (kinds: service); calling
   // ensureService() from a binding would mutate the registry it reads (loop).
-  readonly property var svc: bar && bar.shell ? bar.shell.serviceFor("alanfortlink.cames") : null
+  readonly property var svc: bar && bar.shell ? bar.shell.serviceFor("alanfortlink.camera-effects") : null
   readonly property bool inUse: svc ? svc.running : false
   readonly property bool connected: svc ? svc.connected : false
   readonly property var s: svc ? svc.settings : ({})
@@ -197,7 +197,7 @@ Panel {
     command: ["sh", "-c",
       'command -v zenity >/dev/null 2>&1 || exit 127; ' +
       'exec zenity --file-selection --title="$1" --file-filter="$2" --file-filter="All files | *"',
-      "cames-pick", title, filter]
+      "camera-effects-pick", title, filter]
     // begin(target, title, filter): open the chooser for `target` (a daemon setting key).
     function begin(t, ti, f) {
       if (running) return
@@ -371,7 +371,7 @@ Panel {
           // ---------- Hero ----------
           PanelHero {
             width: parent.width
-            title: root.svc ? root.svc.loopbackLabel : "cames Camera"
+            title: root.svc ? root.svc.loopbackLabel : "Camera Effects"
             meta: root.subtitle()
             foreground: root.fg
             fontFamily: root.fontFamily
