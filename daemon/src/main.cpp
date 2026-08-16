@@ -215,8 +215,7 @@ void loadConfig(Config& c) {
 void saveConfig(const Config& c) {
   json byCam = json::object();
   for (auto& [bus, st] : c.settingsByCamera) byCam[bus] = settingsToJson(st);
-  json j = { { "loopback", { { "label", c.label } } },
-             { "output", { { "width", c.outW }, { "height", c.outH }, { "fps", c.fps } } },
+  json j = { { "output", { { "width", c.outW }, { "height", c.outH }, { "fps", c.fps } } },
              { "capture", { { "width", c.capW }, { "height", c.capH } } },
              { "camera", c.preferredCamera },
              { "block", c.block },
