@@ -77,6 +77,9 @@ install -m 755 "$SETUP" "$LIB/camera-effects-setup"
 install -m 644 "$HERE"/models/*.onnx "$DATA/models/"
 install -m 644 "$HERE"/assets/*.png "$DATA/assets/"
 ln -sfn "$LIB/camera-effects-server" "$BIN/camera-effects-server"
+# Remember which checkout commit this build came from (the shell plugin rebuilds
+# automatically after `omarchy plugin update` when this no longer matches).
+git -C "$HERE" rev-parse HEAD > "$LIB/installed-commit" 2>/dev/null || date +%s > "$LIB/installed-commit"
 
 echo "› installing shell plugin"
 mkdir -p "$(dirname "$PLUGIN")"

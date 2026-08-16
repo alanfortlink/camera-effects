@@ -173,10 +173,35 @@ Item {
     id: installProc
     stdout: StdioCollector { onStreamFinished: root.setupOutput = String(text).trim() }
     onExited: function(code) {
-      if (code === 0) { restartTimer.restart(); Qt.callLater(function() { root.runSetup("install") }) }
+      if (code === 0) { restartTimer.restart(); rootCheckProc.running = true }
       else root.setupOutput = "install failed (" + code + "), see " + root.installLog + ":\n" + root.setupOutput
       probeProc.running = true   // re-check the binary rather than trusting the exit code
     }
+  }
+  // After a build: only ask for the password when the root-owned copies (setup
+  // script; the setgid daemon when cameras are hidden) or the device are out of
+  // date. Exit 1 = needs root, 0 = all current.
+  Process {
+    id: rootCheckProc
+    command: ["sh", "-c",
+      'lib=$1; root=/usr/local/lib/camera-effects; ' +
+      '[ -x "$root/camera-effects-setup" ] || exit 1; cmp -s "$lib/camera-effects-setup" "$root/camera-effects-setup" || exit 1; ' +
+      'if ls /etc/udev/rules.d/71-camera-effects-hide-*.rules >/dev/null 2>&1; then [ -r "$root/camera-effects-server" ] || exit 1; cmp -s "$lib/camera-effects-server" "$root/camera-effects-server" || exit 1; fi; ' +
+      'exit 0',
+      "camera-effects-rootcheck", root.libDir]
+    onExited: function(code) { if (code !== 0 || root.deviceMissing) root.runSetup("install") }
+  }
+  // Auto-update: after `omarchy plugin update` the shell reloads this plugin, so
+  // on start we compare the checkout with what install.sh last installed and
+  // rebuild silently when they differ (a password is asked only if root copies
+  // are stale, see rootCheckProc).
+  Process {
+    id: updateCheckProc
+    command: ["sh", "-c",
+      'a=$(git -C "$1" rev-parse HEAD 2>/dev/null) || exit 0; b=$(cat "$2/installed-commit" 2>/dev/null); ' +
+      '[ -x "$2/camera-effects-server" ] || exit 0; [ -n "$a" ] && [ "$a" != "$b" ] && exit 3; exit 0',
+      "camera-effects-updatecheck", root.repoDir, root.libDir]
+    onExited: function(code) { if (code === 3) { root.setupOutput = "Updating…"; root.install() } }
   }
   // Is the daemon binary there? Answers the "exit 127" question: not installed
   // yet (wait for install()) or installed but not startable (back off, tell the user).
@@ -314,6 +339,7 @@ Item {
     probeProc.running = true
     daemon.running = true
     connectSocket()
+    updateCheckProc.running = true
   }
   Component.onDestruction: {
     if (daemon.running) daemon.signal(15)

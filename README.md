@@ -37,8 +37,9 @@ Update:
 
 ```bash
 omarchy plugin update alanfortlink.camera-effects
-~/.config/omarchy/plugins/alanfortlink.camera-effects/install.sh
 ```
+
+That is all: the plugin notices the new code, rebuilds the daemon in the background and restarts it. You are asked for your password only when the root-owned parts changed. (Manual equivalent: run `~/.config/omarchy/plugins/alanfortlink.camera-effects/install.sh`.)
 
 Uninstall, in this order:
 
