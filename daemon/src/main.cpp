@@ -96,6 +96,8 @@ int cmdClient(const std::string& sockPath, const std::string& request, bool wait
   addr.sun_family = AF_UNIX;
   strncpy(addr.sun_path, sockPath.c_str(), sizeof(addr.sun_path) - 1);
   if (connect(fd, (sockaddr*)&addr, sizeof addr) < 0) { fprintf(stderr, "daemon not running (%s)\n", sockPath.c_str()); return 1; }
+  timeval tv{ 5, 0 };  // never hang the CLI on a wedged daemon
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
   std::string msg = request + "\n";
   send(fd, msg.data(), msg.size(), 0);
   // Read the greeting state + reply.
@@ -191,6 +193,9 @@ void saveConfig(const Config& c) {
   mkdir(dir.c_str(), 0755);
   std::string tmp = c.configPath + ".tmp";
   { std::ofstream f(tmp); f << j.dump(2) << "\n"; }
+  // The setgid (hide-raw) build would otherwise leave these group camerad.
+  (void)!chown(dir.c_str(), (uid_t)-1, getgid());
+  (void)!chown(tmp.c_str(), (uid_t)-1, getgid());
   rename(tmp.c_str(), c.configPath.c_str());
 }
 
@@ -368,7 +373,9 @@ bool Daemon::openCapture(std::string* err) {
   std::string pref;
   { std::lock_guard<std::mutex> lk(mu_); pref = cfg_.preferredCamera; }
   cv::Size want = wantedCapture();
-  if (!pref.empty() && pref[0] == '/' && pref.rfind("/dev/", 0) != 0 && fileExists(pref)) {
+  // A file source (dev/testing) must be a readable regular file: a FIFO or a
+  // directory would wedge or spin the OpenCV/FFmpeg opener.
+  if (!pref.empty() && pref[0] == '/' && pref.rfind("/dev/", 0) != 0 && blockSourceValid(pref)) {
     if (!file_.open(pref, cfg_.fps, err)) return false;
     useFile_ = true;
     std::lock_guard<std::mutex> lk(mu_);
@@ -592,6 +599,9 @@ bool ensureRuntimeDir(const std::string& dir, std::string* err) {
   if (fd < 0) { *err = std::string("open ") + dir + ": " + strerror(errno); return false; }
   struct stat st{};
   bool ok = fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == getuid() && (st.st_mode & 0777) == 0700;
+  // The setgid (hide-raw) build creates files with egid camerad; keep our own
+  // dirs/files in the user's group so nothing looks odd or depends on camerad.
+  if (ok && st.st_gid != getgid()) (void)!fchown(fd, (uid_t)-1, getgid());
   close(fd);
   if (!ok) { *err = dir + " must be a directory owned by us with mode 0700"; return false; }
   return true;
