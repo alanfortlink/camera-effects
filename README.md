@@ -1,6 +1,8 @@
 # Iris — system-wide camera effects for Omarchy
 
-![Iris Camera panel](docs/panel.png)
+> Tested only on **Omarchy 4** (Arch Linux, Hyprland, omarchy-shell). Video walkthrough: coming soon.
+
+![Iris panel](docs/panel.png)
 
 macOS-style camera effects for Omarchy: a background daemon reads your webcam,
 applies effects, and publishes the result as a virtual webcam called
