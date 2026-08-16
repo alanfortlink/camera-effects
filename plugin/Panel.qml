@@ -508,10 +508,10 @@ Panel {
                 var rx = r[0] || 0, ry = r[1] || 0
                 if (rx <= 0 && ry <= 0) return
                 // pan = the crop's place in its free range (-1..1); the range covers 2 * r * (preview size) px.
-                // The preview shows the camera feed as a mirror (whatever the Mirror setting), so a drag to the
-                // right reveals more of the feed's right; the placeholder is shown as is. Rotation needs no
-                // correction: pan applies to the rotated frame, which is what the preview shows.
-                var sx = root.blocked ? -1 : 1
+                // The preview shows the output as apps get it: dragging the picture right moves the crop left
+                // (-1); when the output is mirrored the picture is flipped, so the sign flips too. Rotation
+                // needs no correction: pan applies to the rotated frame, which is what the preview shows.
+                var sx = (!root.blocked && !!root.s.mirror) ? 1 : -1
                 var px = rx > 0 ? Math.max(-1, Math.min(1, panX0 + sx * (mouse.x - startX) / (rx * width))) : panX0
                 var py = ry > 0 ? Math.max(-1, Math.min(1, panY0 - (mouse.y - startY) / (ry * height))) : panY0
                 pending = { panX: Math.round(px * 1000) / 1000, panY: Math.round(py * 1000) / 1000 }
@@ -605,10 +605,6 @@ Panel {
           Note {
             visible: previewBox.visible && root.previewActive && (root.centerStageOn || root.panEnabled)
             text: root.centerStageOn ? "Center Stage frames automatically" : "Drag to pan · scroll to zoom"
-          }
-          Note {
-            visible: previewBox.visible && root.previewActive && !!root.s.mirror
-            text: "Apps get the mirrored feed"
           }
 
           // ---------- Camera ----------

@@ -9,10 +9,9 @@ import QtQuick
 Item {
   id: root
   property string path: ""   // .../camera-effects/preview.jpg
-  // True when the daemon already mirrors the output (settings.mirror). The
-  // preview always shows you a mirror view of yourself, so it flips the feed
-  // itself only when the feed is not mirrored already.
-  property bool mirror: false
+  // The preview shows exactly what apps get (so the Mirror switch is visible
+  // here too); no local flipping.
+  property bool mirror: false  // kept for API compatibility, unused
   readonly property bool ready: shown.status === Image.Ready && shown.implicitWidth > 0
 
   // Two images, front and back: the next frame loads into the back one and
@@ -39,8 +38,7 @@ Item {
     cache: false
     asynchronous: true
     fillMode: Image.PreserveAspectCrop
-    // Mirror like a real mirror, whatever the output setting is.
-    transform: Scale { origin.x: imgA.width / 2; xScale: root.mirror ? 1 : -1 }
+    transform: Scale { origin.x: imgA.width / 2; xScale: 1 }
     onStatusChanged: root.loaded(imgA)
   }
   Image {
@@ -50,7 +48,7 @@ Item {
     cache: false
     asynchronous: true
     fillMode: Image.PreserveAspectCrop
-    transform: Scale { origin.x: imgB.width / 2; xScale: root.mirror ? 1 : -1 }
+    transform: Scale { origin.x: imgB.width / 2; xScale: 1 }
     onStatusChanged: root.loaded(imgB)
   }
 
