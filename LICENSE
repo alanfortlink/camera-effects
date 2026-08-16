@@ -20,6 +20,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Third-party components: ONNX models in models/ come from the OpenCV Zoo
-(Apache-2.0); emoji sprites in assets/ are rendered from Noto Color Emoji
-(SIL OFL 1.1); daemon/third_party/json.hpp is nlohmann/json (MIT).
+Third-party components (see THIRD_PARTY_NOTICES.md): models/yunet.onnx (MIT,
+Shiqi Yu); models/pphumanseg.onnx, palm_detection.onnx, hand_landmark.onnx
+(Apache-2.0, via OpenCV Zoo); daemon/third_party/json.hpp (MIT, nlohmann/json);
+assets/*.png rendered from Noto Color Emoji (SIL OFL 1.1).

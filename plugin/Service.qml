@@ -45,7 +45,9 @@ Item {
   // Preferred for pkexec so that what runs as root is not user-writable.
   readonly property string privilegedSetupScript: "/usr/local/lib/iris/iris-setup"
   // The plugin checkout (this file lives in <repo>/plugin/).
-  readonly property string repoDir: String(Qt.resolvedUrl("..")).replace(/^file:\/\//, "").replace(/\/$/, "")
+  readonly property string repoDir: decodeURIComponent(String(Qt.resolvedUrl("..")).replace(/^file:\/\//, "").replace(/\/$/, ""))
+  readonly property string cacheDir: (Quickshell.env("XDG_CACHE_HOME") || (homeDir + "/.cache")) + "/iris"
+  readonly property string installLog: cacheDir + "/install.log"
   property bool installed: false   // daemon binary present in ~/.local/lib
 
   // ---- commands ----
@@ -71,7 +73,8 @@ Item {
   function runSetup(what, a, b) {
     if (setupProc.running) return
     var args
-    if (what === "install") args = ["install", daemonBinary]   // also refreshes the privileged copy when cameras are hidden
+    // install: also refreshes the root-owned script copy and, when cameras are hidden, the setgid daemon copy
+    if (what === "install") args = ["install", daemonBinary, setupScript]
     else if (what === "hide-all") args = a ? ["hide-raw", "on", daemonBinary] : ["hide-raw", "off"]
     else if (what === "hide-camera") args = b ? ["hide-raw", "on", daemonBinary, String(a)] : ["hide-raw", "off", String(a)]
     else return
@@ -95,20 +98,27 @@ Item {
     }
   }
 
-  // First run from a plain `omarchy plugin add`: build + install the user
-  // half (no password), then create the device (password).
+  // First run from a plain `omarchy plugin add` (and "Rebuild daemon" later):
+  // build + install the user half (no password; the build goes to ~/.cache so
+  // nothing is written inside the plugin dir, which the shell watches), then
+  // create the device / refresh the root-owned copies (password). The whole
+  // output goes to ~/.cache/iris/install.log.
   function install() {
     if (installProc.running) return
-    installProc.command = ["sh", "-c", 'cd "$1" && ./install.sh --no-root 2>&1', "iris-install", repoDir]
+    setupOutput = ""
+    daemonError = ""
+    installProc.command = ["sh", "-c",
+      'mkdir -p "$(dirname "$2")"; cd "$1" && ./install.sh --no-root >"$2" 2>&1; rc=$?; tail -n 4 "$2"; exit $rc',
+      "iris-install", repoDir, installLog]
     installProc.running = true
   }
   Process {
     id: installProc
-    stdout: StdioCollector { onStreamFinished: root.setupOutput = String(text).trim().split("\n").slice(-3).join("\n") }
+    stdout: StdioCollector { onStreamFinished: root.setupOutput = String(text).trim() }
     onExited: function(code) {
-      root.installed = code === 0
       if (code === 0) { restartTimer.restart(); Qt.callLater(function() { root.runSetup("install") }) }
-      else root.setupOutput = "install failed (" + code + "):\n" + root.setupOutput
+      else root.setupOutput = "install failed (" + code + "), see " + root.installLog + ":\n" + root.setupOutput
+      probeProc.running = true   // re-check the binary rather than trusting the exit code
     }
   }
   // Is the daemon binary there? Answers the "exit 127" question: not installed
@@ -124,11 +134,19 @@ Item {
       if (!root.installed || daemon.running) return
       if (afterExit) {
         root.restarts += 1
-        root.daemonError = "daemon failed to start (exit 127, see log)"
+        root.daemonError = "daemon cannot start (exit 127: a library changed after an update, or a stale privileged copy) — rebuild it"
         restartTimer.interval = Math.min(10000, 1000 + root.restarts * 1000)
       }
       restartTimer.restart()
     }
+  }
+  // While not installed, keep looking: an install interrupted by a shell reload
+  // (or run from a terminal) finishes on its own and we pick the binary up.
+  Timer {
+    interval: 5000
+    repeat: true
+    running: !root.installed && !installProc.running && !probeProc.running
+    onTriggered: probeProc.running = true
   }
 
   // ---- daemon lifecycle ----
@@ -156,6 +174,7 @@ Item {
       root.state = ({})
       if (code === 127) { root.probeAfterExit = true; probeProc.running = true; return }  // not installed yet, or unloadable: the probe decides
       root.restarts += 1
+      if (code !== 3 && root.restarts >= 3) root.daemonError = "daemon keeps exiting (code " + code + ") — rebuild it or check the log"
       restartTimer.interval = code === 3 ? 5000 : Math.min(10000, 1000 + root.restarts * 1000)  // 3 = another instance holds the lock
       restartTimer.restart()
     }

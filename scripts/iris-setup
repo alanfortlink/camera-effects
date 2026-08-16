@@ -2,10 +2,11 @@
 # iris-setup — the privileged half of the Iris Camera plugin.
 # Invoked through pkexec by the shell plugin (or sudo by install.sh).
 #
-#   install [<irisd>]              create the virtual camera now and at every boot; also
-#                                   installs a root-owned copy of this script for the shell to pkexec
-#                                   and, when hide rules exist, refreshes the privileged daemon copy
-#   uninstall                       remove the boot unit, the device and all hide rules
+#   install [<irisd> [<iris-setup>]]  create the virtual camera now and at every boot; also
+#                                   installs a root-owned copy of this script (from <iris-setup>, the
+#                                   user's copy) for the shell to pkexec and, when hide rules exist,
+#                                   refreshes the privileged daemon copy from <irisd>
+#   uninstall                       remove the boot unit, the device, the hide rules and /usr/local/lib/iris
 #   hide-raw on <irisd> [<key>]    hide physical webcams from apps (all, or one USB camera by
 #                                   key "usb-<vid>-<pid>[-<serial>]"); only irisd may read them
 #   hide-raw off [<key>]            make physical webcams (all, or that one) visible again
@@ -18,6 +19,7 @@ LABEL="Iris Camera"
 NR=20
 UNIT=/etc/systemd/system/iris-camera-device.service
 MODLOAD=/etc/modules-load.d/iris.conf
+MODPROBE=/etc/modprobe.d/iris.conf
 RULES_DIR=/etc/udev/rules.d
 RULE_ALL=$RULES_DIR/71-iris-hide-raw.rules
 LIBDIR=/usr/local/lib/iris
@@ -45,8 +47,14 @@ ensure_tools() {
 
 cmd_install() {
   need_root
-  local bin=${1:-}
+  local bin=${1:-} src=${2:-}
   ensure_tools
+  # Without any options the module creates one "Dummy video device" at every boot
+  # that shows up in every app's camera list. Ask for none unless the user (or OBS)
+  # already configured the module; the boot unit adds ours by label.
+  if ! grep -qs '^[[:space:]]*options[[:space:]]\+v4l2loopback\b' /etc/modprobe.d/*.conf /usr/lib/modprobe.d/*.conf; then
+    echo "options v4l2loopback devices=0" > "$MODPROBE"
+  fi
   echo v4l2loopback > "$MODLOAD"
   modprobe v4l2loopback 2>/dev/null || true
   cat > "$UNIT" <<EOF
@@ -68,19 +76,36 @@ EOF
   systemctl enable iris-camera-device.service >/dev/null 2>&1 || true
   systemctl restart iris-camera-device.service
   # A root-owned copy of this script: the shell pkexecs that one (not the
-  # user-writable copy in ~/.local) once it exists. Re-run install to update it.
-  local self; self=$(readlink -f "$0")
+  # user-writable copy in ~/.local) once it exists. Refreshed from the caller's
+  # copy (owner-checked) on every install, so `./install.sh` and the panel's
+  # Install button keep it current; without a source, from the running script.
   install -d -m 755 "$LIBDIR"
-  [[ $self == "$LIBDIR/iris-setup" ]] || install -m 755 -o root -g root "$self" "$LIBDIR/iris-setup"
+  if [[ -n $src ]]; then
+    install_privileged_script "$src"
+  else
+    local self; self=$(readlink -f "$0")
+    [[ $self == "$LIBDIR/iris-setup" ]] || install -m 755 -o root -g root "$self" "$LIBDIR/iris-setup"
+  fi
   # Cameras hidden => the shell runs the privileged daemon copy: keep it in step
   # with the build being installed (the caller passes its irisd path).
   if [[ -n $bin ]] && ls "$RULES_DIR"/71-iris-hide-*.rules >/dev/null 2>&1; then
     install_privileged_daemon "$bin"
     echo "privileged daemon refreshed"
   fi
+  # Loud failures: a kernel updated but not rebooted (running kernel != installed
+  # headers), a failed dkms build, or missing headers all leave the module unloadable.
+  if [[ ! -e /dev/v4l2loopback ]]; then
+    echo "v4l2loopback is not loadable for the running kernel $(uname -r): reboot if the kernel was just updated, otherwise check 'dkms status' and 'sudo modprobe v4l2loopback'" >&2
+    exit 1
+  fi
   # udev needs a moment to apply the ACL for the seat user
   sleep 0.3
-  echo "virtual camera: $(device_path)"
+  local dev; dev=$(device_path)
+  if [[ -z $dev ]]; then
+    echo "the virtual camera was not created: see 'systemctl status iris-camera-device' and 'v4l2loopback-ctl list'" >&2
+    exit 1
+  fi
+  echo "virtual camera: $dev"
 }
 
 raw_devices() {
@@ -93,26 +118,41 @@ raw_devices() {
   done
 }
 
-# Root-owned setgid copy of the daemon: the only thing allowed to read hidden webcams.
-# The source must be a plain file of the invoking user (or root's when root itself
-# calls): this publishes it setgid, so it must not be pointed at someone else's file.
-# The file is opened once and every check plus the copy go through that descriptor,
-# so the path cannot be swapped between check and copy. The copy is 2750 root:camerad
-# plus an ACL granting rx to the invoking user only, so other local accounts cannot
-# run it to reach the hidden webcams (hiding a camera must not widen its audience).
-install_privileged_daemon() {
-  local bin=$1
-  [[ -n $bin && ! -L $bin ]] || { echo "irisd binary missing or a symlink: $bin" >&2; exit 1; }
-  exec 3<"$bin" || { echo "cannot open $bin" >&2; exit 1; }
+# Open a caller-supplied source file on fd 3 and check it there: a plain, executable
+# regular file owned by the invoking user (or root's when root itself calls). Every
+# check and the copy go through that descriptor, so the path cannot be swapped
+# between check and copy.
+open_owned_exec() {
+  local path=$1
+  [[ -n $path && ! -L $path ]] || { echo "$2 missing or a symlink: $path" >&2; exit 1; }
+  exec 3<"$path" || { echo "cannot open $path" >&2; exit 1; }
   local caller=${PKEXEC_UID:-${SUDO_UID:-0}}
   local st; st=$(stat -L -c '%u %F' /dev/fd/3)
-  [[ $st == "$caller regular file" && -x /dev/fd/3 ]] || { echo "refusing $bin: must be an executable regular file owned by uid $caller (got: $st)" >&2; exit 1; }
+  [[ $st == "$caller regular file" && -x /dev/fd/3 ]] || { echo "refusing $path: must be an executable regular file owned by uid $caller (got: $st)" >&2; exit 1; }
+}
+
+# Root-owned setgid copy of the daemon: the only thing allowed to read hidden webcams.
+# The source must be the invoking user's file: this publishes it setgid, so it must
+# not be pointed at someone else's file. The copy is 2750 root:camerad plus an ACL
+# granting rx to the invoking user only, so other local accounts cannot run it to
+# reach the hidden webcams (hiding a camera must not widen its audience).
+install_privileged_daemon() {
+  open_owned_exec "${1:-}" "irisd binary"
+  local caller=${PKEXEC_UID:-${SUDO_UID:-0}}
   getent group "$GROUP" >/dev/null || groupadd -r "$GROUP"
   install -d -m 755 "$LIBDIR"
   # install replaces the destination inode, so no stale ACL survives from a previous copy
   install -m 2750 -o root -g "$GROUP" /dev/fd/3 "$LIBDIR/irisd"
   exec 3<&-
   [[ $caller -eq 0 ]] || setfacl -m "u:$caller:rx" "$LIBDIR/irisd"
+}
+
+# Root-owned copy of this script (what the shell pkexecs), from the caller's copy.
+install_privileged_script() {
+  open_owned_exec "${1:-}" "iris-setup script"
+  install -d -m 755 "$LIBDIR"
+  install -m 755 -o root -g root /dev/fd/3 "$LIBDIR/iris-setup"
+  exec 3<&-
 }
 
 # udev match for one USB camera from our (validated) key "usb-<vid>-<pid>[-<serial>]".
@@ -213,15 +253,17 @@ cmd_refresh_daemon() {
 
 cmd_uninstall() {
   need_root
+  # Hide rules first: with them gone, reapply hands the webcams back to group video.
   rm -f "$RULES_DIR"/71-iris-hide-*.rules
   reapply || true
   systemctl disable --now iris-camera-device.service >/dev/null 2>&1 || true
-  rm -f "$UNIT" "$MODLOAD"
+  rm -f "$UNIT" "$MODLOAD" "$MODPROBE"
   systemctl daemon-reload
   local dev; dev=$(device_path)
   [[ -n $dev ]] && v4l2loopback-ctl delete "$dev" || true
   rm -rf "$LIBDIR"
-  echo "removed"
+  echo "removed: device, boot unit, hide rules, $LIBDIR"
+  echo "left in place: group $GROUP, ~/.config/iris/config.json, packages (v4l2loopback-dkms/-utils, onnxruntime); the module stays loaded until reboot"
 }
 
 cmd_status() {
@@ -233,10 +275,10 @@ cmd_status() {
 }
 
 case "${1:-}" in
-  install) cmd_install "${2:-}";;
+  install) cmd_install "${2:-}" "${3:-}";;
   uninstall) cmd_uninstall;;
   hide-raw) shift; cmd_hide_raw "$@";;
   refresh-daemon) cmd_refresh_daemon "${2:-}";;
   status) cmd_status;;
-  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
 esac

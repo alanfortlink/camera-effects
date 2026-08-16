@@ -3,9 +3,9 @@
   "id": "alanfortlink.iris",
   "name": "Iris",
   "version": "0.1.0",
-  "author": "tank",
+  "author": "alanfortlink",
   "license": "MIT",
-  "description": "Iris \u2014 system-wide camera effects (Center Stage, Portrait, Studio Light, Backgrounds, Reactions) exposed as the \"Iris Camera\" virtual webcam, with a Control-Center-style panel.",
+  "description": "System-wide camera effects (Center Stage, Portrait, Studio Light, Backgrounds, Reactions) exposed as the \"Iris Camera\" virtual webcam, with a Control-Center-style panel in the bar.",
   "kinds": [
     "service",
     "bar-widget"

@@ -42,6 +42,16 @@ Panel {
   // control (dropdown, slider, field) gets the same inset so they line up.
   readonly property int trailInset: Style.space(6)
   property bool pickerMissing: false
+  // The binary is there but nothing answered for a while: the daemon is stuck or
+  // unloadable (e.g. a library changed after a system update). Offer a rebuild.
+  property bool stalled: false
+  Timer {
+    interval: 10000
+    running: !!root.svc && root.svc.installed && !root.connected && !root.svc.setupBusy
+    onTriggered: root.stalled = true
+  }
+  onConnectedChanged: if (connected) stalled = false
+  readonly property bool needsRebuild: !!svc && svc.installed && !connected && (svc.daemonError !== "" || stalled)
 
   // The daemon does not say when a reaction is playing (a `reactionsActive`
   // field in its state would make this exact), so approximate: hide the
@@ -76,6 +86,8 @@ Panel {
     if (!svc) return "Service not loaded"
     if (svc.setupBusy) return "Working…"
     if (!svc.installed) return "Not installed"
+    if (svc.daemonError && !connected) return svc.daemonError
+    if (stalled && !connected) return "Daemon not responding"
     if (!connected) return "Starting…"
     if (svc.deviceMissing) return "Needs setup"
     if (svc.error) return svc.error
@@ -285,24 +297,30 @@ Panel {
           }
           Item { width: parent.width; height: Style.space(4) }  // hero → preview breathing room
 
-          // ---------- Not installed / needs setup ----------
+          // ---------- Not installed / needs setup / needs rebuild ----------
           Row {
             width: parent.width
             spacing: Style.space(8)
-            visible: root.svc && !root.svc.setupBusy && (!root.svc.installed || root.svc.deviceMissing)
+            visible: root.svc && !root.svc.setupBusy && (!root.svc.installed || root.svc.deviceMissing || root.needsRebuild)
             Button {
-              text: root.svc && !root.svc.installed ? "Install (build daemon)" : "Set up virtual camera"
+              text: root.svc && !root.svc.installed ? "Install (build daemon)"
+                  : root.needsRebuild ? "Rebuild daemon" : "Set up virtual camera"
               foreground: root.fg
               fontFamily: root.fontFamily
               bordered: true
-              onClicked: if (root.svc) root.svc.installed ? root.svc.runSetup("install") : root.svc.install()
+              onClicked: {
+                if (!root.svc) return
+                if (!root.svc.installed || root.needsRebuild) root.svc.install()
+                else root.svc.runSetup("install")
+              }
             }
           }
           Text {
             width: parent.width
-            visible: root.svc && root.svc.setupOutput !== ""
+            visible: root.svc && (root.svc.setupOutput !== "" || (root.needsRebuild && root.svc.daemonLog !== ""))
             wrapMode: Text.WordWrap
-            text: root.svc ? root.svc.setupOutput : ""
+            text: root.svc ? (root.svc.setupOutput !== "" ? root.svc.setupOutput
+                              : root.svc.daemonLog.trim().split("\n").slice(-3).join("\n")) : ""
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
