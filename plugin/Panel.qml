@@ -254,6 +254,25 @@ Panel {
     onExited: function(code) { pickProc.exitCode = code; pickProc.finish() }
   }
 
+  // Native colour chooser (zenity). GTK prints "rgb(r,g,b)" or "#rrggbb".
+  Process {
+    id: colorPickProc
+    property string initial: "#1e1e2e"
+    command: ["sh", "-c", 'command -v zenity >/dev/null 2>&1 || exit 127; exec zenity --color-selection --title="Background colour" --color="$1"', "camera-effects-pick", initial]
+    function begin(c) { if (running) return; initial = c; running = true }
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var t = String(text).trim(), hex = ""
+        var m = t.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/)
+        if (m) hex = "#" + [m[1], m[2], m[3]].map(function(v) { var h = Number(v).toString(16); return h.length < 2 ? "0" + h : h }).join("")
+        else if (/^#[0-9a-fA-F]{6}$/.test(t)) hex = t.toLowerCase()
+        else if (/^#[0-9a-fA-F]{12}$/.test(t)) hex = "#" + t.substr(1, 2) + t.substr(5, 2) + t.substr(9, 2)   // 16-bit per channel
+        if (hex !== "" && root.svc) root.svc.setSetting("backgroundColor", hex)
+      }
+    }
+    onExited: function(code) { if (code === 127) root.pickerMissing = true }
+  }
+
   // One compact settings row: label on the left, switch on the right.
   component SwitchRow: Item {
     id: sw
@@ -736,8 +755,16 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
                 placeholderText: "#1e1e2e"
-                text: root.s.backgroundColor || ""
-                onEditingFinished: if (root.svc && valid) root.svc.setSetting("backgroundColor", text)
+                // Not a binding: state pushes arrive several times a second and would
+                // overwrite what is being typed. Follow the setting only while unfocused.
+                Component.onCompleted: text = root.s.backgroundColor || ""
+                Connections { target: root; function onSChanged() { if (!colorField.activeFocus) colorField.text = root.s.backgroundColor || "" } }
+                onEditingFinished: {
+                  var t = text.trim()
+                  if (t !== "" && t[0] !== "#") t = "#" + t
+                  if (/^#[0-9a-fA-F]{3}$/.test(t)) t = "#" + t[1] + t[1] + t[2] + t[2] + t[3] + t[3]
+                  if (root.svc && /^#[0-9a-fA-F]{6}$/.test(t)) { text = t.toLowerCase(); root.svc.setSetting("backgroundColor", text) }
+                }
               }
               Dropdown {
                 id: bgDropdown
@@ -748,6 +775,40 @@ Panel {
                 value: root.s.background || "none"
                 onChanged: function(v) { if (root.svc) root.svc.setSetting("background", v) }
               }
+            }
+          }
+          Item {  // Background colour: preset swatches + native picker (own row, indented like the sliders)
+            visible: root.s.background === "color"
+            width: parent.width
+            height: root.rowH
+            Row {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(20)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
+              Repeater {
+                model: ["#000000", "#ffffff", "#1e1e2e", "#3b4252", "#1e5a8a", "#2e7d32", "#6a1b9a", "#b71c1c", "#e65100", "#00897b"]
+                delegate: Rectangle {
+                  required property string modelData
+                  width: Style.space(18); height: Style.space(18)
+                  radius: Style.space(4)
+                  color: modelData
+                  border.width: (root.s.backgroundColor || "").toLowerCase() === modelData ? 2 : 1
+                  border.color: (root.s.backgroundColor || "").toLowerCase() === modelData ? Color.accent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.35)
+                  MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: if (root.svc) root.svc.setSetting("backgroundColor", modelData) }
+                }
+              }
+            }
+            Button {
+              anchors.right: parent.right
+              anchors.rightMargin: root.trailInset
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Pick…"
+              foreground: root.fg
+              fontFamily: root.fontFamily
+              bordered: true
+              visible: !root.pickerMissing
+              onClicked: colorPickProc.begin(root.s.backgroundColor || "#1e1e2e")
             }
           }
           Item {  // Background image: elided file name + chooser (own row, indented like the sliders)
