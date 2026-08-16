@@ -1,5 +1,7 @@
 # Omarchy Camera — system-wide camera effects
 
+![Omarchy Camera panel](docs/panel.png)
+
 macOS-style camera effects for Omarchy: a background daemon reads your webcam,
 applies effects, and publishes the result as a virtual webcam called
 **"Omarchy Camera"** that every app (Chromium, Zoom, Discord, OBS, Firefox…)
@@ -31,13 +33,17 @@ in any app. `./install.sh --uninstall` reverses everything.
 
 ```bash
 # as an Omarchy plugin (clones into ~/.config/omarchy/plugins/tank.camera):
-omarchy plugin add <this repo> --enable
-#   then click "Install (build daemon)" in the panel — it builds camfxd, installs the
-#   user half and asks for your password once to create the virtual camera device.
+omarchy plugin add https://github.com/<you>/camera_effects.git --enable
+#   the bar shows a camera icon; open it and click "Install (build daemon)": it installs the
+#   build deps if missing, builds camfxd, installs the user half under ~/.local, and asks for
+#   your password once to create the virtual camera device (and again per "hide raw" toggle).
 
 # or from a checkout:
-./install.sh          # builds, installs to ~/.local, enables the plugin, creates the device (password)
+./install.sh          # same thing non-interactively (asks for the password via sudo/pkexec)
 ```
+
+`omarchy plugin update tank.camera` fast-forwards the checkout; run `./install.sh --no-root`
+(or the panel's Install button) afterwards to rebuild the daemon.
 
 Requirements (all in Omarchy already): `opencv`, `onnxruntime`, `pipewire`,
 `v4l2loopback-dkms` (+ `v4l2loopback-utils`, installed by setup), `qt6-multimedia`.
@@ -82,6 +88,13 @@ camfxd preview on|off               # keep the pipeline running without a consum
 camfxd profile on                   # per-stage timings in `status`
 omarchy-shell tank.camera toggle    # open/close the panel (bind it to a key)
 ```
+
+## Publishing (Omarchy shell plugin conventions)
+
+The repo root *is* the plugin: `manifest.json` (id `tank.camera`, kinds `service` +
+`bar-widget`, entry points under `plugin/`), no symlinks, `omarchy plugin validate .`
+passes. Push it to a public git repo and list it at omarchyplugins.com. Bump
+`version` in `manifest.json` for releases; users update with `omarchy plugin update`.
 
 ## Notes / limits
 
