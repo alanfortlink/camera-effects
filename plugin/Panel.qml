@@ -411,7 +411,7 @@ Panel {
                 // Keep the preview a mirror view of yourself whatever the
                 // output setting is: undo the flip only when the feed
                 // itself is already mirrored.
-                item.mirror = Qt.binding(function() { return !!root.s.mirror })
+                item.mirror = Qt.binding(function() { return !!root.s.mirror || root.blocked })  // the placeholder card must not be shown mirrored
               }
             }
             // Black until the daemon delivers its first live frame.
@@ -689,10 +689,10 @@ Panel {
               anchors.right: parent.right
               anchors.rightMargin: root.trailInset
               anchors.verticalCenter: parent.verticalCenter
-              width: Style.space(120)
+              width: Style.space(132)
               showLabel: false
               fontFamily: root.fontFamily
-              options: [ { value: "card", label: "Built-in card" }, { value: "image", label: "Image" }, { value: "video", label: "Video" } ]
+              options: [ { value: "card", label: "Camera-off card" }, { value: "image", label: "Image" }, { value: "video", label: "Video" } ]
               value: root.blockKind
               onChanged: function(v) {
                 if (!root.svc) return
