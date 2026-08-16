@@ -1,19 +1,38 @@
 #pragma once
 #include <opencv2/core.hpp>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
+
+// Process-wide credential lock. When running setgid (hide-raw mode) the
+// effective gid differs from the user's, which makes /proc/<pid>/fd of the
+// user's other processes unreadable; the consumer scan (loopback.cpp) drops to
+// the real gid for its duration under this lock, and everything that needs the
+// privileged gid (opening or probing a raw camera, below) holds it meanwhile.
+extern std::mutex g_credMutex;
 
 struct CameraInfo {
   std::string path;     // /dev/videoN
   std::string name;     // card name
   std::string bus;      // bus_info (stable across reboots for the same port)
-  std::string key;      // "usb-<vid>-<pid>-<serial>" for USB cameras (used for per-camera hide rules), else ""
+  std::string key;      // "usb-<vid>-<pid>[-<serial>]" for USB cameras (used for per-camera hide rules), else ""
+                        // vid/pid are 4 hex digits; the serial is included only if it is [A-Za-z0-9._]{1,64}
 };
 
-// Enumerate real capture-capable cameras. Skips metadata nodes, non-capture
-// nodes and the given loopback path. One entry per physical device.
-std::vector<CameraInfo> enumerateCameras(const std::string& excludePath);
+// Enumerates real capture-capable cameras: one entry per physical device,
+// skipping virtual (loopback) devices, metadata and non-capture nodes.
+// Nodes are listed from sysfs; a node is opened (VIDIOC_QUERYCAP) only the
+// first time it is seen, so idle rescans do not wake cameras from autosuspend.
+class CameraEnumerator {
+public:
+  std::vector<CameraInfo> scan();
+
+private:
+  struct Probe { std::string ident; bool isCamera = false; CameraInfo info; };
+  std::map<std::string, Probe> cache_;  // /dev/videoN -> result of the last probe
+};
 
 // Test/dev source: loops a video file or shows a still image at a fixed rate.
 class FileCapture {

@@ -8,6 +8,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <limits.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -30,68 +32,110 @@ static std::string fourccStr(unsigned f) {
   return s;
 }
 
+std::mutex g_credMutex;
+
 // Identify a USB camera by vendor/product/serial from sysfs so udev rules and
 // settings can refer to the physical unit rather than /dev/videoN.
 static std::string readSysAttr(const std::string& p) {
   std::ifstream f(p);
   std::string v;
   std::getline(f, v);
-  while (!v.empty() && (v.back() == '\n' || v.back() == ' ')) v.pop_back();
-  for (auto& c : v) if (c == '/' || c == ' ') c = '_';
+  while (!v.empty() && (v.back() == '\n' || v.back() == '\r' || v.back() == ' ')) v.pop_back();
   return v;
+}
+static bool isHex4(const std::string& s) {
+  if (s.size() != 4) return false;
+  for (char c : s) if (!isxdigit((unsigned char)c)) return false;
+  return true;
+}
+// The key ends up in a udev rule and a file name (root, via the setup script),
+// so it is built only from characters that are safe there. The setup script
+// re-validates it with the same rule; a serial that does not fit is dropped.
+static bool isSafeSerial(const std::string& s) {
+  if (s.empty() || s.size() > 64) return false;
+  for (char c : s) if (!(isalnum((unsigned char)c) || c == '.' || c == '_')) return false;
+  return true;
 }
 static std::string usbKeyFor(const std::string& node) {
   std::string base = "/sys/class/video4linux/" + node + "/device/../";
   std::string vid = readSysAttr(base + "idVendor"), pid = readSysAttr(base + "idProduct");
-  if (vid.empty() || pid.empty()) return "";
+  if (!isHex4(vid) || !isHex4(pid)) return "";
   std::string serial = readSysAttr(base + "serial");
-  return "usb-" + vid + "-" + pid + (serial.empty() ? "" : "-" + serial);
+  return "usb-" + vid + "-" + pid + (isSafeSerial(serial) ? "-" + serial : "");
 }
 
-std::vector<CameraInfo> enumerateCameras(const std::string& excludePath) {
+// Open the node once and decide whether it is a real capture camera.
+enum class ProbeResult { NoAccess, NotCamera, Camera };
+static ProbeResult probeCamera(const std::string& path, const std::string& node, CameraInfo& info) {
+  int fd = ::open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) return ProbeResult::NoAccess;
+  v4l2_capability cap{};
+  if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) { ::close(fd); return ProbeResult::NotCamera; }
+  unsigned caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
+  if (!(caps & V4L2_CAP_VIDEO_CAPTURE) || !(caps & V4L2_CAP_STREAMING) || (caps & V4L2_CAP_META_CAPTURE)) { ::close(fd); return ProbeResult::NotCamera; }
+  // A node without any capture pixel format is a metadata/control node.
+  v4l2_fmtdesc fd_desc{};
+  fd_desc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  bool hasFmt = xioctl(fd, VIDIOC_ENUM_FMT, &fd_desc) == 0;
+  ::close(fd);
+  if (!hasFmt) return ProbeResult::NotCamera;
+  // Loopback devices (ours or OBS's) are outputs of other software, not cameras.
+  if (strncmp((const char*)cap.driver, "v4l2 loopback", 13) == 0) return ProbeResult::NotCamera;
+  info = CameraInfo{ path, (const char*)cap.card, (const char*)cap.bus_info, usbKeyFor(node) };
+  return ProbeResult::Camera;
+}
+
+std::vector<CameraInfo> CameraEnumerator::scan() {
   std::vector<CameraInfo> out;
-  std::map<std::string, int> seenBus;  // bus -> index in out
-  DIR* d = opendir("/dev");
+  DIR* d = opendir("/sys/class/video4linux");
   if (!d) return out;
-  std::vector<std::string> names;
+  std::vector<std::string> nodes;
   while (dirent* e = readdir(d)) {
-    if (strncmp(e->d_name, "video", 5) == 0) names.push_back(e->d_name);
+    if (strncmp(e->d_name, "video", 5) == 0) nodes.push_back(e->d_name);
   }
   closedir(d);
   // Sort numerically so /dev/video0 comes before /dev/video10.
-  std::sort(names.begin(), names.end(), [](const std::string& a, const std::string& b) {
+  std::sort(nodes.begin(), nodes.end(), [](const std::string& a, const std::string& b) {
     return atoi(a.c_str() + 5) < atoi(b.c_str() + 5);
   });
-  for (const auto& n : names) {
-    std::string path = "/dev/" + n;
-    if (path == excludePath) continue;
-    int fd = ::open(path.c_str(), O_RDWR | O_NONBLOCK);
-    if (fd < 0) continue;
-    v4l2_capability cap{};
-    if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) { ::close(fd); continue; }
-    unsigned caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
-    if (!(caps & V4L2_CAP_VIDEO_CAPTURE) || !(caps & V4L2_CAP_STREAMING)) { ::close(fd); continue; }
-    if (caps & V4L2_CAP_META_CAPTURE) { ::close(fd); continue; }
-    // A node without any capture pixel format is a metadata/control node.
-    v4l2_fmtdesc fd_desc{};
-    fd_desc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    bool hasFmt = xioctl(fd, VIDIOC_ENUM_FMT, &fd_desc) == 0;
-    ::close(fd);
-    if (!hasFmt) continue;
-    // Skip loopback devices in general (ours or OBS's): they are outputs of
-    // other software, not physical cameras.
-    if (strncmp((const char*)cap.driver, "v4l2 loopback", 13) == 0) continue;
-    CameraInfo ci{ path, (const char*)cap.card, (const char*)cap.bus_info, usbKeyFor(n) };
-    if (seenBus.count(ci.bus)) continue;
-    seenBus[ci.bus] = (int)out.size();
-    out.push_back(ci);
+  std::map<std::string, Probe> fresh;
+  std::map<std::string, int> seenBus;
+  std::lock_guard<std::mutex> credLk(g_credMutex);
+  for (const auto& node : nodes) {
+    std::string sys = "/sys/class/video4linux/" + node;
+    std::string path = "/dev/" + node;
+    // Virtual (loopback) devices have no physical parent: skip without opening.
+    char real[PATH_MAX];
+    if (!realpath((sys + "/device").c_str(), real) || strstr(real, "/devices/virtual/")) continue;
+    struct stat st{};
+    if (stat(path.c_str(), &st) != 0 || !S_ISCHR(st.st_mode)) continue;
+    // Identity of what sits behind /dev/videoN: reprobe only when it changes.
+    std::string ident = readSysAttr(sys + "/name") + "|" + real + "|" + std::to_string(st.st_rdev);
+    Probe pr;
+    auto it = cache_.find(path);
+    if (it != cache_.end() && it->second.ident == ident) pr = it->second;
+    else {
+      pr.ident = ident;
+      ProbeResult r = probeCamera(path, node, pr.info);
+      // Not cached when the open itself failed (e.g. udev has not applied the
+      // ACL yet): retry on the next scan.
+      if (r == ProbeResult::NoAccess) continue;
+      pr.isCamera = r == ProbeResult::Camera;
+    }
+    fresh[path] = pr;
+    if (!pr.isCamera) continue;
+    if (seenBus.count(pr.info.bus)) continue;
+    seenBus[pr.info.bus] = (int)out.size();
+    out.push_back(pr.info);
   }
+  cache_.swap(fresh);
   return out;
 }
 
 bool V4L2Capture::open(const std::string& path, int w, int h, int fps, std::string* err) {
   close();
-  fd_ = ::open(path.c_str(), O_RDWR | O_NONBLOCK);
+  std::lock_guard<std::mutex> credLk(g_credMutex);  // needs the privileged gid for hidden cameras
+  fd_ = ::open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
   if (fd_ < 0) { if (err) *err = std::string("open: ") + strerror(errno); return false; }
   path_ = path;
 
@@ -118,7 +162,9 @@ bool V4L2Capture::open(const std::string& path, int w, int h, int fps, std::stri
   width_ = fmt.fmt.pix.width; height_ = fmt.fmt.pix.height; pixfmt_ = fmt.fmt.pix.pixelformat;
   fourcc_ = fourccStr(pixfmt_);
   if (pixfmt_ != V4L2_PIX_FMT_MJPEG && pixfmt_ != V4L2_PIX_FMT_YUYV && pixfmt_ != V4L2_PIX_FMT_NV12 && pixfmt_ != V4L2_PIX_FMT_UYVY) {
-    if (err) *err = "unsupported pixel format " + fourcc_; close(); return false;
+    if (err) *err = "unsupported pixel format " + fourcc_;
+    close();
+    return false;
   }
 
   v4l2_streamparm parm{};

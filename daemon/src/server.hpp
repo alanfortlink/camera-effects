@@ -19,7 +19,6 @@ public:
 
 private:
   void run();
-  void serveClient(int fd);
   std::string path_;
   int listenFd_ = -1;
   Handler handler_;

@@ -1,6 +1,8 @@
 #pragma once
+#include <atomic>
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <opencv2/core.hpp>
 #include <string>
 #include <vector>
@@ -27,6 +29,9 @@ struct Settings {
   }
 };
 
+// Parses "#RRGGBB" (exactly 6 hex digits). Returns false on anything else.
+bool parseHexColor(const std::string& s, unsigned& rgb);
+
 // Center Stage: keeps the people in frame by choosing a crop of the (larger)
 // source frame and easing towards it.
 class Framer {
@@ -44,12 +49,13 @@ private:
   double maxZoom_ = 2.2;
 };
 
-// Emoji particle overlays.
+// Emoji particle overlays. trigger() may be called from any thread; it only
+// queues. Everything else runs on the frame (main) thread.
 class Reactions {
 public:
   bool loadAssets(const std::string& dir, std::string* err);
   void trigger(const std::string& name);  // hearts|thumbsup|thumbsdown|balloons|confetti|fireworks|rain|lasers
-  bool active() const { return !anims_.empty(); }
+  bool active();                          // something playing or queued
   void render(cv::Mat& frame, double now);
   static const std::vector<std::string>& names();
 
@@ -58,6 +64,9 @@ private:
   struct Anim { std::string name; double start; std::vector<Particle> parts; };
   std::map<std::string, cv::Mat> sprites_;  // BGRA
   std::vector<Anim> anims_;
+  std::mutex pendingMu_;
+  std::vector<std::string> pending_;        // triggered, not yet started (drained by render)
+  void drainPending();
   void spawn(Anim& a, const cv::Size& sz);
   void blit(cv::Mat& frame, const cv::Mat& sprite, double cx, double cy, double size, double alpha, double rot);
   cv::Mat overlay_, overlayA_;  // procedural drawing layer + alpha, composited once per frame
@@ -70,11 +79,13 @@ public:
   Settings settings() const { return settings_; }
   // Processes a source frame into an output of the given size.
   void process(const cv::Mat& src, cv::Mat& out, const cv::Size& outSize, double now);
+  // Thread-safe (queued); everything else is main-thread only.
   void triggerReaction(const std::string& name) { reactions_.trigger(name); }
-  bool reactionsActive() const { return reactions_.active(); }
+  void setProfile(bool on) { profile_ = on; }
+  // Main thread only.
+  bool reactionsActive() { return reactions_.active(); }
   std::string lastGesture() const { return gestures_.lastGesture(); }
   std::string modelStatus() const { return modelStatus_; }
-  void setProfile(bool on) { profile_ = on; }
   std::string profileLine() const { return profileLine_; }
 
 private:
@@ -91,7 +102,7 @@ private:
   cv::Size bgImageSize_;
   std::vector<cv::Rect2f> lastFaces_;
   int frameIdx_ = 0;
-  bool profile_ = false;
+  std::atomic<bool> profile_{false};
   std::string profileLine_;
   double profAcc_[8] = {0};
   int profN_ = 0;

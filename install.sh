@@ -45,14 +45,20 @@ if command -v omarchy-plugin-enable >/dev/null; then
 fi
 
 if [[ ${1:-} != --no-root ]]; then
+  # Creates the device (now + at boot) and installs the root-owned copy of the
+  # setup script that the shell pkexecs from then on.
   echo "› creating the virtual camera (root)"
   privileged install
 fi
 # A "hide raw camera" rule means the shell runs the root-owned setgid copy of the
-# daemon; refresh it so it matches the build we just installed.
+# daemon; refresh it so it matches the build we just installed (rules untouched).
 if ls /etc/udev/rules.d/71-omarchy-camera-hide-*.rules >/dev/null 2>&1; then
-  echo "› refreshing the privileged daemon copy (root)"
-  privileged hide-raw on "$LIB/camfxd" || true
+  if [[ ${1:-} != --no-root ]] || sudo -n true 2>/dev/null; then
+    echo "› refreshing the privileged daemon copy (root)"
+    privileged refresh-daemon "$LIB/camfxd" || true
+  else
+    echo "› note: cameras are hidden, so the shell runs the privileged daemon copy; run: sudo $LIB/omarchy-camera-setup refresh-daemon $LIB/camfxd"
+  fi
 fi
 
 echo "done. The Camera icon appears in the bar (reload the shell with: omarchy-shell reload, or log out/in)."

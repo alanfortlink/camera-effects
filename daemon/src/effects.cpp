@@ -10,6 +10,22 @@
 #include <cstdio>
 #include <cstdlib>
 
+bool parseHexColor(const std::string& s, unsigned& rgb) {
+  if (s.size() != 7 || s[0] != '#') return false;
+  unsigned v = 0;
+  for (size_t i = 1; i < 7; i++) {
+    char c = s[i];
+    unsigned d;
+    if (c >= '0' && c <= '9') d = c - '0';
+    else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+    else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+    else return false;
+    v = v * 16 + d;
+  }
+  rgb = v;
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Framer (Center Stage)
 
@@ -80,9 +96,26 @@ bool Reactions::loadAssets(const std::string& dir, std::string* err) {
 
 void Reactions::trigger(const std::string& name) {
   if (std::find(names().begin(), names().end(), name) == names().end()) return;
-  for (auto& a : anims_) if (a.name == name) return;  // already playing
-  Anim a; a.name = name; a.start = -1;  // spawned lazily on first render (needs frame size)
-  anims_.push_back(a);
+  std::lock_guard<std::mutex> lk(pendingMu_);
+  if (std::find(pending_.begin(), pending_.end(), name) == pending_.end()) pending_.push_back(name);
+}
+
+bool Reactions::active() {
+  if (!anims_.empty()) return true;
+  std::lock_guard<std::mutex> lk(pendingMu_);
+  return !pending_.empty();
+}
+
+void Reactions::drainPending() {
+  std::vector<std::string> names;
+  { std::lock_guard<std::mutex> lk(pendingMu_); names.swap(pending_); }
+  for (auto& name : names) {
+    bool playing = false;
+    for (auto& a : anims_) if (a.name == name) playing = true;
+    if (playing) continue;
+    Anim a; a.name = name; a.start = -1;  // spawned lazily on first render (needs frame size)
+    anims_.push_back(a);
+  }
 }
 
 namespace {
@@ -124,7 +157,7 @@ void Reactions::spawn(Anim& a, const cv::Size& sz) {
 }
 
 void Reactions::blit(cv::Mat& frame, const cv::Mat& sprite, double cx, double cy, double size, double alpha, double rot) {
-  if (size < 2 || alpha <= 0.01) return;
+  if (sprite.empty() || size < 2 || alpha <= 0.01) return;  // empty: asset missing
   double s = size / std::max(sprite.cols, sprite.rows);
   cv::Mat sp;
   cv::Size dst((int)std::max(1.0, sprite.cols * s), (int)std::max(1.0, sprite.rows * s));
@@ -179,6 +212,7 @@ void Reactions::render(cv::Mat& frame, double now) {
     cv::circle(overlayA_, c, r, cv::Scalar(a), -1, cv::LINE_AA);
   };
 
+  drainPending();
   for (auto& a : anims_) {
     if (a.start < 0) { a.start = now; spawn(a, frame.size()); }
     double t = now - a.start;
@@ -318,7 +352,7 @@ void EffectPipeline::ensureBackground(const cv::Size& sz) {
   } else if (settings_.background == "color") {
     unsigned rgb = 0x1e1e2e;
     const std::string& c = settings_.backgroundColor;
-    if (c.size() == 7 && c[0] == '#') rgb = std::stoul(c.substr(1), nullptr, 16);
+    parseHexColor(c, rgb);  // validated when the setting is read; default if not
     cv::Scalar col((rgb) & 0xff, (rgb >> 8) & 0xff, (rgb >> 16) & 0xff);
     if (bgImage_.empty() || bgImageSize_ != sz || bgImagePath_ != c) {
       bgImage_ = cv::Mat(sz, CV_8UC3, col);

@@ -62,7 +62,11 @@ Requirements (all in Omarchy already): `opencv`, `onnxruntime`, `pipewire`,
   root-owned setgid copy of the daemon at `/usr/local/lib/omarchy-camera/camfxd`,
   so apps can only see "Omarchy Camera". With several cameras you get one switch
   for all of them plus one per USB camera (matched by vendor/product/serial).
-  Toggling off restores everything.
+  Toggling off restores everything. This is a courtesy boundary for well-behaved
+  apps (they no longer list the raw camera), not protection against malware
+  running as your user. The privileged half is `omarchy-camera-setup`; `install`
+  puts a root-owned copy in `/usr/local/lib/omarchy-camera/` which the shell uses
+  for every later password prompt (re-run `./install.sh` to update it).
 - With several cameras the panel has a picker for the source and a "Same effects
   on every camera" switch; off, each camera keeps its own effect settings.
 - Settings persist per user in `~/.config/omarchy/camera.json`.

@@ -15,9 +15,10 @@ bool ControlServer::start(const std::string& socketPath, Handler handler, std::s
   stop();
   path_ = socketPath;
   handler_ = std::move(handler);
+  sockaddr_un addr{};
+  if (path_.size() >= sizeof(addr.sun_path)) { if (err) *err = "socket path too long: " + path_; return false; }
   listenFd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
   if (listenFd_ < 0) { if (err) *err = strerror(errno); return false; }
-  sockaddr_un addr{};
   addr.sun_family = AF_UNIX;
   strncpy(addr.sun_path, path_.c_str(), sizeof(addr.sun_path) - 1);
   unlink(path_.c_str());
@@ -32,13 +33,11 @@ void ControlServer::stop() {
   stop_ = true;
   if (thread_.joinable()) thread_.join();
   if (listenFd_ >= 0) {
-    // Only remove the socket file if it is still ours (a newer instance may
-    // have replaced it while we were shutting down).
-    struct stat a{}, b{};
-    bool ours = fstat(listenFd_, &a) == 0 && stat(path_.c_str(), &b) == 0 && a.st_ino == b.st_ino && a.st_dev == b.st_dev;
+    // The socket file is ours to remove: the daemon holds the instance lock
+    // until it exits, so no newer instance can have bound this path yet.
     close(listenFd_);
     listenFd_ = -1;
-    if (ours) unlink(path_.c_str());
+    unlink(path_.c_str());
   }
   std::lock_guard<std::mutex> lk(mu_);
   for (int fd : clients_) close(fd);
@@ -61,6 +60,7 @@ void ControlServer::broadcast(const std::string& line) {
 }
 
 void ControlServer::run() {
+  const size_t kMaxRequest = 64 * 1024;
   std::map<int, std::string> buffers;
   while (!stop_) {
     std::vector<pollfd> pfds;
@@ -95,6 +95,13 @@ void ControlServer::run() {
       }
       std::string& acc = buffers[fd];
       acc.append(buf, n);
+      if (acc.size() > kMaxRequest) {  // no newline in 64 KiB: not a client we understand
+        std::lock_guard<std::mutex> lk(mu_);
+        clients_.erase(std::remove(clients_.begin(), clients_.end(), fd), clients_.end());
+        buffers.erase(fd);
+        close(fd);
+        continue;
+      }
       size_t pos;
       while ((pos = acc.find('\n')) != std::string::npos) {
         std::string line = acc.substr(0, pos);

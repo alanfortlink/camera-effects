@@ -8,6 +8,10 @@ Item {
   id: root
   property string deviceLabel: "Omarchy Camera"
   property string devicePath: ""
+  // True when the daemon already mirrors the output (settings.mirror). The
+  // preview always shows you a mirror view of yourself, so it flips the feed
+  // itself only when the feed is not mirrored already.
+  property bool mirror: false
   readonly property bool ready: cam.active && vo.videoSink && vo.videoSink.videoSize.width > 0
 
   MediaDevices { id: devs }
@@ -35,8 +39,8 @@ Item {
     id: vo
     anchors.fill: parent
     fillMode: VideoOutput.PreserveAspectCrop
-    // Mirror like a real mirror; the feed apps get is not mirrored.
-    transform: Scale { origin.x: vo.width / 2; xScale: -1 }
+    // Mirror like a real mirror, whatever the output setting is.
+    transform: Scale { origin.x: vo.width / 2; xScale: root.mirror ? 1 : -1 }
   }
 
   // The loopback only shows up in Qt's device list once the daemon has

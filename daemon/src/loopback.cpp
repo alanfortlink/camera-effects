@@ -1,5 +1,7 @@
 #include "loopback.hpp"
 
+#include "capture.hpp"  // g_credMutex
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -91,9 +93,8 @@ void ConsumerWatcher::stop() {
 
 // Count fds on the device across all processes except ourselves. Only
 // processes of our own uid are readable anyway; that is also exactly the set
-// that can open the loopback (apps of the logged-in user).
-std::mutex g_credMutex;
-
+// that can open the loopback (apps of the logged-in user). When running
+// setgid the scan drops to the real gid for its duration (see g_credMutex).
 int ConsumerWatcher::scanProc() {
   struct stat target{};
   if (stat(path_.c_str(), &target) != 0) return 0;

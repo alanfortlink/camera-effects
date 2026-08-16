@@ -9,6 +9,7 @@
 #include <pwd.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -72,82 +73,17 @@ void settingsFromJson(const json& j, Settings& s) {
   gets("background", s.background); gets("backgroundImage", s.backgroundImage); gets("backgroundColor", s.backgroundColor);
   getb("reactions", s.reactions); getb("mirror", s.mirror);
   if (s.background != "none" && s.background != "image" && s.background != "color") s.background = "none";
-}
-
-// ---------------------------------------------------------------------------
-// v4l2loopback control (root): create/remove the virtual camera device.
-
-struct v4l2_loopback_config {
-  int32_t output_nr;
-  int32_t unused;
-  char card_label[32];
-  uint32_t min_width, max_width, min_height, max_height;
-  int32_t max_buffers;
-  int32_t max_openers;
-  int32_t debug;
-  int32_t announce_all_caps;
-};
-#define V4L2LOOPBACK_CTL_ADD _IOW('~', 1, struct v4l2_loopback_config)
-#define V4L2LOOPBACK_CTL_REMOVE _IOW('~', 2, uint32_t)
-
-int cmdDevice(int argc, char** argv) {
-  std::string op = argc > 0 ? argv[0] : "";
-  int nr = 20;
-  std::string label = "Omarchy Camera";
-  for (int i = 1; i < argc; i++) {
-    std::string a = argv[i];
-    if (a == "--nr" && i + 1 < argc) nr = atoi(argv[++i]);
-    else if (a == "--label" && i + 1 < argc) label = argv[++i];
-  }
-  if (op == "add") {
-    std::string existing = findLoopbackByLabel(label);
-    if (!existing.empty()) { printf("%s\n", existing.c_str()); return 0; }
-    if (!fileExists("/dev/v4l2loopback")) {
-      if (system("modprobe v4l2loopback") != 0 || !fileExists("/dev/v4l2loopback")) { fprintf(stderr, "v4l2loopback module not available\n"); return 1; }
-    }
-    int fd = open("/dev/v4l2loopback", O_RDWR);
-    if (fd < 0) { perror("open /dev/v4l2loopback"); return 1; }
-    v4l2_loopback_config cfg{};
-    cfg.output_nr = nr;
-    cfg.unused = -1;
-    strncpy(cfg.card_label, label.c_str(), sizeof(cfg.card_label) - 1);
-    cfg.max_openers = 16;
-    cfg.max_buffers = 4;
-    cfg.announce_all_caps = 0;  // == exclusive_caps=1: looks like a capture device only while we feed it
-    int r = ioctl(fd, V4L2LOOPBACK_CTL_ADD, &cfg);
-    close(fd);
-    if (r < 0) { perror("V4L2LOOPBACK_CTL_ADD"); return 1; }
-    printf("/dev/video%d\n", r);
-    return 0;
-  }
-  if (op == "remove") {
-    std::string path = findLoopbackByLabel(label);
-    if (path.empty()) return 0;
-    int n = atoi(path.c_str() + strlen("/dev/video"));
-    int fd = open("/dev/v4l2loopback", O_RDWR);
-    if (fd < 0) { perror("open /dev/v4l2loopback"); return 1; }
-    uint32_t dev = n;
-    int r = ioctl(fd, V4L2LOOPBACK_CTL_REMOVE, &dev);
-    close(fd);
-    if (r < 0) { perror("V4L2LOOPBACK_CTL_REMOVE"); return 1; }
-    return 0;
-  }
-  if (op == "find") {
-    std::string path = findLoopbackByLabel(label);
-    if (path.empty()) return 1;
-    printf("%s\n", path.c_str());
-    return 0;
-  }
-  fprintf(stderr, "usage: camfxd device add|remove|find [--nr N] [--label NAME]\n");
-  return 2;
+  unsigned rgb;
+  if (!parseHexColor(s.backgroundColor, rgb)) s.backgroundColor = Settings().backgroundColor;
 }
 
 // ---------------------------------------------------------------------------
 // Client mode: talk to a running daemon.
 
 int cmdClient(const std::string& sockPath, const std::string& request, bool wait) {
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   sockaddr_un addr{};
+  if (sockPath.size() >= sizeof(addr.sun_path)) { fprintf(stderr, "socket path too long: %s\n", sockPath.c_str()); return 1; }
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   addr.sun_family = AF_UNIX;
   strncpy(addr.sun_path, sockPath.c_str(), sizeof(addr.sun_path) - 1);
   if (connect(fd, (sockaddr*)&addr, sizeof addr) < 0) { fprintf(stderr, "daemon not running (%s)\n", sockPath.c_str()); return 1; }
@@ -192,14 +128,19 @@ void loadConfig(Config& c) {
   if (!f) return;
   try {
     json j = json::parse(f);
-    if (j.contains("loopback") && j["loopback"].contains("label")) c.label = j["loopback"]["label"];
+    if (j.contains("loopback") && j["loopback"].is_object() && j["loopback"].contains("label") && j["loopback"]["label"].is_string()) c.label = j["loopback"]["label"];
+    // Sizes/fps are hand-editable: accept only numbers in a sane range.
+    auto geti = [](const json& o, const char* k, int& v, int lo, int hi) {
+      if (o.is_object() && o.contains(k) && o[k].is_number()) v = std::clamp(o[k].get<int>(), lo, hi);
+    };
     if (j.contains("output")) {
-      auto& o = j["output"];
-      if (o.contains("width")) c.outW = o["width"]; if (o.contains("height")) c.outH = o["height"]; if (o.contains("fps")) c.fps = o["fps"];
+      geti(j["output"], "width", c.outW, 160, 4096);
+      geti(j["output"], "height", c.outH, 120, 4096);
+      geti(j["output"], "fps", c.fps, 1, 120);
     }
     if (j.contains("capture")) {
-      auto& o = j["capture"];
-      if (o.contains("width")) c.capW = o["width"]; if (o.contains("height")) c.capH = o["height"];
+      geti(j["capture"], "width", c.capW, 160, 4096);
+      geti(j["capture"], "height", c.capH, 120, 4096);
     }
     if (j.contains("camera") && j["camera"].is_string()) c.preferredCamera = j["camera"];
     if (j.contains("settings")) settingsFromJson(j["settings"], c.settings);
@@ -241,23 +182,35 @@ private:
   LoopbackWriter loop_;
   PipeWireOutput pwOut_;
   std::atomic<bool> pwActive_{false};
-  std::string pwStatus_ = "off";
   ConsumerWatcher watcher_;
   ControlServer server_;
+  CameraEnumerator enumerator_;
   V4L2Capture cap_;
   FileCapture file_;   // dev/test source when the selected "camera" is a file path
   bool useFile_ = false;
-  std::vector<CameraInfo> cameras_;
-  CameraInfo current_;
   std::atomic<int> consumers_{0};
   std::atomic<bool> stateDirty_{true};
+  // State shown to clients. Written by the main thread and read by the
+  // server thread (stateJson): every write happens under mu_.
+  std::vector<CameraInfo> cameras_;
+  CameraInfo current_;
   bool running_ = false;
   double fps_ = 0;
   double procMs_ = 0;   // EMA of per-frame processing time
-  std::string error_, loopPath_, statePath_, runtimeDir_;
+  std::string error_, loopPath_, pwStatus_ = "off", gesture_, profileLine_;
   bool forcePreview_ = false;  // keep running even without consumers (debug)
   bool hideRawActive_ = false;
+  std::string runtimeDir_;
+  int misses_ = 0;      // consecutive grab timeouts
 
+  // Set a client-visible field (main thread) and mark the state dirty if it changed.
+  template <class T> void setState(T& field, const T& value) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (field == value) return;
+    field = value;
+    stateDirty_ = true;
+  }
+  void setError(const std::string& e) { setState(error_, e); }
   json stateJson();
   void publishState();
   // Settings that apply to the current camera (global when sameForAll).
@@ -309,8 +262,8 @@ json Daemon::stateJson() {
                { "settings", settingsToJson(effectiveSettings()) },
                { "sameForAll", cfg_.sameForAll },
                { "models", fx_.modelStatus() },
-               { "gesture", fx_.lastGesture() },
-               { "profile", fx_.profileLine() },
+               { "gesture", gesture_ },
+               { "profile", profileLine_ },
                { "reactions", Reactions::names() },
                { "hideRaw", hideRawActive_ },
                { "error", error_ } };
@@ -319,16 +272,11 @@ json Daemon::stateJson() {
 void Daemon::publishState() {
   json j;
   { std::lock_guard<std::mutex> lk(mu_); j = stateJson(); }
-  std::string s = j.dump();
-  server_.broadcast(s);
-  std::string tmp = statePath_ + ".tmp";
-  { std::ofstream f(tmp); f << s << "\n"; }
-  rename(tmp.c_str(), statePath_.c_str());
+  server_.broadcast(j.dump());
 }
 
 void Daemon::rescanCameras() {
-  std::vector<CameraInfo> cams;
-  { std::lock_guard<std::mutex> credLk(g_credMutex); cams = enumerateCameras(loopPath_); }
+  std::vector<CameraInfo> cams = enumerator_.scan();
   std::lock_guard<std::mutex> lk(mu_);
   if (cams.size() != cameras_.size()) stateDirty_ = true;
   else for (size_t i = 0; i < cams.size(); i++) if (cams[i].path != cameras_[i].path) { stateDirty_ = true; break; }
@@ -348,13 +296,12 @@ bool Daemon::openCapture(std::string* err) {
     if (!file_.open(pref, cfg_.fps, err)) return false;
     useFile_ = true;
     std::lock_guard<std::mutex> lk(mu_);
-    current_ = CameraInfo{ pref, "File: " + pref.substr(pref.rfind('/') + 1), pref };
+    current_ = CameraInfo{ pref, "File: " + pref.substr(pref.rfind('/') + 1), pref, "" };
     return true;
   }
   useFile_ = false;
   CameraInfo c = pickCamera();
   if (c.path.empty()) { *err = "no camera found"; return false; }
-  std::lock_guard<std::mutex> credLk(g_credMutex);
   if (!cap_.open(c.path, cfg_.capW, cfg_.capH, cfg_.fps, err)) return false;
   std::lock_guard<std::mutex> lk(mu_);
   current_ = c;
@@ -364,51 +311,79 @@ bool Daemon::captureOpen() const { return useFile_ ? file_.isOpen() : cap_.isOpe
 void Daemon::captureClose() { cap_.close(); file_.close(); std::lock_guard<std::mutex> lk(mu_); current_ = CameraInfo{}; }
 bool Daemon::captureGrab(cv::Mat& f, int ms) { return useFile_ ? file_.grab(f, ms) : cap_.grab(f, ms); }
 
+// Runs on the server thread. Requests come from same-uid clients but may be
+// malformed: every field is type-checked and nothing here may throw.
 std::string Daemon::handle(const std::string& req) {
-  json j;
-  try { j = json::parse(req); } catch (...) { return R"({"type":"error","error":"bad json"})"; }
-  std::string cmd = j.value("cmd", "");
-  if (cmd == "get") { std::lock_guard<std::mutex> lk(mu_); return stateJson().dump(); }
-  if (cmd == "set") {
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      if (j.contains("sameForAll") && j["sameForAll"].is_boolean()) {
-        bool v = j["sameForAll"];
-        // Switching to per-camera: seed the current camera from what is shown now.
-        if (!v && cfg_.sameForAll && !selectedBus().empty()) cfg_.settingsByCamera[selectedBus()] = cfg_.settings;
-        // Switching to shared: what is shown now becomes the shared set.
-        if (v && !cfg_.sameForAll) cfg_.settings = effectiveSettings();
-        cfg_.sameForAll = v;
+  static const std::string kOk = R"({"type":"ok"})";
+  auto error = [](const char* what) { return json{ { "type", "error" }, { "error", what } }.dump(); };
+  try {
+    json j = json::parse(req, nullptr, false);
+    if (j.is_discarded()) return error("bad json");
+    if (!j.is_object() || !j.contains("cmd") || !j["cmd"].is_string()) return error("missing cmd");
+    std::string cmd = j["cmd"];
+    auto boolField = [&](const char* k) { return j.contains(k) && j[k].is_boolean() && j[k].get<bool>(); };
+    if (cmd == "get") { std::lock_guard<std::mutex> lk(mu_); return stateJson().dump(); }
+    if (cmd == "set") {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (j.contains("sameForAll") && j["sameForAll"].is_boolean()) {
+          bool v = j["sameForAll"];
+          // Switching to per-camera: seed the current camera from what is shown now.
+          if (!v && cfg_.sameForAll && !selectedBus().empty()) cfg_.settingsByCamera[selectedBus()] = cfg_.settings;
+          // Switching to shared: what is shown now becomes the shared set.
+          if (v && !cfg_.sameForAll) cfg_.settings = effectiveSettings();
+          cfg_.sameForAll = v;
+        }
+        if (j.contains("camera") && j["camera"].is_string()) cfg_.preferredCamera = j["camera"];
+        if (j.contains("settings") && j["settings"].is_object()) settingsFromJson(j["settings"], effectiveSettings());
+        saveConfig(cfg_);
       }
-      if (j.contains("camera") && j["camera"].is_string()) cfg_.preferredCamera = j["camera"];
-      if (j.contains("settings")) {
-        Settings& target = effectiveSettings();
-        settingsFromJson(j["settings"], target);
-      }
-      saveConfig(cfg_);
+      stateDirty_ = true;
+      return kOk;
     }
-    stateDirty_ = true;
-    return R"({"type":"ok"})";
+    if (cmd == "react") {
+      if (!j.contains("name") || !j["name"].is_string()) return error("missing name");
+      fx_.triggerReaction(j["name"]);
+      return kOk;
+    }
+    if (cmd == "rescan") { rescanCameras(); stateDirty_ = true; return kOk; }
+    if (cmd == "preview") { std::lock_guard<std::mutex> lk(mu_); forcePreview_ = boolField("on"); stateDirty_ = true; return kOk; }
+    if (cmd == "profile") { fx_.setProfile(boolField("on")); return kOk; }
+    if (cmd == "quit") { g_quit = true; return kOk; }
+    return error("unknown cmd");
+  } catch (const std::exception& e) {
+    fprintf(stderr, "camfxd: request failed: %s\n", e.what());
+    return error("request failed");
   }
-  if (cmd == "react") { fx_.triggerReaction(j.value("name", "")); return R"({"type":"ok"})"; }
-  if (cmd == "rescan") { rescanCameras(); stateDirty_ = true; return R"({"type":"ok"})"; }
-  if (cmd == "preview") { std::lock_guard<std::mutex> lk(mu_); forcePreview_ = j.value("on", false); stateDirty_ = true; return R"({"type":"ok"})"; }
-  if (cmd == "profile") { fx_.setProfile(j.value("on", false)); return R"({"type":"ok"})"; }
-  if (cmd == "quit") { g_quit = true; return R"({"type":"ok"})"; }
-  return R"({"type":"error","error":"unknown cmd"})";
+}
+
+// The runtime dir holds the control socket and the instance lock. Refuse
+// anything that is not a private directory of ours (a pre-created dir in a
+// shared /tmp could redirect the socket or the lock).
+bool ensureRuntimeDir(const std::string& dir, std::string* err) {
+  if (mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) { *err = std::string("mkdir ") + dir + ": " + strerror(errno); return false; }
+  int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) { *err = std::string("open ") + dir + ": " + strerror(errno); return false; }
+  struct stat st{};
+  bool ok = fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == getuid() && (st.st_mode & 0777) == 0700;
+  close(fd);
+  if (!ok) { *err = dir + " must be a directory owned by us with mode 0700"; return false; }
+  return true;
 }
 
 int Daemon::run() {
+  // The shell owns us: exit with it rather than linger as an orphan the next
+  // shell cannot manage (it also asks a stray instance to quit, belt and braces).
+  prctl(PR_SET_PDEATHSIG, SIGTERM);
   runtimeDir_ = xdgRuntime() + "/omarchy-camera";
-  mkdir(runtimeDir_.c_str(), 0700);
-  statePath_ = runtimeDir_ + "/state.json";
+  std::string err;
+  if (!ensureRuntimeDir(runtimeDir_, &err)) { fprintf(stderr, "camfxd: %s\n", err.c_str()); return 1; }
   std::string sockPath = runtimeDir_ + "/ctl.sock";
   // Single instance per session (the shell restarts us; a stray manual copy
   // must not fight over the loopback writer).
-  int lockFd = open((runtimeDir_ + "/lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  int lockFd = open((runtimeDir_ + "/lock").c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
   if (lockFd < 0 || flock(lockFd, LOCK_EX | LOCK_NB) < 0) { fprintf(stderr, "camfxd: another instance is running\n"); return 3; }
 
-  std::string err;
   if (!fx_.init(cfg_.modelsDir, cfg_.assetsDir, &err)) fprintf(stderr, "models: %s\n", err.c_str());
   else if (!err.empty()) fprintf(stderr, "models (degraded): %s\n", err.c_str());
   fx_.setSettings(cfg_.settings);
@@ -416,11 +391,12 @@ int Daemon::run() {
   if (!server_.start(sockPath, [this](const std::string& r) { return handle(r); }, &err)) { fprintf(stderr, "control socket: %s\n", err.c_str()); return 1; }
 
   // Native PipeWire camera node for portal-based apps (best effort).
-  if (pwOut_.start(cfg_.outW, cfg_.outH, cfg_.fps, cfg_.label, [this](bool on) { pwActive_ = on; stateDirty_ = true; }, &err)) pwStatus_ = "ok";
-  else { pwStatus_ = err; fprintf(stderr, "camfxd: pipewire output unavailable: %s\n", err.c_str()); }
+  if (pwOut_.start(cfg_.outW, cfg_.outH, cfg_.fps, cfg_.label, [this](bool on) { pwActive_ = on; stateDirty_ = true; }, &err)) setState(pwStatus_, std::string("ok"));
+  else { setState(pwStatus_, err); fprintf(stderr, "camfxd: pipewire output unavailable: %s\n", err.c_str()); }
 
-  // The loopback device is created by `camfxd device add` (root, at boot).
-  // Wait for it rather than fail: the plugin's setup step may still be running.
+  // The loopback device is created by the omarchy-camera-device systemd unit
+  // (v4l2loopback-ctl, installed by `omarchy-camera-setup install`). Wait for
+  // it rather than fail: the plugin's setup step may still be running.
   auto lastLoopCheck = clk::now() - std::chrono::seconds(10);
   auto lastScan = clk::now() - std::chrono::seconds(10);
   auto lastPublish = clk::now();
@@ -434,20 +410,30 @@ int Daemon::run() {
     if (!loop_.isOpen() && now - lastLoopCheck > std::chrono::seconds(2)) {
       lastLoopCheck = now;
       std::string p = findLoopbackByLabel(cfg_.label);
-      if (p.empty()) { if (error_ != "virtual camera device missing") { error_ = "virtual camera device missing"; stateDirty_ = true; } }
+      if (p.empty()) setError("virtual camera device missing");
       else if (loop_.open(p, cfg_.outW, cfg_.outH, &err)) {
-        loopPath_ = p; error_.clear(); stateDirty_ = true;
+        setState(loopPath_, p);
+        setError("");
         fprintf(stderr, "camfxd: virtual camera %s (%dx%d)\n", p.c_str(), cfg_.outW, cfg_.outH);
         watcher_.start(p, [this](int n) { consumers_ = n; stateDirty_ = true; });
-      } else if (error_ != err) { error_ = err; stateDirty_ = true; }
+      } else setError(err);
     }
     if (now - lastScan > std::chrono::seconds(running_ ? 10 : 4)) { lastScan = now; rescanCameras(); }
-    hideRawActive_ = fileExists("/etc/udev/rules.d/71-omarchy-camera-hide-raw.rules");
+    setState(hideRawActive_, fileExists("/etc/udev/rules.d/71-omarchy-camera-hide-raw.rules"));
 
-    bool want = (loop_.isOpen() && consumers_ > 0) || pwActive_ || forcePreview_;
+    bool preview;
+    { std::lock_guard<std::mutex> lk(mu_); preview = forcePreview_; }
+    bool want = (loop_.isOpen() && consumers_ > 0) || pwActive_ || preview;
     if (want && !captureOpen()) {
-      if (openCapture(&err)) { error_.clear(); stateDirty_ = true; fprintf(stderr, "camfxd: capturing %s %dx%d %s\n", current_.path.c_str(), useFile_ ? file_.width() : cap_.width(), useFile_ ? file_.height() : cap_.height(), useFile_ ? "file" : cap_.format().c_str()); }
-      else { if (error_ != err) { error_ = err; stateDirty_ = true; fprintf(stderr, "camfxd: capture: %s\n", err.c_str()); } std::this_thread::sleep_for(std::chrono::milliseconds(500)); }
+      if (openCapture(&err)) {
+        setError("");
+        misses_ = 0;
+        fprintf(stderr, "camfxd: capturing %s %dx%d %s\n", current_.path.c_str(), useFile_ ? file_.width() : cap_.width(), useFile_ ? file_.height() : cap_.height(), useFile_ ? "file" : cap_.format().c_str());
+      } else {
+        if (error_ != err) fprintf(stderr, "camfxd: capture: %s\n", err.c_str());
+        setError(err);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      }
     }
     if (!want && captureOpen()) {
       captureClose();
@@ -457,12 +443,13 @@ int Daemon::run() {
       pwOut_.clear();
       fprintf(stderr, "camfxd: idle\n");
     }
-    running_ = captureOpen();
-    if (running_ != wasRunning) { wasRunning = running_; stateDirty_ = true; frames = 0; fpsT0 = now; fps_ = 0; }
+    setState(running_, captureOpen());
+    if (running_ != wasRunning) { wasRunning = running_; frames = 0; fpsT0 = now; setState(fps_, 0.0); }
 
     if (running_) {
       cv::Mat frame, out;
       if (captureGrab(frame, 200)) {
+        misses_ = 0;
         Settings s;
         std::string preferred;
         { std::lock_guard<std::mutex> lk(mu_); s = effectiveSettings(); preferred = cfg_.preferredCamera; }
@@ -473,18 +460,25 @@ int Daemon::run() {
           if (useFile_ || fileExists(preferred) || (!c.path.empty() && c.path != current_.path)) { captureClose(); continue; }
         }
         auto p0 = clk::now();
-        fx_.process(frame, out, cv::Size(cfg_.outW, cfg_.outH), nowSec());
-        if (loop_.isOpen()) loop_.write(out);
-        pwOut_.push(out);
+        // A bad frame or setting must not take the daemon down mid-call: log and skip the frame.
+        try {
+          fx_.process(frame, out, cv::Size(cfg_.outW, cfg_.outH), nowSec());
+          if (loop_.isOpen()) loop_.write(out);
+          pwOut_.push(out);
+        } catch (const std::exception& e) {
+          fprintf(stderr, "camfxd: frame dropped: %s\n", e.what());
+          continue;
+        }
         double ms = std::chrono::duration<double, std::milli>(clk::now() - p0).count();
-        procMs_ = procMs_ == 0 ? ms : procMs_ * 0.9 + ms * 0.1;
+        { std::lock_guard<std::mutex> lk(mu_); procMs_ = procMs_ == 0 ? ms : procMs_ * 0.9 + ms * 0.1; }  // shown with the next publish
+        setState(gesture_, fx_.lastGesture());
+        setState(profileLine_, fx_.profileLine());
         frames++;
         auto dt = std::chrono::duration<double>(now - fpsT0).count();
-        if (dt >= 1.0) { fps_ = frames / dt; frames = 0; fpsT0 = now; stateDirty_ = true; }
+        if (dt >= 1.0) { setState(fps_, frames / dt); frames = 0; fpsT0 = now; }
       } else {
         // Camera unplugged or stalled: reopen.
-        static int misses = 0;
-        if (++misses > 15) { misses = 0; captureClose(); rescanCameras(); }
+        if (++misses_ > 15) { misses_ = 0; captureClose(); rescanCameras(); }
       }
     } else {
       std::this_thread::sleep_for(std::chrono::milliseconds(60));
@@ -500,7 +494,6 @@ int Daemon::run() {
   pwOut_.stop();
   watcher_.stop();
   server_.stop();
-  unlink(statePath_.c_str());
   return 0;
 }
 
@@ -508,7 +501,11 @@ int Daemon::run() {
 
 int main(int argc, char** argv) {
   std::string cmd = argc > 1 ? argv[1] : "run";
-  if (cmd == "device") return cmdDevice(argc - 2, argv + 2);
+  // Only the daemon needs the setgid (camerad) copy's privileges: every other
+  // mode drops to the caller's own gid before doing anything else.
+  if (cmd != "run" && getegid() != getgid()) {
+    if (setresgid(getgid(), getgid(), getgid()) != 0) { perror("setresgid"); return 1; }
+  }
   if (cmd == "hands" && argc > 2) {
     // Dev tool: run hand detection on an image, print per-hand debug, write annotated copy.
     std::string exe(4096, '\0');
@@ -576,7 +573,7 @@ int main(int argc, char** argv) {
   if (cmd == "quit") return cmdClient(sock, R"({"cmd":"quit"})", true);
   if (cmd == "profile") return cmdClient(sock, json{ { "cmd", "profile" }, { "on", argc > 2 && std::string(argv[2]) == "on" } }.dump(), true);
   if (cmd != "run") {
-    fprintf(stderr, "usage: camfxd [run|status|set k=v...|react NAME|camera BUS|preview on|off|quit|device ...]\n");
+    fprintf(stderr, "usage: camfxd [run|status|set k=v...|react NAME|camera BUS|preview on|off|profile on|off|quit]\n");
     return 2;
   }
   signal(SIGINT, onSignal);

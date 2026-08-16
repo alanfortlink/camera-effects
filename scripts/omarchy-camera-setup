@@ -2,11 +2,13 @@
 # omarchy-camera-setup — the privileged half of the Omarchy Camera plugin.
 # Invoked through pkexec by the shell plugin (or sudo by install.sh).
 #
-#   install                         create the virtual camera now and at every boot
+#   install                         create the virtual camera now and at every boot; also
+#                                   installs a root-owned copy of this script for the shell to pkexec
 #   uninstall                       remove the boot unit, the device and all hide rules
 #   hide-raw on <camfxd> [<key>]    hide physical webcams from apps (all, or one USB camera by
-#                                   key "usb-<vid>-<pid>-<serial>"); only camfxd may read them
+#                                   key "usb-<vid>-<pid>[-<serial>]"); only camfxd may read them
 #   hide-raw off [<key>]            make physical webcams (all, or that one) visible again
+#   refresh-daemon <camfxd>         refresh the privileged daemon copy only (rules untouched)
 #   status                          print JSON status
 set -euo pipefail
 
@@ -18,8 +20,13 @@ RULES_DIR=/etc/udev/rules.d
 RULE_ALL=$RULES_DIR/71-omarchy-camera-hide-raw.rules
 LIBDIR=/usr/local/lib/omarchy-camera
 GROUP=camerad
+# Camera key as built by the daemon (capture.cpp): 4 hex vid, 4 hex pid, optional
+# serial of [A-Za-z0-9._]{1,64}. Anything else is refused: the key becomes part of a
+# udev rule and of a file name written as root.
+KEY_RE='^usb-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}(-[A-Za-z0-9._]{1,64})?$'
 
 need_root() { [[ $EUID -eq 0 ]] || { echo "must run as root (pkexec/sudo)" >&2; exit 1; }; }
+valid_key() { [[ $1 =~ $KEY_RE ]] || { echo "bad camera key: $1" >&2; exit 2; }; }
 
 # `list` prints "OUTPUT \t CAPTURE \t NAME" rows with padded fields.
 device_path() { v4l2loopback-ctl list 2>/dev/null | awk -F'\t' -v l="$LABEL" '{ gsub(/ +$/, "", $1); gsub(/ +$/, "", $3) } $3==l {print $1; exit}'; }
@@ -57,6 +64,11 @@ EOF
   systemctl daemon-reload
   systemctl enable omarchy-camera-device.service >/dev/null 2>&1 || true
   systemctl restart omarchy-camera-device.service
+  # A root-owned copy of this script: the shell pkexecs that one (not the
+  # user-writable copy in ~/.local) once it exists. Re-run install to update it.
+  local self; self=$(readlink -f "$0")
+  install -d -m 755 "$LIBDIR"
+  [[ $self == "$LIBDIR/omarchy-camera-setup" ]] || install -m 755 -o root -g root "$self" "$LIBDIR/omarchy-camera-setup"
   # udev needs a moment to apply the ACL for the seat user
   sleep 0.3
   echo "virtual camera: $(device_path)"
@@ -73,32 +85,47 @@ raw_devices() {
 }
 
 # Root-owned setgid copy of the daemon: the only thing allowed to read hidden webcams.
+# The source must be a plain file of the invoking user (or root): this publishes it
+# world-readable and setgid, so it must not be pointed at someone else's file.
 install_privileged_daemon() {
   local bin=$1
-  [[ -x $bin ]] || { echo "camfxd binary not found: $bin" >&2; exit 1; }
+  [[ -n $bin && -f $bin && ! -L $bin && -x $bin ]] || { echo "camfxd binary not found or not a regular file: $bin" >&2; exit 1; }
+  local owner caller; owner=$(stat -c %u "$bin"); caller=${PKEXEC_UID:-${SUDO_UID:-0}}
+  [[ $owner == 0 || $owner == "$caller" ]] || { echo "refusing $bin: owned by uid $owner, not by you" >&2; exit 1; }
   getent group "$GROUP" >/dev/null || groupadd -r "$GROUP"
   install -d -m 755 "$LIBDIR"
   install -m 2755 -o root -g "$GROUP" "$bin" "$LIBDIR/camfxd"
 }
 
-# udev match for one USB camera from our key "usb-<vid>-<pid>[-<serial>]".
+# udev match for one USB camera from our (validated) key "usb-<vid>-<pid>[-<serial>]".
+# The serial is only in the key when it is plain [A-Za-z0-9._], so it can be matched
+# verbatim; a camera whose serial did not fit has no serial in its key and is matched
+# by vendor/product only.
 key_match() {
   local key=$1 vid pid serial
+  valid_key "$key"
   IFS=- read -r _ vid pid serial <<<"$key"
-  [[ -n $vid && -n $pid ]] || { echo "bad camera key: $key" >&2; exit 2; }
   local m="ATTRS{idVendor}==\"$vid\", ATTRS{idProduct}==\"$pid\""
   [[ -n $serial ]] && m+=", ATTRS{serial}==\"$serial\""
   echo "$m"
 }
 
-# Our key for a physical device node, same format as the daemon uses.
+# Our key for a physical device node, same rules as the daemon (capture.cpp).
 device_key() {
   local base; base=$(readlink -f "/sys/class/video4linux/$(basename "$1")/device")/..
   local vid pid serial
   vid=$(cat "$base/idVendor" 2>/dev/null || true); pid=$(cat "$base/idProduct" 2>/dev/null || true)
-  serial=$(cat "$base/serial" 2>/dev/null | tr ' /' '__' || true)
-  [[ -n $vid && -n $pid ]] || return 0
+  serial=$(cat "$base/serial" 2>/dev/null || true)
+  [[ $vid =~ ^[0-9a-fA-F]{4}$ && $pid =~ ^[0-9a-fA-F]{4}$ ]] || return 0
+  [[ $serial =~ ^[A-Za-z0-9._]{1,64}$ ]] || serial=
   echo "usb-$vid-$pid${serial:+-$serial}"
+}
+
+# What the hide-all rule matches: a USB device node with a capture capability.
+is_usb_capture() {
+  local sys; sys=/sys/class/video4linux/$(basename "$1")
+  [[ -e $(readlink -f "$sys/device")/../idVendor ]] || return 1
+  udevadm info -q property -p "$sys" 2>/dev/null | grep -q '^ID_V4L_CAPABILITIES=.*:capture:'
 }
 
 # Re-evaluate udev for cameras and fix ACL/group state to match the rules.
@@ -111,7 +138,7 @@ reapply() {
   local d key hidden
   for d in $(raw_devices); do
     hidden=false
-    [[ -f $RULE_ALL ]] && hidden=true
+    [[ -f $RULE_ALL ]] && is_usb_capture "$d" && hidden=true
     key=$(device_key "$d")
     [[ -n $key && -f $RULES_DIR/71-omarchy-camera-hide-$key.rules ]] && hidden=true
     if $hidden; then
@@ -129,12 +156,14 @@ cmd_hide_raw() {
   case "$mode" in
     on)
       local bin=${2:-} key=${3:-}
+      [[ -z $key ]] || valid_key "$key"
       install_privileged_daemon "$bin"
       if [[ -z $key ]]; then
+        # Only USB capture cameras: not tuners, capture cards or codec (M2M) nodes.
         cat > "$RULE_ALL" <<EOF
 # Omarchy Camera: physical webcams are read by the effects daemon only; apps use the
 # virtual "Omarchy Camera" device instead. Toggle "Hide raw cameras" in the panel to restore.
-SUBSYSTEM=="video4linux", DEVPATH!="/devices/virtual/*", TAG-="uaccess", GROUP="$GROUP", MODE="0660"
+SUBSYSTEM=="video4linux", SUBSYSTEMS=="usb", ENV{ID_V4L_CAPABILITIES}=="*:capture:*", TAG-="uaccess", GROUP="$GROUP", MODE="0660"
 EOF
         echo "raw cameras hidden"
       else
@@ -150,11 +179,18 @@ EOF
     off)
       local key=${2:-}
       if [[ -z $key ]]; then rm -f "$RULE_ALL"; echo "raw cameras visible"
-      else rm -f "$RULES_DIR/71-omarchy-camera-hide-$key.rules"; echo "camera $key visible"; fi
+      else valid_key "$key"; rm -f "$RULES_DIR/71-omarchy-camera-hide-$key.rules"; echo "camera $key visible"; fi
       reapply
       ;;
     *) echo "usage: hide-raw on <camfxd> [<key>] | hide-raw off [<key>]" >&2; exit 2;;
   esac
+}
+
+# After a rebuild: make the setgid copy match the new build without touching rules.
+cmd_refresh_daemon() {
+  need_root
+  install_privileged_daemon "${1:-}"
+  echo "privileged daemon refreshed"
 }
 
 cmd_uninstall() {
@@ -182,6 +218,7 @@ case "${1:-}" in
   install) cmd_install;;
   uninstall) cmd_uninstall;;
   hide-raw) shift; cmd_hide_raw "$@";;
+  refresh-daemon) cmd_refresh_daemon "${2:-}";;
   status) cmd_status;;
-  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
 esac

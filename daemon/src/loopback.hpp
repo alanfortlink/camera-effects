@@ -5,14 +5,6 @@
 #include <string>
 #include <thread>
 
-#include <mutex>
-
-// When running setgid (hide-raw mode) the effective gid differs from the
-// user's, which makes /proc/<pid>/fd of the user's other processes
-// unreadable. The scan drops to the real gid for its duration; anything that
-// needs the privileged gid (opening a raw camera) takes this lock meanwhile.
-extern std::mutex g_credMutex;
-
 // Find /dev/videoN whose v4l2loopback card label matches. Empty if none.
 std::string findLoopbackByLabel(const std::string& label);
 
@@ -43,7 +35,8 @@ private:
 class ConsumerWatcher {
 public:
   ~ConsumerWatcher() { stop(); }
-  // ownFdCount: how many fds *this process* holds on the device (excluded).
+  // onChange(n) is called from the watcher thread whenever the number of
+  // other processes holding the device open changes.
   void start(const std::string& path, std::function<void(int)> onChange);
   void stop();
   int consumers() const { return consumers_.load(); }

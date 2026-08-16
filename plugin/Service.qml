@@ -38,6 +38,9 @@ Item {
   readonly property string setupScript: libDir + "/omarchy-camera-setup"
   readonly property string daemonBinary: libDir + "/camfxd"
   readonly property string privilegedBinary: "/usr/local/lib/omarchy-camera/camfxd"
+  // Root-owned copy of the setup script (installed by `omarchy-camera-setup install`).
+  // Preferred for pkexec so that what runs as root is not user-writable.
+  readonly property string privilegedSetupScript: "/usr/local/lib/omarchy-camera/omarchy-camera-setup"
   // The plugin checkout (this file lives in <repo>/plugin/).
   readonly property string repoDir: String(Qt.resolvedUrl("..")).replace(/^file:\/\//, "").replace(/\/$/, "")
   property bool installed: false   // daemon binary present in ~/.local/lib
@@ -64,13 +67,15 @@ Item {
   //   runSetup("hide-camera", key, on)       hide/unhide one USB camera
   function runSetup(what, a, b) {
     if (setupProc.running) return
-    var args = ["pkexec", setupScript]
-    if (what === "install") args.push("install")
-    else if (what === "hide-all") args = args.concat(a ? ["hide-raw", "on", daemonBinary] : ["hide-raw", "off"])
-    else if (what === "hide-camera") args = args.concat(b ? ["hide-raw", "on", daemonBinary, String(a)] : ["hide-raw", "off", String(a)])
+    var args
+    if (what === "install") args = ["install"]
+    else if (what === "hide-all") args = a ? ["hide-raw", "on", daemonBinary] : ["hide-raw", "off"]
+    else if (what === "hide-camera") args = b ? ["hide-raw", "on", daemonBinary, String(a)] : ["hide-raw", "off", String(a)]
     else return
     setupOutput = ""
-    setupProc.command = args
+    // The root-owned script copy when it exists (after the first install), else ours.
+    setupProc.command = ["sh", "-c", 'if [ -f "$1" ]; then s=$1; else s=$2; fi; shift 2; exec pkexec "$s" "$@"',
+                         "camfx-setup", privilegedSetupScript, setupScript].concat(args)
     setupProc.running = true
   }
   property bool setupBusy: setupProc.running || installProc.running
@@ -144,6 +149,9 @@ Item {
     repeat: false
     onTriggered: {
       if (daemon.running) { daemon.signal(15); return }   // restart requested (setup changed things)
+      // Not our process but something answers on the socket: a daemon orphaned by
+      // a previous shell. Ask it to quit so we can start (and later restart) our own.
+      if (root.sockConnected) { root.send({ cmd: "quit" }); interval = 5000; restart(); return }
       daemon.command = root.daemonCommand()
       daemon.running = true
     }
