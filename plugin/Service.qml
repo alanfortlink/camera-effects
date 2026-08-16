@@ -16,6 +16,7 @@ Item {
   readonly property bool connected: sockConnected
   readonly property bool running: !!state.running          // camera is being read + processed right now
   readonly property int consumers: state.consumers || 0     // apps holding the virtual camera open
+  readonly property var consumerApps: state.consumerApps || []   // their process names
   readonly property bool previewOn: !!state.previewOn       // some client (our panel) is watching the preview: pipeline runs, preview.jpg is written
   readonly property var settings: state.settings || ({})   // effective settings for the current camera
   readonly property bool sameForAll: state.sameForAll !== false

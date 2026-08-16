@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <opencv2/imgproc.hpp>
@@ -115,6 +116,7 @@ int ConsumerWatcher::scanProc() {
   struct Restore { bool on; gid_t g; ~Restore() { if (on) { (void)!setegid(g); prctl(PR_SET_PDEATHSIG, SIGTERM); } } } restore{ dropped, egid };
   pid_t self = getpid();
   int count = 0;
+  std::vector<std::string> names;
   DIR* proc = opendir("/proc");
   if (!proc) return 0;
   while (dirent* pe = readdir(proc)) {
@@ -128,11 +130,20 @@ int ConsumerWatcher::scanProc() {
       if (fe->d_name[0] == '.') continue;
       struct stat st{};
       if (stat((fdDir + "/" + fe->d_name).c_str(), &st) != 0) continue;
-      if (S_ISCHR(st.st_mode) && st.st_rdev == target.st_rdev) { count++; break; }  // one per process
+      if (S_ISCHR(st.st_mode) && st.st_rdev == target.st_rdev) {  // one per process
+        count++;
+        std::ifstream cf(std::string("/proc/") + pe->d_name + "/comm");
+        std::string comm;
+        std::getline(cf, comm);
+        if (!comm.empty() && std::find(names.begin(), names.end(), comm) == names.end()) names.push_back(comm);
+        break;
+      }
     }
     closedir(fds);
   }
   closedir(proc);
+  std::sort(names.begin(), names.end());
+  { std::lock_guard<std::mutex> lk(appsMu_); apps_ = std::move(names); }
   return count;
 }
 

@@ -198,7 +198,8 @@ Panel {
     if (!svc || !connected) return ""
     var res = svc.state.output ? " · " + svc.state.output.width + "×" + svc.state.output.height : ""
     // Keep it under ~50 monospace caption characters so it never elides.
-    var use = appCount > 0 ? appCount + " app" + (appCount > 1 ? "s" : "") + " connected"
+    var apps = svc.consumerApps || []
+    var use = appCount > 0 ? "In use by " + (apps.length ? apps.join(", ") : appCount + " app" + (appCount > 1 ? "s" : ""))
             : previewOnly && inUse ? (blocked ? "Preview only · camera blocked" : "Preview only · camera on while open") : "Idle"
     return use + res
   }

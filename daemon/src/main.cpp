@@ -405,6 +405,7 @@ json Daemon::stateJson() {
   json j = json{ { "type", "state" },
                { "running", running_ },
                { "consumers", consumers_.load() },
+               { "consumerApps", watcher_.apps() },
                { "previewOn", previewOn_ },
                { "camera", { { "path", shown.path }, { "name", shown.name }, { "bus", shown.bus }, { "key", shown.key } } },
                { "cameras", cams },

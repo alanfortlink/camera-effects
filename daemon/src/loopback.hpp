@@ -3,6 +3,7 @@
 #include <functional>
 #include <opencv2/core.hpp>
 #include <string>
+#include <vector>
 #include <thread>
 
 // Find /dev/videoN whose v4l2loopback card label matches. Empty if none.
@@ -43,6 +44,8 @@ public:
   void start(const std::string& path, std::function<void(int)> onChange);
   void stop();
   int consumers() const { return consumers_.load(); }
+  // Names (comm) of the processes holding the device, from the last /proc scan.
+  std::vector<std::string> apps() const { std::lock_guard<std::mutex> lk(appsMu_); return apps_; }
 
 private:
   void run();
@@ -50,6 +53,8 @@ private:
   std::string path_;
   std::function<void(int)> onChange_;
   std::atomic<int> consumers_{0};
+  mutable std::mutex appsMu_;
+  std::vector<std::string> apps_;
   std::atomic<bool> stop_{false};
   std::thread thread_;
 };
