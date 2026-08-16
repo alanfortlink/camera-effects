@@ -41,6 +41,21 @@ Panel {
   readonly property int trailInset: Style.space(6)
   property bool pickerMissing: false
 
+  // The daemon does not say when a reaction is playing (a `reactionsActive`
+  // field in its state would make this exact), so approximate: hide the
+  // gesture badge for the length of an animation after a reaction button is
+  // clicked, or once a shown gesture has been held long enough to fire
+  // (~0.6 s steady in the daemon).
+  Timer { id: badgeHide; interval: 3500 }
+  Timer { id: gestureFire; interval: 600; onTriggered: badgeHide.restart() }
+  Connections {
+    target: root.svc
+    function onGestureChanged() {
+      if (root.svc && root.svc.gesture !== "" && !!root.s.reactions) gestureFire.restart()
+      else gestureFire.stop()
+    }
+  }
+
   visible: alwaysShow || inUse
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -96,7 +111,7 @@ Panel {
     if (!svc || !connected) return ""
     var res = svc.state.output ? " · " + svc.state.output.width + "×" + svc.state.output.height : ""
     var use = appCount > 0 ? appCount + " app" + (appCount > 1 ? "s" : "") + " connected"
-            : previewActive ? "no apps connected" : "idle"
+            : previewActive ? "preview only (camera on while open)" : "idle"
     return "Virtual camera" + res + " · " + use
   }
 
@@ -215,8 +230,10 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(392))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(720))
+    contentWidth: panel.fittedContentWidth(Style.space(380))
+    // No cap (like network/bluetooth): the screen governs. The status footer
+    // is pinned under the ScrollView so it never scrolls or clips away.
+    contentHeight: panel.fittedContentHeight(column.implicitHeight + footerBlock.height)
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -226,7 +243,10 @@ Panel {
 
       ScrollView {
         id: scrollArea
-        anchors.fill: parent
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: footerBlock.top
         clip: true
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
         ScrollBar.vertical.policy: column.implicitHeight > height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
@@ -311,7 +331,7 @@ Panel {
               Text {
                 anchors.centerIn: parent
                 text: root.connected && root.svc && root.svc.camera && root.svc.camera.name ? "Starting camera…" : "No camera"
-                color: "#666"
+                color: Qt.rgba(1, 1, 1, 0.5)  // the box is always black
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
@@ -320,7 +340,7 @@ Panel {
               anchors.left: parent.left
               anchors.bottom: parent.bottom
               anchors.margins: Style.space(8)
-              visible: !!root.svc && !!root.s.reactions && root.svc.gesture !== "" && !!previewLoader.item && previewLoader.item.ready
+              visible: !!root.svc && !!root.s.reactions && root.svc.gesture !== "" && !badgeHide.running && !!previewLoader.item && previewLoader.item.ready
               color: "#aa000000"
               radius: Style.space(4)
               width: gestureText.implicitWidth + Style.space(12)
@@ -334,10 +354,6 @@ Panel {
                 font.pixelSize: Style.font.caption
               }
             }
-          }
-          Note {
-            visible: previewBox.visible && root.previewActive
-            text: "Preview keeps the camera on while this panel is open"
           }
           Note {
             visible: previewBox.visible && root.previewActive && !!root.s.mirror
@@ -412,10 +428,10 @@ Panel {
                 id: colorField
                 readonly property bool valid: /^#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$/.test(text)
                 visible: root.s.background === "color"
-                width: Style.space(84)
+                width: Style.space(96)
                 foreground: root.fg
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: Style.font.body
                 placeholderText: "#1e1e2e"
                 text: root.s.backgroundColor || ""
                 onEditingFinished: if (root.svc && valid) root.svc.setSetting("backgroundColor", text)
@@ -497,7 +513,7 @@ Panel {
                     anchors.fill: parent
                     hoverEnabled: true
                     enabled: !!root.svc
-                    onClicked: if (root.svc) root.svc.react(modelData)
+                    onClicked: if (root.svc) { root.svc.react(modelData); badgeHide.restart() }
                     cursorShape: Qt.PointingHandCursor
                   }
                   Rectangle { anchors.fill: parent; radius: Style.space(4); color: root.fg; opacity: reactArea.containsMouse ? 0.12 : 0; z: -1 }
@@ -508,7 +524,7 @@ Panel {
             Note {
               x: Style.space(20)
               width: parent.width - Style.space(20)
-              text: "Tap to play · switch enables hand gestures"
+              text: "Click to play · switch enables hand gestures"
             }
           }
           SwitchRow { label: "Mirror"; checked: !!root.s.mirror; onToggled: if (root.svc) root.svc.setSetting("mirror", !root.s.mirror) }
@@ -534,10 +550,28 @@ Panel {
               onToggled: if (root.svc) root.svc.runSetup("hide-camera", modelData.key, !modelData.hidden)
             }
           }
+        }
+      }
 
-          // ---------- Footer ----------
-          Item { width: parent.width; height: Style.space(6) }  // + column spacing = 12px of air above the status line
-          Note { visible: text !== ""; text: root.footer() }
+      // ---------- Footer ---------- (pinned below the scroll area, never clipped)
+      Item {
+        id: footerBlock
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        height: footerNote.visible ? footerNote.implicitHeight + Style.space(12) : 0
+        PanelSeparator {  // marks the scroll edge when the list overflows (the bar itself is transient)
+          anchors.top: parent.top
+          foreground: root.fg
+          visible: footerNote.visible && column.implicitHeight > scrollArea.height + 1  // +1: rounding slack
+        }
+        Note {
+          id: footerNote
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
+          visible: text !== ""
+          text: root.footer()
         }
       }
     }
