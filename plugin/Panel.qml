@@ -608,6 +608,24 @@ Panel {
               }
             }
           }
+          // The camera is delivering frames, but they are black — almost always a
+          // closed privacy cover on the webcam.
+          Rectangle {
+            anchors.centerIn: parent
+            visible: previewBox.visible && root.svc && root.svc.covered && !root.blocked
+            width: Math.min(parent.width - Style.space(24), coveredText.implicitWidth + Style.space(24))
+            height: coveredText.implicitHeight + Style.space(14)
+            radius: Style.space(6)
+            color: Qt.rgba(0, 0, 0, 0.6)
+            Text {
+              id: coveredText
+              anchors.centerIn: parent
+              text: "Something might be blocking your camera"
+              color: "#ffffff"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
           // Reopening (Center Stage flips the capture size, or the camera is
           // switched): keep the last frame, dim it and spin over it instead of
           // looking frozen.

@@ -14,6 +14,7 @@ Item {
   // ---- daemon state (mirrors the JSON pushed by camera-effects-server) ----
   property var state: ({})
   readonly property bool connected: sockConnected
+  readonly property bool covered: !!state.covered      // frames arrive but they are black (lens cover?)
   readonly property bool starting: !!state.starting   // camera opening/reopening: the panel shows a busy indicator
   readonly property bool running: !!state.running          // camera is being read + processed right now
   readonly property int consumers: state.consumers || 0     // apps holding the virtual camera open

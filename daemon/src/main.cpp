@@ -293,6 +293,8 @@ private:
   CameraInfo current_;
   bool running_ = false;
   bool starting_ = false;   // wanted, but the first frame after (re)opening has not arrived yet
+  bool covered_ = false;    // the camera delivers frames, but they are essentially black (lens cover / privacy shutter)
+  int darkFrames_ = 0;      // consecutive near-black source frames
   double fps_ = 0;
   double procMs_ = 0;   // EMA of the displayed per-frame cost: decode + effects + output conversion/write
   int tier_ = 0;        // adaptive quality tier (0 = full, 2 = cheapest), see updateTier()
@@ -421,6 +423,7 @@ json Daemon::stateJson() {
   json j = json{ { "type", "state" },
                { "running", running_ },
                { "starting", starting_ },
+               { "covered", covered_ },
                { "consumers", consumers_.load() },
                { "consumerApps", watcher_.apps() },
                { "previewOn", previewOn_ },
@@ -1001,7 +1004,7 @@ int Daemon::run() {
       setError(block_.error());
       setState(panRange_, block_.panRange());
     }
-    if (!want && captureOpen()) { captureClose(); resetTier(false); stopped = true; }
+    if (!want && captureOpen()) { captureClose(); resetTier(false); stopped = true; darkFrames_ = 0; setState(covered_, false); }
     // "Starting" drives the panel's busy indicator: something wants frames but
     // the camera is still opening (a USB reopen costs a second or two).
     setState(starting_, want && !block && !captureOpen());
@@ -1065,6 +1068,19 @@ int Daemon::run() {
         } catch (const std::exception& e) {
           fprintf(stderr, "camera-effects-server: frame dropped: %s\n", e.what());
           continue;
+        }
+        // A lens cover (or a camera that opens but never exposes) delivers frames
+        // that are essentially black: sample the source cheaply and tell the panel
+        // after ~1 s of them, so the user is not left staring at a black preview.
+        if (!frame.empty()) {
+          cv::Mat probe;
+          cv::resize(frame, probe, cv::Size(32, 18), 0, 0, cv::INTER_AREA);
+          double mx = 0;
+          cv::minMaxLoc(probe.reshape(1), nullptr, &mx);
+          bool dark = cv::mean(probe)[0] + cv::mean(probe)[1] + cv::mean(probe)[2] < 24.0 && mx < 40.0;
+          darkFrames_ = dark ? darkFrames_ + 1 : 0;
+          if (darkFrames_ >= 20) setState(covered_, true);
+          else if (!dark) setState(covered_, false);
         }
         double loopMs = std::chrono::duration<double, std::milli>(clk::now() - p0).count();
         updateTier(decodeMs, loopMs, nowSec());  // also updates procMs_ (shown with the next publish)
