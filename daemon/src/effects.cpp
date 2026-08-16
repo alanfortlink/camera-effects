@@ -100,8 +100,8 @@ void Reactions::trigger(const std::string& name) {
   if (std::find(pending_.begin(), pending_.end(), name) == pending_.end()) pending_.push_back(name);
 }
 
-bool Reactions::active() {
-  if (!anims_.empty()) return true;
+bool Reactions::active() const {
+  if (playing_.load()) return true;
   std::lock_guard<std::mutex> lk(pendingMu_);
   return !pending_.empty();
 }
@@ -116,6 +116,7 @@ void Reactions::drainPending() {
     Anim a; a.name = name; a.start = -1;  // spawned lazily on first render (needs frame size)
     anims_.push_back(a);
   }
+  playing_ = !anims_.empty();
 }
 
 namespace {
@@ -378,6 +379,7 @@ void Reactions::render(cv::Mat& frame, double now) {
     dirty_ = bbox;
   }
   anims_.erase(std::remove_if(anims_.begin(), anims_.end(), [&](const Anim& a) { return a.start >= 0 && now - a.start > DUR; }), anims_.end());
+  playing_ = !anims_.empty();
 }
 
 // ---------------------------------------------------------------------------
@@ -447,8 +449,8 @@ void EffectPipeline::ensureBackground(const cv::Size& sz) {
 
 // Person mask for this frame. Everything after the model runs on 8-bit data:
 // the mask is smoothed and feathered at model resolution (192x192), upsampled
-// once with INTER_LINEAR, and kept as 3-channel fg/bg weights (mask3_/inv3_)
-// so the blends below are single elementwise passes.
+// once with INTER_LINEAR, and kept as a 3-channel weight (mask3_) so the blends
+// below are single elementwise passes.
 void EffectPipeline::computeMask(const cv::Mat& work) {
   // Segmenter cadence by tier: every frame / every 2nd / every 3rd; the
   // temporal EMA (maskSmall_) is reused in between (the mask barely moves).

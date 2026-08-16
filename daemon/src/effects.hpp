@@ -56,7 +56,7 @@ class Reactions {
 public:
   bool loadAssets(const std::string& dir, std::string* err);
   void trigger(const std::string& name);  // hearts|thumbsup|thumbsdown|balloons|confetti|fireworks|rain|lasers
-  bool active();                          // something playing or queued
+  bool active() const;                    // something playing or queued (any thread)
   void render(cv::Mat& frame, double now);
   static const std::vector<std::string>& names();
 
@@ -65,7 +65,8 @@ private:
   struct Anim { std::string name; double start; std::vector<Particle> parts; };
   std::map<std::string, cv::Mat> sprites_;  // BGRA
   std::vector<Anim> anims_;
-  std::mutex pendingMu_;
+  std::atomic<bool> playing_{false};        // anims_ non-empty, published by render for active()
+  mutable std::mutex pendingMu_;
   std::vector<std::string> pending_;        // triggered, not yet started (drained by render)
   void drainPending();
   void spawn(Anim& a, const cv::Size& sz);
@@ -108,8 +109,8 @@ public:
   // Adaptive quality tier (0 = full quality, 2 = cheapest); see main.cpp.
   void setTier(int t) { tier_ = std::clamp(t, 0, 2); }
   int tier() const { return tier_; }
+  bool reactionsActive() const { return reactions_.active(); }  // any thread
   // Main thread only.
-  bool reactionsActive() { return reactions_.active(); }
   std::string lastGesture() const { return gestures_.lastGesture(); }
   std::string modelStatus() const { return modelStatus_; }
   std::string profileLine() const { return profileLine_; }
@@ -143,7 +144,6 @@ private:
   double lastGestureTime_ = 0;
   // Time-based cadences (capture fps varies, so nothing counts frames).
   double lastPalmTime_ = -1e9, lastFaceTime_ = -1e9, lastHandSeen_ = -1e9;
-  bool hadFacesLastPalm_ = false;
   std::string pendingGesture_;
   double pendingSince_ = 0;
   bool debugGestures_ = false;

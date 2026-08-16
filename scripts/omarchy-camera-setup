@@ -2,8 +2,9 @@
 # omarchy-camera-setup — the privileged half of the Omarchy Camera plugin.
 # Invoked through pkexec by the shell plugin (or sudo by install.sh).
 #
-#   install                         create the virtual camera now and at every boot; also
+#   install [<camfxd>]              create the virtual camera now and at every boot; also
 #                                   installs a root-owned copy of this script for the shell to pkexec
+#                                   and, when hide rules exist, refreshes the privileged daemon copy
 #   uninstall                       remove the boot unit, the device and all hide rules
 #   hide-raw on <camfxd> [<key>]    hide physical webcams from apps (all, or one USB camera by
 #                                   key "usb-<vid>-<pid>[-<serial>]"); only camfxd may read them
@@ -11,6 +12,7 @@
 #   refresh-daemon <camfxd>         refresh the privileged daemon copy only (rules untouched)
 #   status                          print JSON status
 set -euo pipefail
+export LC_ALL=C  # the key/serial regexes below are ASCII classes; keep them locale-independent
 
 LABEL="Omarchy Camera"
 NR=20
@@ -43,6 +45,7 @@ ensure_tools() {
 
 cmd_install() {
   need_root
+  local bin=${1:-}
   ensure_tools
   echo v4l2loopback > "$MODLOAD"
   modprobe v4l2loopback 2>/dev/null || true
@@ -69,6 +72,12 @@ EOF
   local self; self=$(readlink -f "$0")
   install -d -m 755 "$LIBDIR"
   [[ $self == "$LIBDIR/omarchy-camera-setup" ]] || install -m 755 -o root -g root "$self" "$LIBDIR/omarchy-camera-setup"
+  # Cameras hidden => the shell runs the privileged daemon copy: keep it in step
+  # with the build being installed (the caller passes its camfxd path).
+  if [[ -n $bin ]] && ls "$RULES_DIR"/71-omarchy-camera-hide-*.rules >/dev/null 2>&1; then
+    install_privileged_daemon "$bin"
+    echo "privileged daemon refreshed"
+  fi
   # udev needs a moment to apply the ACL for the seat user
   sleep 0.3
   echo "virtual camera: $(device_path)"
@@ -85,16 +94,21 @@ raw_devices() {
 }
 
 # Root-owned setgid copy of the daemon: the only thing allowed to read hidden webcams.
-# The source must be a plain file of the invoking user (or root): this publishes it
-# world-readable and setgid, so it must not be pointed at someone else's file.
+# The source must be a plain file of the invoking user (or root's when root itself
+# calls): this publishes it world-readable and setgid, so it must not be pointed at
+# someone else's file. The file is opened once and every check plus the copy go
+# through that descriptor, so the path cannot be swapped between check and copy.
 install_privileged_daemon() {
   local bin=$1
-  [[ -n $bin && -f $bin && ! -L $bin && -x $bin ]] || { echo "camfxd binary not found or not a regular file: $bin" >&2; exit 1; }
-  local owner caller; owner=$(stat -c %u "$bin"); caller=${PKEXEC_UID:-${SUDO_UID:-0}}
-  [[ $owner == 0 || $owner == "$caller" ]] || { echo "refusing $bin: owned by uid $owner, not by you" >&2; exit 1; }
+  [[ -n $bin && ! -L $bin ]] || { echo "camfxd binary missing or a symlink: $bin" >&2; exit 1; }
+  exec 3<"$bin" || { echo "cannot open $bin" >&2; exit 1; }
+  local caller=${PKEXEC_UID:-${SUDO_UID:-0}}
+  local st; st=$(stat -L -c '%u %F' /dev/fd/3)
+  [[ $st == "$caller regular file" && -x /dev/fd/3 ]] || { echo "refusing $bin: must be an executable regular file owned by uid $caller (got: $st)" >&2; exit 1; }
   getent group "$GROUP" >/dev/null || groupadd -r "$GROUP"
   install -d -m 755 "$LIBDIR"
-  install -m 2755 -o root -g "$GROUP" "$bin" "$LIBDIR/camfxd"
+  install -m 2755 -o root -g "$GROUP" /dev/fd/3 "$LIBDIR/camfxd"
+  exec 3<&-
 }
 
 # udev match for one USB camera from our (validated) key "usb-<vid>-<pid>[-<serial>]".
@@ -215,7 +229,7 @@ cmd_status() {
 }
 
 case "${1:-}" in
-  install) cmd_install;;
+  install) cmd_install "${2:-}";;
   uninstall) cmd_uninstall;;
   hide-raw) shift; cmd_hide_raw "$@";;
   refresh-daemon) cmd_refresh_daemon "${2:-}";;

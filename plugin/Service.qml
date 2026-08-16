@@ -30,6 +30,9 @@ Item {
   readonly property bool deviceMissing: error.indexOf("virtual camera device missing") !== -1
   property string daemonLog: ""
   property int restarts: 0
+  // Set when the daemon binary is present but cannot start (exit 127: a library
+  // missing after a system update, a stale privileged copy); cleared once it talks to us.
+  property string daemonError: ""
 
   readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omarchy-camera"
   readonly property string socketPath: runtimeDir + "/ctl.sock"
@@ -68,7 +71,7 @@ Item {
   function runSetup(what, a, b) {
     if (setupProc.running) return
     var args
-    if (what === "install") args = ["install"]
+    if (what === "install") args = ["install", daemonBinary]   // also refreshes the privileged copy when cameras are hidden
     else if (what === "hide-all") args = a ? ["hide-raw", "on", daemonBinary] : ["hide-raw", "off"]
     else if (what === "hide-camera") args = b ? ["hide-raw", "on", daemonBinary, String(a)] : ["hide-raw", "off", String(a)]
     else return
@@ -107,10 +110,24 @@ Item {
       else root.setupOutput = "install failed (" + code + "):\n" + root.setupOutput
     }
   }
+  // Is the daemon binary there? Answers the "exit 127" question: not installed
+  // yet (wait for install()) or installed but not startable (back off, tell the user).
+  property bool probeAfterExit: false
   Process {
     id: probeProc
     command: ["sh", "-c", 'test -x "$1"', "probe", root.daemonBinary]
-    onExited: function(code) { root.installed = code === 0; if (code === 0 && !daemon.running) restartTimer.restart() }
+    onExited: function(code) {
+      root.installed = code === 0
+      var afterExit = root.probeAfterExit
+      root.probeAfterExit = false
+      if (!root.installed || daemon.running) return
+      if (afterExit) {
+        root.restarts += 1
+        root.daemonError = "daemon failed to start (exit 127, see log)"
+        restartTimer.interval = Math.min(10000, 1000 + root.restarts * 1000)
+      }
+      restartTimer.restart()
+    }
   }
 
   // ---- daemon lifecycle ----
@@ -136,7 +153,7 @@ Item {
     }
     onExited: function(code, status) {
       root.state = ({})
-      if (code === 127) { root.installed = false; probeProc.running = true; return }  // not installed yet
+      if (code === 127) { root.probeAfterExit = true; probeProc.running = true; return }  // not installed yet, or unloadable: the probe decides
       root.restarts += 1
       restartTimer.interval = code === 3 ? 5000 : Math.min(10000, 1000 + root.restarts * 1000)  // 3 = another instance holds the lock
       restartTimer.restart()
@@ -176,7 +193,7 @@ Item {
         onRead: function(line) {
           try {
             var msg = JSON.parse(line)
-            if (msg && msg.type === "state") root.state = msg
+            if (msg && msg.type === "state") { root.state = msg; if (root.daemonError !== "") root.daemonError = "" }
           } catch (e) { /* reply we don't care about */ }
         }
       }

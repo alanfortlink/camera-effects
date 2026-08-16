@@ -146,6 +146,9 @@ void loadConfig(Config& c) {
       geti(j["capture"], "width", c.capW, 160, 4096);
       geti(j["capture"], "height", c.capH, 120, 4096);
     }
+    // YUYV packs two pixels per sample: the BGR->YUYV conversion (and most
+    // cameras) need even sizes, so a hand-edited odd value is rounded down.
+    c.outW &= ~1; c.outH &= ~1; c.capW &= ~1; c.capH &= ~1;
     if (j.contains("camera") && j["camera"].is_string()) c.preferredCamera = j["camera"];
     if (j.contains("settings")) settingsFromJson(j["settings"], c.settings);
     if (j.contains("sameForAll") && j["sameForAll"].is_boolean()) c.sameForAll = j["sameForAll"];
@@ -200,9 +203,17 @@ private:
   CameraInfo current_;
   bool running_ = false;
   double fps_ = 0;
-  double procMs_ = 0;   // EMA of the whole per-frame cost: decode + effects + output conversion/write
+  double procMs_ = 0;   // EMA of the displayed per-frame cost: decode + effects + output conversion/write
   int tier_ = 0;        // adaptive quality tier (0 = full, 2 = cheapest), see updateTier()
-  double overSince_ = -1, underSince_ = -1;
+  bool reactionsActive_ = false;  // a reaction is playing or queued (mirrors fx_.reactionsActive())
+  // Tier controller state (main thread only). ctrlMs_ is the EMA of the
+  // controlling metric (max of decode and processing: they run in parallel).
+  double ctrlMs_ = 0, overSince_ = -1, underSince_ = -1;
+  double holdSec_ = 10;      // headroom needed before stepping down (doubles after a failed probe)
+  double probeSince_ = -1;   // >= 0 while a step-down is on probation
+  bool probeRes_ = false;    // the current probe is the capture-size step (csLowRes_ off), not a tier step
+  bool csLowRes_ = false;    // Center Stage capture dropped to the output size (tier 2) until a probe at tier 0 shows the full size fits
+  bool lowCores_ = false;    // <= 2 hardware threads: never capture above the output size
   std::string error_, loopPath_, pwStatus_ = "off", gesture_, profileLine_;
   bool forcePreview_ = false;  // keep running even without consumers (debug)
   bool hideRawActive_ = false;
@@ -226,7 +237,8 @@ private:
   void captureLoop();
   bool nextFrame(cv::Mat& f, double* decodeMs, int ms);
   cv::Size wantedCapture();
-  void updateTier(double loopMs, double now);
+  void updateTier(double decodeMs, double loopMs, double now);
+  void resetTier(bool keepTier);
 
   // Set a client-visible field (main thread) and mark the state dirty if it changed.
   template <class T> void setState(T& field, const T& value) {
@@ -292,6 +304,7 @@ json Daemon::stateJson() {
                { "gesture", gesture_ },
                { "profile", profileLine_ },
                { "reactions", Reactions::names() },
+               { "reactionsActive", reactionsActive_ },
                { "hideRaw", hideRawActive_ },
                { "error", error_ } };
 }
@@ -316,10 +329,16 @@ CameraInfo Daemon::pickCamera() {
   return cameras_.empty() ? CameraInfo{} : cameras_[0];
 }
 
+// Center Stage captures at the (larger) capture size so it has room to zoom;
+// everything else at the output size. On a machine that cannot keep up (tier
+// 2, or two hardware threads) Center Stage works from the output size too:
+// the face detector only needs a 480x270 level anyway, only the maximum zoom
+// loses sharpness, and a 1080p MJPEG decode is what such a machine cannot afford.
 cv::Size Daemon::wantedCapture() {
   std::lock_guard<std::mutex> lk(mu_);
-  if (effectiveSettings().centerStage) return cv::Size(cfg_.capW, cfg_.capH);
-  return cv::Size(std::min(cfg_.capW, cfg_.outW), std::min(cfg_.capH, cfg_.outH));
+  cv::Size outSz(std::min(cfg_.capW, cfg_.outW), std::min(cfg_.capH, cfg_.outH));
+  if (effectiveSettings().centerStage && !lowCores_ && !csLowRes_) return cv::Size(cfg_.capW, cfg_.capH);
+  return outSz;
 }
 
 bool Daemon::openCapture(std::string* err) {
@@ -341,6 +360,7 @@ bool Daemon::openCapture(std::string* err) {
     current_ = c; capOpened_ = want; capActual_ = cv::Size(cap_.width(), cap_.height());
   }
   { std::lock_guard<std::mutex> lk(slotMu_); slotHas_ = false; slotMisses_ = 0; }
+  resetTier(true);  // new source, new timings: restart the controller (tier itself is kept across a reopen)
   capStop_ = false;
   capThread_ = std::thread([this] { captureLoop(); });
   return true;
@@ -359,10 +379,26 @@ bool Daemon::captureGrab(cv::Mat& f, int ms) { return useFile_ ? file_.grab(f, m
 // Capture thread body. `f` is reused as the decode target; swapping it with
 // the slot means the three buffers (capture, slot, processing) rotate without
 // per-frame allocation, and an unconsumed frame is simply overwritten.
+// A corrupt frame must not take the daemon down: OpenCV throws on e.g. an MJPEG
+// header claiming an absurd size or odd YUV dimensions, and a decode that
+// "succeeds" at a size far from the negotiated one is treated as a miss too
+// (it would only feed garbage sizes downstream).
 void Daemon::captureLoop() {
   cv::Mat f;
+  const int maxW = 2 * (useFile_ ? file_.width() : cap_.width()), maxH = 2 * (useFile_ ? file_.height() : cap_.height());
+  int badLogged = 0;
   while (!capStop_) {
-    bool ok = captureGrab(f, 200);
+    bool ok = false;
+    try {
+      ok = captureGrab(f, 200);
+      if (ok && (f.empty() || f.cols > maxW || f.rows > maxH)) {
+        if (badLogged++ < 3) fprintf(stderr, "camfxd: dropping %dx%d frame (negotiated up to %dx%d)\n", f.cols, f.rows, maxW, maxH);
+        ok = false;
+      }
+    } catch (const std::exception& e) {
+      if (badLogged++ < 3) fprintf(stderr, "camfxd: decode failed: %s\n", e.what());
+      ok = false;
+    }
     std::lock_guard<std::mutex> lk(slotMu_);
     if (ok) {
       std::swap(f, slotFrame_);
@@ -391,22 +427,60 @@ bool Daemon::nextFrame(cv::Mat& f, double* decodeMs, int ms) {
   return false;
 }
 
-// Adaptive quality. The whole per-frame cost (decode + effects + output) is
-// tracked as an EMA against a budget of 80% of the frame period; sustained
-// overrun (~2 s) raises the tier, sustained headroom (<50% of the budget for
-// ~10 s) lowers it again. Tiers only cheapen the effects (see effects.cpp:
-// segmenter every 2nd/3rd frame, slower gesture/face cadence, single blur
-// pass, portrait at 1/8); passthrough is unaffected.
-void Daemon::updateTier(double loopMs, double now) {
+// Adaptive quality. The controlling metric is the larger of decode time and
+// processing time (they run on different threads), tracked as an EMA against a
+// budget of 80% of the frame period. Sustained overrun (~2 s) raises the tier.
+// Stepping down is a probe: after holdSec_ (10 s) below 70% of the budget the
+// tier drops; if that overruns the budget within 5 s it is reverted and the
+// hold doubles (thrash guard, reset by the next successful probe). Tiers only
+// cheapen the effects (see effects.cpp: segmenter every 2nd/3rd frame, slower
+// gesture/face cadence, single blur pass, portrait at 1/8); passthrough is
+// unaffected. Tier 2 additionally drops the Center Stage capture to the output
+// size (csLowRes_, see wantedCapture); going back up to the full capture size
+// is the last probe step after tier 0 fits.
+void Daemon::updateTier(double decodeMs, double loopMs, double now) {
   double budget = 0.8 * 1000.0 / std::max(1, cfg_.fps);
-  double ema;
-  { std::lock_guard<std::mutex> lk(mu_); procMs_ = procMs_ == 0 ? loopMs : procMs_ * 0.9 + loopMs * 0.1; ema = procMs_; }
+  double ctrl = std::max(decodeMs, loopMs);
+  ctrlMs_ = ctrlMs_ == 0 ? ctrl : ctrlMs_ * 0.9 + ctrl * 0.1;
+  { std::lock_guard<std::mutex> lk(mu_); double sum = decodeMs + loopMs; procMs_ = procMs_ == 0 ? sum : procMs_ * 0.9 + sum * 0.1; }
+  double ema = ctrlMs_;
   int t = tier_;
-  if (ema > budget) { if (overSince_ < 0) overSince_ = now; else if (now - overSince_ > 2.0 && t < 2) { t++; overSince_ = -1; } }
-  else overSince_ = -1;
-  if (ema < 0.5 * budget) { if (underSince_ < 0) underSince_ = now; else if (now - underSince_ > 10.0 && t > 0) { t--; underSince_ = -1; } }
-  else underSince_ = -1;
-  if (t != tier_) { fx_.setTier(t); setState(tier_, t); fprintf(stderr, "camfxd: quality tier %d (%.1f ms/frame, budget %.1f)\n", t, ema, budget); }
+  bool lowRes = csLowRes_;
+  bool probing = probeSince_ >= 0;
+  if (probing && now - probeSince_ > 5.0) { probeSince_ = -1; probing = false; holdSec_ = 10; }  // probe passed
+  if (ema > budget) {
+    if (probing) {  // the step-down did not fit: back up at once, wait longer next time
+      if (probeRes_) lowRes = true; else t = std::min(t + 1, 2);
+      probeSince_ = -1; overSince_ = -1; holdSec_ = std::min(holdSec_ * 2, 160.0);
+    } else if (overSince_ < 0) overSince_ = now;
+    else if (now - overSince_ > 2.0 && t < 2) { t++; overSince_ = -1; }
+  } else overSince_ = -1;
+  if (ema < 0.7 * budget) {
+    if (underSince_ < 0) underSince_ = now;
+    else if (now - underSince_ > holdSec_ && !probing && (t > 0 || lowRes)) {
+      probeRes_ = t == 0;  // tier 0 already: the remaining step is the capture size
+      if (probeRes_) lowRes = false; else t--;
+      underSince_ = -1; probeSince_ = now;
+    }
+  } else underSince_ = -1;
+  if (t >= 2) lowRes = true;
+  if (t != tier_ || lowRes != csLowRes_) {
+    fx_.setTier(t);
+    setState(tier_, t);
+    setState(csLowRes_, lowRes);
+    fprintf(stderr, "camfxd: quality tier %d%s (%.1f ms/frame, budget %.1f, hold %.0f s)\n", t, lowRes ? " (capture at output size)" : "", ema, budget, holdSec_);
+  }
+}
+
+// Restart the controller's timing after a (re)open, or forget everything when
+// the camera goes idle. The tier survives a reopen (a Center Stage or camera
+// switch does not change the machine); a probe in flight gets a fresh window.
+void Daemon::resetTier(bool keepTier) {
+  ctrlMs_ = 0; overSince_ = underSince_ = -1;
+  { std::lock_guard<std::mutex> lk(mu_); procMs_ = 0; }
+  if (keepTier) { if (probeSince_ >= 0) probeSince_ = nowSec(); return; }
+  probeSince_ = -1; probeRes_ = false; holdSec_ = 10;
+  if (tier_ != 0 || csLowRes_) { fx_.setTier(0); setState(tier_, 0); setState(csLowRes_, false); }
 }
 
 // Runs on the server thread. Requests come from same-uid clients but may be
@@ -472,12 +546,16 @@ bool ensureRuntimeDir(const std::string& dir, std::string* err) {
 int Daemon::run() {
   // The shell owns us: exit with it rather than linger as an orphan the next
   // shell cannot manage (it also asks a stray instance to quit, belt and braces).
+  // The kernel clears this flag on every credential change, and the setgid
+  // (hide-raw) build switches gid for each consumer scan: ConsumerWatcher
+  // re-arms it after every restore (loopback.cpp).
   prctl(PR_SET_PDEATHSIG, SIGTERM);
   // OpenCV's worker threads spin after every parallel region: with one thread
   // per core the passthrough loop burns 3-4x the CPU time for the same wall
   // time. Two threads (one on a dual-core) keeps the CPU for the video apps.
   unsigned hw = std::thread::hardware_concurrency();
   cv::setNumThreads(hw <= 2 ? 1 : 2);
+  lowCores_ = hw > 0 && hw <= 2;
   runtimeDir_ = xdgRuntime() + "/omarchy-camera";
   std::string err;
   if (!ensureRuntimeDir(runtimeDir_, &err)) { fprintf(stderr, "camfxd: %s\n", err.c_str()); return 1; }
@@ -503,6 +581,7 @@ int Daemon::run() {
   auto lastLoopCheck = clk::now() - std::chrono::seconds(10);
   auto lastScan = clk::now() - std::chrono::seconds(10);
   auto lastPublish = clk::now();
+  auto lastPwCheck = clk::now();
   bool wasRunning = false;
   int frames = 0;
   auto fpsT0 = clk::now();
@@ -523,6 +602,8 @@ int Daemon::run() {
       } else setError(err);
     }
     if (now - lastScan > std::chrono::seconds(running_ ? 10 : 4)) { lastScan = now; rescanCameras(); }
+    // PipeWire restarted / stream error: reconnect with backoff, show it meanwhile.
+    if (now - lastPwCheck > std::chrono::seconds(1)) { lastPwCheck = now; setState(pwStatus_, pwOut_.maintain(nowSec())); }
     setState(hideRawActive_, fileExists("/etc/udev/rules.d/71-omarchy-camera-hide-raw.rules"));
 
     bool preview;
@@ -541,6 +622,7 @@ int Daemon::run() {
     }
     if (!want && captureOpen()) {
       captureClose();
+      resetTier(false);  // idle: back to full quality for the next opener
       // Leave black behind so the next opener doesn't see a stale frame.
       cv::Mat black(cfg_.outH, cfg_.outW, CV_8UC3, cv::Scalar(0, 0, 0));
       if (loop_.isOpen()) loop_.write(black);
@@ -578,9 +660,10 @@ int Daemon::run() {
           fprintf(stderr, "camfxd: frame dropped: %s\n", e.what());
           continue;
         }
-        double ms = decodeMs + std::chrono::duration<double, std::milli>(clk::now() - p0).count();
-        updateTier(ms, nowSec());  // also updates procMs_ (shown with the next publish)
+        double loopMs = std::chrono::duration<double, std::milli>(clk::now() - p0).count();
+        updateTier(decodeMs, loopMs, nowSec());  // also updates procMs_ (shown with the next publish)
         setState(gesture_, fx_.lastGesture());
+        setState(reactionsActive_, fx_.reactionsActive());
         setState(profileLine_, fx_.profileLine());
         frames++;
         auto dt = std::chrono::duration<double>(now - fpsT0).count();
@@ -590,6 +673,7 @@ int Daemon::run() {
         if (++misses_ > 15) { misses_ = 0; captureClose(); rescanCameras(); }
       }
     } else {
+      setState(reactionsActive_, fx_.reactionsActive());  // queued while idle: shown as pending
       std::this_thread::sleep_for(std::chrono::milliseconds(60));
     }
 

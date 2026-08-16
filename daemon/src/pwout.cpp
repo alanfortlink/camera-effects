@@ -6,6 +6,7 @@
 #include <spa/pod/builder.h>
 #include <string.h>
 
+#include <algorithm>
 #include <cstdio>
 
 struct PwCallbacks {
@@ -14,7 +15,17 @@ struct PwCallbacks {
   static void stateChanged(void* data, pw_stream_state old, pw_stream_state state, const char* error) {
     static_cast<PipeWireOutput*>(data)->onStateChanged((int)old, (int)state, error);
   }
+  static void coreError(void* data, uint32_t id, int seq, int res, const char* message) {
+    static_cast<PipeWireOutput*>(data)->onCoreError(id, seq, res, message);
+  }
 };
+
+static const pw_core_events kCoreEvents = [] {
+  pw_core_events ev{};
+  ev.version = PW_VERSION_CORE_EVENTS;
+  ev.error = PwCallbacks::coreError;
+  return ev;
+}();
 
 static const pw_stream_events kStreamEvents = {
   PW_VERSION_STREAM_EVENTS,
@@ -32,9 +43,20 @@ static const pw_stream_events kStreamEvents = {
 };
 
 bool PipeWireOutput::start(int w, int h, int fps, const std::string& label, std::function<void(bool)> onActive, std::string* err) {
+  std::string e;
+  bool ok = startImpl(w, h, fps, label, std::move(onActive), &e);
+  status_ = ok ? "ok" : e;
+  if (ok) { everConnected_ = true; okSince_ = -1; }
+  if (err) *err = e;
+  return ok;
+}
+
+bool PipeWireOutput::startImpl(int w, int h, int fps, const std::string& label, std::function<void(bool)> onActive, std::string* err) {
   stop();
   w_ = w; h_ = h; fps_ = fps > 0 ? fps : 30;
+  label_ = label;
   onActive_ = std::move(onActive);
+  failed_ = false;
   pw_init(nullptr, nullptr);
   loop_ = pw_thread_loop_new("camfxd-pw", nullptr);
   if (!loop_) { if (err) *err = "pw_thread_loop_new failed"; return false; }
@@ -44,6 +66,8 @@ bool PipeWireOutput::start(int w, int h, int fps, const std::string& label, std:
   if (pw_thread_loop_start(loop_) < 0) { pw_thread_loop_unlock(loop_); if (err) *err = "pw_thread_loop_start failed"; stop(); return false; }
   core_ = pw_context_connect(context_, nullptr, 0);
   if (!core_) { pw_thread_loop_unlock(loop_); if (err) *err = "cannot connect to PipeWire"; stop(); return false; }
+  coreListener_ = new spa_hook{};
+  pw_core_add_listener(core_, coreListener_, &kCoreEvents, this);
 
   pw_properties* props = pw_properties_new(
       PW_KEY_MEDIA_CLASS, "Video/Source",
@@ -84,21 +108,63 @@ void PipeWireOutput::stop() {
   if (loop_) pw_thread_loop_lock(loop_);
   if (stream_) { pw_stream_destroy(stream_); stream_ = nullptr; }
   if (listener_) { delete listener_; listener_ = nullptr; }
+  if (coreListener_) { spa_hook_remove(coreListener_); delete coreListener_; coreListener_ = nullptr; }
   if (core_) { pw_core_disconnect(core_); core_ = nullptr; }
   if (loop_) pw_thread_loop_unlock(loop_);
   if (loop_) pw_thread_loop_stop(loop_);
   if (context_) { pw_context_destroy(context_); context_ = nullptr; }
   if (loop_) { pw_thread_loop_destroy(loop_); loop_ = nullptr; }
-  active_ = false;
+  failed_ = false;
+  // Consumers that were linked are gone with the node: tell the owner so it
+  // does not keep the camera running for them.
+  if (active_.exchange(false) && onActive_) onActive_(false);
 }
 
-void PipeWireOutput::onStateChanged(int, int state, const char* error) {
+std::string PipeWireOutput::maintain(double now) {
+  bool healthy = stream_ && !failed_.load();
+  if (healthy) {
+    if (okSince_ < 0) okSince_ = now;
+    if (now - okSince_ > 30) backoff_ = 2;  // stable for a while: forget the backoff
+    return status_ = "ok";
+  }
+  okSince_ = -1;
+  if (stream_) {  // just failed: tear down now, come back after the backoff
+    fprintf(stderr, "camfxd: pipewire stream lost, reconnecting in %.0f s\n", backoff_);
+    stop();
+    status_ = "reconnecting";
+    retryAt_ = now + backoff_;
+    backoff_ = std::min(backoff_ * 2, 30.0);
+    return status_;
+  }
+  if (!everConnected_ && retryAt_ == 0) retryAt_ = now + backoff_;  // first start failed: same schedule
+  if (now < retryAt_) return status_;
+  std::string err;
+  if (start(w_, h_, fps_, label_, onActive_, &err)) {
+    fprintf(stderr, "camfxd: pipewire output back\n");
+    return status_;  // "ok"
+  }
+  status_ = err;
+  retryAt_ = now + backoff_;
+  backoff_ = std::min(backoff_ * 2, 30.0);
+  return status_;
+}
+
+void PipeWireOutput::onStateChanged(int old, int state, const char* error) {
   bool streaming = state == PW_STREAM_STATE_STREAMING;
   if (error) fprintf(stderr, "camfxd: pipewire stream error: %s\n", error);
+  // Error, or dropped back to unconnected after having been up: the owner's
+  // maintain() re-creates the node (nothing may be torn down from this thread).
+  if (state == PW_STREAM_STATE_ERROR || (state == PW_STREAM_STATE_UNCONNECTED && old > PW_STREAM_STATE_CONNECTING)) failed_ = true;
   if (streaming != active_.load()) {
     active_ = streaming;
     if (onActive_) onActive_(streaming);
   }
+}
+
+void PipeWireOutput::onCoreError(uint32_t id, int, int res, const char* message) {
+  if (id != PW_ID_CORE) return;
+  fprintf(stderr, "camfxd: pipewire core error: %s (%d)\n", message ? message : "", res);
+  failed_ = true;
 }
 
 void PipeWireOutput::onParamChanged(uint32_t id, const void* param) {

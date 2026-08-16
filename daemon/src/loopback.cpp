@@ -7,7 +7,9 @@
 #include <fcntl.h>
 #include <linux/videodev2.h>
 #include <poll.h>
+#include <signal.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -100,13 +102,17 @@ void ConsumerWatcher::stop() {
 // processes of our own uid are readable anyway; that is also exactly the set
 // that can open the loopback (apps of the logged-in user). When running
 // setgid the scan drops to the real gid for its duration (see g_credMutex).
+// glibc applies setegid() to every thread, and the kernel clears
+// PR_SET_PDEATHSIG (and the dumpable flag) on each such credential change, so
+// the "die with the shell" flag from main.cpp is re-armed after the restore; it
+// is per thread and one armed thread is enough for the whole process.
 int ConsumerWatcher::scanProc() {
   struct stat target{};
   if (stat(path_.c_str(), &target) != 0) return 0;
   std::lock_guard<std::mutex> lk(g_credMutex);
   gid_t egid = getegid(), rgid = getgid();
   bool dropped = egid != rgid && setegid(rgid) == 0;
-  struct Restore { bool on; gid_t g; ~Restore() { if (on) (void)!setegid(g); } } restore{ dropped, egid };
+  struct Restore { bool on; gid_t g; ~Restore() { if (on) { (void)!setegid(g); prctl(PR_SET_PDEATHSIG, SIGTERM); } } } restore{ dropped, egid };
   pid_t self = getpid();
   int count = 0;
   DIR* proc = opendir("/proc");
