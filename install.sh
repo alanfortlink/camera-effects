@@ -18,9 +18,21 @@ privileged() {  # run the setup script as root, silently if sudo allows it
 if [[ ${1:-} == --uninstall ]]; then
   omarchy-plugin-disable "$ID" 2>/dev/null || true
   privileged uninstall || true
-  rm -rf "$LIB" "$DATA" "$BIN/camfxd" "$PLUGIN"
+  rm -rf "$LIB" "$DATA" "$BIN/camfxd"
+  [[ -L $PLUGIN ]] && rm -f "$PLUGIN"   # dev symlink; a real checkout is removed with `omarchy plugin remove tank.camera`
   echo "uninstalled (config left in ~/.config/omarchy/camera.json)"
   exit 0
+fi
+
+# Build/runtime dependencies (all in the Omarchy/Arch repos).
+missing=()
+for p in gcc make pkgconf opencv onnxruntime pipewire qt6-multimedia v4l2loopback-dkms; do
+  pacman -Q "$p" >/dev/null 2>&1 || missing+=("$p")
+done
+if ((${#missing[@]})); then
+  echo "› installing missing packages: ${missing[*]}"
+  if sudo -n true 2>/dev/null; then sudo pacman -S --needed --noconfirm "${missing[@]}"
+  else pkexec pacman -S --needed --noconfirm "${missing[@]}"; fi
 fi
 
 echo "› building daemon"
