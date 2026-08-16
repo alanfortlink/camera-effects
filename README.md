@@ -2,11 +2,18 @@
 
 macOS-style camera effects for Omarchy: Center Stage, Portrait, Studio Light, backgrounds, filters, reactions and a privacy shutter, on any webcam, in every app.
 
-It runs as a virtual camera called **Camera Effects** that you pick in Zoom, Meet, OBS or anything else, and a panel in the bar where you switch things on and off while watching a live preview.
+It runs as a virtual camera called **Camera Effects** that you pick in Zoom, Meet, OBS or anything else, and a panel in the bar where you switch things on and off while watching a live preview
 
 > Tested only on **Omarchy 4** (Arch Linux, Hyprland, omarchy-shell).
->
-> Video walkthrough: coming soon.
+
+
+
+https://github.com/user-attachments/assets/1a460e2d-d732-4391-97cc-6155982c594f
+
+
+
+Thanks to [@prettyletto](https://github.com/prettyletto) for sending me this video.
+
 
 ## What you get
 
