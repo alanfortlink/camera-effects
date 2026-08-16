@@ -45,6 +45,30 @@ ensure_tools() {
   fi
 }
 
+# The dkms module only exists for kernels that have headers installed and had a
+# build. On a fresh machine that usually means: install <kernel>-headers, run
+# dkms, then modprobe. Do all of it here so "Set up virtual camera" just works.
+ensure_module() {
+  local krel; krel=$(uname -r)
+  if ! modprobe v4l2loopback 2>/dev/null; then
+    if [[ ! -e /usr/lib/modules/$krel/build ]]; then
+      # Kernel flavour from the release string: 7.1.8-arch1-3 -> linux, -zen -> linux-zen, …
+      local flavour=linux
+      case "$krel" in *-zen*) flavour=linux-zen;; *-lts*) flavour=linux-lts;; *-hardened*) flavour=linux-hardened;; *-rt-lts*) flavour=linux-rt-lts;; *-rt*) flavour=linux-rt;; esac
+      # Only when that kernel package is what is running; otherwise leave it to the user.
+      if pacman -Q "$flavour" >/dev/null 2>&1; then
+        echo "Installing ${flavour}-headers for $krel…"
+        pacman -S --noconfirm --needed "${flavour}-headers" || true
+      fi
+    fi
+    if [[ -e /usr/lib/modules/$krel/build ]] && command -v dkms >/dev/null; then
+      echo "Building v4l2loopback for $krel…"
+      dkms autoinstall -k "$krel" >/dev/null 2>&1 || dkms autoinstall >/dev/null 2>&1 || true
+      modprobe v4l2loopback 2>/dev/null || true
+    fi
+  fi
+}
+
 cmd_install() {
   need_root
   local bin=${1:-} src=${2:-}
@@ -56,7 +80,7 @@ cmd_install() {
     echo "options v4l2loopback devices=0" > "$MODPROBE"
   fi
   echo v4l2loopback > "$MODLOAD"
-  modprobe v4l2loopback 2>/dev/null || true
+  ensure_module
   cat > "$UNIT" <<EOF
 [Unit]
 Description=Camera Effects virtual video device
@@ -95,7 +119,7 @@ EOF
   # Loud failures: a kernel updated but not rebooted (running kernel != installed
   # headers), a failed dkms build, or missing headers all leave the module unloadable.
   if [[ ! -e /dev/v4l2loopback ]]; then
-    echo "v4l2loopback is not loadable for the running kernel $(uname -r): reboot if the kernel was just updated, otherwise check 'dkms status' and 'sudo modprobe v4l2loopback'" >&2
+    echo "v4l2loopback is not loadable for the running kernel $(uname -r). If the kernel was just updated, reboot. Otherwise: sudo pacman -S linux-headers (matching your kernel), sudo dkms autoinstall, sudo modprobe v4l2loopback — then click Set up again. Details: dkms status" >&2
     exit 1
   fi
   # udev needs a moment to apply the ACL for the seat user

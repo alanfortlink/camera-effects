@@ -36,9 +36,16 @@ fi
 
 # Build/runtime dependencies (all in the Omarchy/Arch repos).
 missing=()
-for p in gcc make pkgconf opencv onnxruntime pipewire qt6-multimedia v4l2loopback-dkms; do
+for p in gcc make pkgconf opencv onnxruntime pipewire qt6-multimedia v4l2loopback-dkms dkms; do
   pacman -Q "$p" >/dev/null 2>&1 || missing+=("$p")
 done
+# The dkms module needs the running kernel's headers; pick the package for this kernel flavour.
+krel=$(uname -r)
+if [[ ! -e /usr/lib/modules/$krel/build ]]; then
+  flavour=linux
+  case "$krel" in *-zen*) flavour=linux-zen;; *-lts*) flavour=linux-lts;; *-hardened*) flavour=linux-hardened;; *-rt-lts*) flavour=linux-rt-lts;; *-rt*) flavour=linux-rt;; esac
+  pacman -Q "$flavour" >/dev/null 2>&1 && missing+=("${flavour}-headers")
+fi
 if ((${#missing[@]})); then
   echo "› installing missing packages: ${missing[*]} (password prompt)"
   # --no-root never uses sudo (a cached ticket must not change what it does): pkexec asks.
