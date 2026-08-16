@@ -8,13 +8,6 @@ privacy shutter on any webcam, published as a virtual camera called
 > Tested only on **Omarchy 4** (Arch Linux, Hyprland, omarchy-shell).
 > Video walkthrough: coming soon.
 
-| Bar icon (lit while an app uses the camera) | Panel |
-|---|---|
-| ![bar](docs/bar.png) | ![panel](docs/panel.png) |
-
-| Effects on | Reaction |
-|---|---|
-| ![effects](docs/effects.png) | ![reaction](docs/reaction.png) |
 
 ## Install
 
