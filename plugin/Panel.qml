@@ -110,9 +110,10 @@ Panel {
   function footer() {
     if (!svc || !connected) return ""
     var res = svc.state.output ? " · " + svc.state.output.width + "×" + svc.state.output.height : ""
+    // Keep it under ~50 monospace caption characters so it never elides.
     var use = appCount > 0 ? appCount + " app" + (appCount > 1 ? "s" : "") + " connected"
-            : previewActive ? "preview only (camera on while open)" : "idle"
-    return "Virtual camera" + res + " · " + use
+            : previewActive ? "Preview only · camera on while open" : "Idle"
+    return use + res
   }
 
   BarIconButton {
@@ -272,6 +273,7 @@ Panel {
               }
             }
           }
+          Item { width: parent.width; height: Style.space(4) }  // hero → preview breathing room
 
           // ---------- Not installed / needs setup ----------
           Row {
@@ -378,7 +380,9 @@ Panel {
             onToggled: if (root.svc) root.svc.setSameForAll(!root.svc.sameForAll)
           }
 
+          Item { width: parent.width; height: Style.space(6) }
           PanelSeparator { foreground: root.fg }
+          Item { width: parent.width; height: Style.space(4) }
 
           // ---------- Effects ----------
           PanelSectionHeader {
@@ -426,9 +430,11 @@ Panel {
               }
               TextField {
                 id: colorField
-                readonly property bool valid: /^#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$/.test(text)
+                readonly property bool valid: /^#[0-9a-fA-F]{6}$/.test(text)   // daemon accepts #RRGGBB only
                 visible: root.s.background === "color"
                 width: Style.space(96)
+                height: bgDropdown.height
+                verticalAlignment: TextInput.AlignVCenter
                 foreground: root.fg
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -437,6 +443,7 @@ Panel {
                 onEditingFinished: if (root.svc && valid) root.svc.setSetting("backgroundColor", text)
               }
               Dropdown {
+                id: bgDropdown
                 width: Style.space(96)
                 showLabel: false
                 fontFamily: root.fontFamily
@@ -529,7 +536,9 @@ Panel {
           }
           SwitchRow { label: "Mirror"; checked: !!root.s.mirror; onToggled: if (root.svc) root.svc.setSetting("mirror", !root.s.mirror) }
 
+          Item { width: parent.width; height: Style.space(6) }
           PanelSeparator { foreground: root.fg }
+          Item { width: parent.width; height: Style.space(4) }
 
           // ---------- Privacy ----------
           PanelSectionHeader { text: "PRIVACY"; foreground: root.fg; fontFamily: root.fontFamily }
