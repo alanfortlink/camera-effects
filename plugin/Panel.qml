@@ -392,6 +392,11 @@ Panel {
   onBlockSourceNowChanged: blockKindPick = ""
   readonly property string blockKind: blockKindPick !== "" ? blockKindPick : blockKindOf(blockSourceNow)
 
+  // Everything on the card except the preview, in the card's own coordinates:
+  // what the preview must leave room for (see previewBox.roomH).
+  readonly property real restH: topBlock.implicitHeight + Style.space(6) + previewNote.blockH + Style.space(10)
+                                + body.implicitHeight + footerBlock.height
+
   KeyboardPanel {
     id: panel
     anchorItem: button
@@ -399,10 +404,13 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(380))
-    // No cap (like network/bluetooth): the screen governs. The status footer
-    // is pinned under the ScrollView so it never scrolls or clips away.
-    contentHeight: panel.fittedContentHeight(column.implicitHeight + footerBlock.height)
+    // Hero and preview stay put at the top; below them two columns (camera
+    // and framing | video effects and privacy) scroll when the screen is
+    // short. The screen governs both axes (no cap, like network/bluetooth);
+    // the status footer is pinned under the ScrollView so it never scrolls
+    // or clips away.
+    contentWidth: panel.fittedContentWidth(Style.space(700))
+    contentHeight: panel.fittedContentHeight(root.restH + previewRow.height)
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -410,596 +418,661 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
+      // ---------- Fixed top: hero · setup · preview ----------
+      Column {
+        id: topBlock
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        spacing: Style.space(6)
+
+        // ---------- Hero ----------
+        PanelHero {
+          width: parent.width
+          title: root.svc ? root.svc.loopbackLabel : "Camera Effects"
+          meta: root.subtitle()
+          foreground: root.fg
+          fontFamily: root.fontFamily
+          iconComponent: Component {
+            Text {
+              text: "󰄀"
+              color: root.appsConnected ? Color.accent : root.fg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.display
+            }
+          }
+        }
+        Item { width: parent.width; height: Style.space(4) }  // hero → preview breathing room
+
+        // ---------- Not installed / needs setup / needs rebuild ----------
+        Row {
+          width: parent.width
+          spacing: Style.space(8)
+          visible: root.svc && !root.svc.setupBusy && (!root.svc.installed || root.svc.deviceMissing || root.needsRebuild)
+          Button {
+            text: root.svc && !root.svc.installed ? "Install (build daemon)"
+                : root.needsRebuild ? "Rebuild daemon" : "Set up virtual camera"
+            foreground: root.fg
+            fontFamily: root.fontFamily
+            bordered: true
+            onClicked: {
+              if (!root.svc) return
+              if (!root.svc.installed || root.needsRebuild) root.svc.install()
+              else root.svc.runSetup("install")
+            }
+          }
+        }
+        Text {
+          width: parent.width
+          visible: root.svc && (root.svc.setupOutput !== "" || (root.needsRebuild && root.svc.daemonLog !== ""))
+          wrapMode: Text.WordWrap
+          text: root.svc ? (root.svc.setupOutput !== "" ? root.svc.setupOutput
+                            : root.svc.daemonLog.trim().split("\n").slice(-3).join("\n")) : ""
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      Item {  // preview row: full width; the box itself may be narrower (see previewBox)
+        id: previewRow
+        anchors.top: topBlock.bottom
+        anchors.topMargin: Style.space(6)
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: previewBox.visible ? previewBox.height : 0
+
+        Rectangle {
+          id: previewBox
+          // Full width at 16:9 when the screen allows; on a short screen it
+          // shrinks (still 16:9, centred) so the columns below fit in their
+          // default state, down to a floor — past that the columns scroll.
+          readonly property int fullH: Math.round(parent.width * 9 / 16)
+          readonly property int roomH: Math.floor(panel.availableCardHeight - panel.verticalContentInset - root.restH)
+          height: Math.max(Style.space(140), Math.min(fullH, roomH))
+          width: height >= fullH ? parent.width : Math.round(height * 16 / 9)
+          anchors.horizontalCenter: parent.horizontalCenter
+          radius: Style.cornerRadius
+          color: "#000000"
+          clip: true
+          visible: root.connected && root.svc && root.svc.loopback !== ""
+
+          Loader {
+            id: previewLoader
+            anchors.fill: parent
+            // Only while the panel is on screen: previewActive asks the
+            // daemon to run the pipeline (camera on) and write the preview.
+            active: root.opened && previewBox.visible
+            source: Qt.resolvedUrl("Preview.qml")
+            onLoaded: {
+              item.path = root.svc.previewPath
+              // Keep the preview a mirror view of yourself whatever the
+              // output setting is: undo the flip only when the feed
+              // itself is already mirrored.
+              // Self-view convention: the preview is a mirror unless the user turns it off; the
+              // placeholder is never flipped. This is display-only — apps get the unflipped output
+              // (or the mirrored one when "Mirror output" is on).
+              item.mirror = Qt.binding(function() { return !root.blocked && root.svc && root.svc.previewMirror })
+            }
+          }
+          // Black until the daemon delivers its first live frame.
+          Rectangle {
+            anchors.fill: parent
+            color: "#000000"
+            visible: !root.inUse || !previewLoader.item || !previewLoader.item.ready
+            Text {
+              anchors.centerIn: parent
+              text: root.connected && root.svc && root.svc.camera && root.svc.camera.name ? "Starting camera…" : "No camera"
+              color: Qt.rgba(1, 1, 1, 0.5)  // the box is always black
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+          MouseArea {  // drag pans, wheel zooms, double-click resets (the camera's framing, or the placeholder's while blocked)
+            id: panArea
+            anchors.fill: parent
+            preventStealing: true   // a vertical pan drag is not a scroll (the ScrollView's Flickable would grab it)
+            enabled: root.framingEnabled && !!previewLoader.item
+            acceptedButtons: Qt.LeftButton
+            cursorShape: !enabled || !root.panEnabled ? Qt.ArrowCursor : (pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor)
+            property real startX: 0
+            property real startY: 0
+            property real panX0: 0
+            property real panY0: 0
+            property var pending: null
+            onPressed: function(mouse) { startX = mouse.x; startY = mouse.y; panX0 = root.panXNow; panY0 = root.panYNow }
+            onPositionChanged: function(mouse) {
+              if (!pressed || !root.panEnabled || !root.svc) return
+              var r = root.svc.panRange
+              var rx = r[0] || 0, ry = r[1] || 0
+              if (rx <= 0 && ry <= 0) return
+              // pan = the crop's place in its free range (-1..1); the range covers 2 * r * (preview size) px.
+              // The preview shows the output as apps get it: dragging the picture right moves the crop left
+              // (-1); when the output is mirrored the picture is flipped, so the sign flips too. Rotation
+              // needs no correction: pan applies to the rotated frame, which is what the preview shows.
+              var flipped = !root.blocked && ((!!root.s.mirror) !== (!!(root.svc && root.svc.previewMirror)))
+              var sx = flipped ? 1 : -1
+              var px = rx > 0 ? Math.max(-1, Math.min(1, panX0 + sx * (mouse.x - startX) / (rx * width))) : panX0
+              var py = ry > 0 ? Math.max(-1, Math.min(1, panY0 - (mouse.y - startY) / (ry * height))) : panY0
+              pending = { panX: Math.round(px * 1000) / 1000, panY: Math.round(py * 1000) / 1000 }
+              if (!panThrottle.running) { panThrottle.flush(); panThrottle.start() }  // ~20 Hz
+            }
+            onReleased: panThrottle.flush()
+            onDoubleClicked: root.setFraming({ zoom: 1, panX: 0, panY: 0 })
+            onWheel: function(wheel) {
+              var z = Math.round(Math.max(1, Math.min(4, root.zoomLive + (wheel.angleDelta.y > 0 ? 0.1 : -0.1))) * 10) / 10
+              if (z === root.zoomLive) return
+              root.zoomLive = z
+              zoomTouched.restart()
+              root.setFraming({ zoom: z })
+            }
+            Timer {
+              id: panThrottle
+              interval: 50
+              function flush() { if (panArea.pending) { root.setFraming(panArea.pending); panArea.pending = null } }
+              onTriggered: flush()
+            }
+          }
+          Rectangle {  // gesture the daemon currently sees, and what it will trigger
+            anchors.left: parent.left
+            anchors.bottom: parent.bottom
+            anchors.margins: Style.space(8)
+            visible: !!root.svc && !!root.s.reactions && root.svc.gesture !== "" && !badgeHide.running && !!previewLoader.item && previewLoader.item.ready
+            color: "#aa000000"
+            radius: Style.space(4)
+            width: gestureText.implicitWidth + Style.space(12)
+            height: gestureText.implicitHeight + Style.space(6)
+            Text {
+              id: gestureText
+              anchors.centerIn: parent
+              text: root.svc ? root.gestureTitle(root.svc.gesture) + " → " + root.effectTitle(root.svc.gesture) : ""
+              color: "#fff"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+          Rectangle {  // shutter button: snapshot of what apps see (after a 3 s countdown)
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.margins: Style.space(8)
+            visible: !!root.svc && root.snapCount === 0 && !!previewLoader.item && previewLoader.item.ready
+            color: snapArea.containsMouse ? "#cc000000" : "#aa000000"
+            radius: Style.space(4)
+            width: snapGlyph.implicitWidth + Style.space(12)
+            height: snapGlyph.implicitHeight + Style.space(6)
+            Text {
+              id: snapGlyph
+              anchors.centerIn: parent
+              text: "󰄀"
+              color: "#fff"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+            }
+            MouseArea {
+              id: snapArea
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.snap()
+            }
+            PanelToolTip { visible: snapArea.containsMouse; text: "Snapshot · saved to ~/Pictures/Camera Effects and copied"; fontFamily: root.fontFamily }
+          }
+          Rectangle {  // countdown: a big centred number on a dim backdrop
+            anchors.centerIn: parent
+            visible: root.snapCount > 0
+            color: "#aa000000"
+            radius: Style.space(8)
+            width: Math.max(snapCountText.implicitHeight, snapCountText.implicitWidth) + Style.space(24)
+            height: width
+            Text {
+              id: snapCountText
+              anchors.centerIn: parent
+              text: root.snapCount > 0 ? String(root.snapCount) : ""
+              color: "#fff"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.display * 2
+              font.bold: true
+            }
+          }
+          Rectangle {  // shutter flash when the snapshot is saved
+            id: snapFlashRect
+            anchors.fill: parent
+            color: "#ffffff"
+            opacity: 0
+            NumberAnimation { id: snapFlash; target: snapFlashRect; property: "opacity"; from: 0.85; to: 0; duration: 400; easing.type: Easing.OutQuad }
+          }
+        }
+      }
+      // Its height comes from the font, not the Text's implicit size: that
+      // size feeds the card height (root.restH), and a Text's implicitHeight
+      // read inside that synchronous chain trips the binding-loop detector.
+      FontMetrics { id: noteMetrics; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+      Note {
+        id: previewNote
+        readonly property real blockH: visible ? height + Style.space(6) : 0
+        anchors.top: previewRow.bottom
+        anchors.topMargin: visible ? Style.space(6) : 0
+        height: visible ? Math.ceil(noteMetrics.height) : 0
+        visible: previewBox.visible && root.previewActive && (root.centerStageOn || root.panEnabled)
+        text: root.centerStageOn ? "Center Stage frames automatically" : "Drag to pan · scroll to zoom"
+      }
+
+      // ---------- Scrolling body: two columns ----------
       ScrollView {
         id: scrollArea
-        anchors.top: parent.top
+        anchors.top: previewNote.bottom
+        anchors.topMargin: Style.space(10)
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: footerBlock.top
         clip: true
+        readonly property bool overflows: body.implicitHeight > height + 1  // +1: rounding slack
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-        ScrollBar.vertical.policy: column.implicitHeight > height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+        ScrollBar.vertical.policy: overflows ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+        // The ScrollView's Flickable takes the wheel (and can be dragged) only
+        // while interactive; tie that to overflow, like the audio panel, so a
+        // short list never bounces. The preview keeps its own wheel (zoom).
+        Binding {
+          target: scrollArea.contentItem
+          property: "interactive"
+          value: scrollArea.overflows
+        }
 
-        Column {
-          id: column
+        Item {
+          id: body
+          readonly property int gap: Style.space(16)
           width: scrollArea.availableWidth
-          spacing: Style.space(6)
+          implicitWidth: width
+          implicitHeight: Math.max(leftCol.implicitHeight, rightCol.implicitHeight)
 
-          // ---------- Hero ----------
-          PanelHero {
-            width: parent.width
-            title: root.svc ? root.svc.loopbackLabel : "Camera Effects"
-            meta: root.subtitle()
-            foreground: root.fg
-            fontFamily: root.fontFamily
-            iconComponent: Component {
-              Text {
-                text: "󰄀"
-                color: root.appsConnected ? Color.accent : root.fg
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.display
-              }
-            }
-          }
-          Item { width: parent.width; height: Style.space(4) }  // hero → preview breathing room
-
-          // ---------- Not installed / needs setup / needs rebuild ----------
-          Row {
-            width: parent.width
-            spacing: Style.space(8)
-            visible: root.svc && !root.svc.setupBusy && (!root.svc.installed || root.svc.deviceMissing || root.needsRebuild)
-            Button {
-              text: root.svc && !root.svc.installed ? "Install (build daemon)"
-                  : root.needsRebuild ? "Rebuild daemon" : "Set up virtual camera"
-              foreground: root.fg
-              fontFamily: root.fontFamily
-              bordered: true
-              onClicked: {
-                if (!root.svc) return
-                if (!root.svc.installed || root.needsRebuild) root.svc.install()
-                else root.svc.runSetup("install")
-              }
-            }
-          }
-          Text {
-            width: parent.width
-            visible: root.svc && (root.svc.setupOutput !== "" || (root.needsRebuild && root.svc.daemonLog !== ""))
-            wrapMode: Text.WordWrap
-            text: root.svc ? (root.svc.setupOutput !== "" ? root.svc.setupOutput
-                              : root.svc.daemonLog.trim().split("\n").slice(-3).join("\n")) : ""
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          // ---------- Preview ----------
-          Rectangle {
-            id: previewBox
-            width: parent.width
-            height: Math.round(width * 9 / 16)
-            radius: Style.cornerRadius
-            color: "#000000"
-            clip: true
-            visible: root.connected && root.svc && root.svc.loopback !== ""
-
-            Loader {
-              id: previewLoader
-              anchors.fill: parent
-              // Only while the panel is on screen: previewActive asks the
-              // daemon to run the pipeline (camera on) and write the preview.
-              active: root.opened && previewBox.visible
-              source: Qt.resolvedUrl("Preview.qml")
-              onLoaded: {
-                item.path = root.svc.previewPath
-                // Keep the preview a mirror view of yourself whatever the
-                // output setting is: undo the flip only when the feed
-                // itself is already mirrored.
-                // Self-view convention: the preview is a mirror unless the user turns it off; the
-                // placeholder is never flipped. This is display-only — apps get the unflipped output
-                // (or the mirrored one when "Mirror output" is on).
-                item.mirror = Qt.binding(function() { return !root.blocked && root.svc && root.svc.previewMirror })
-              }
-            }
-            // Black until the daemon delivers its first live frame.
-            Rectangle {
-              anchors.fill: parent
-              color: "#000000"
-              visible: !root.inUse || !previewLoader.item || !previewLoader.item.ready
-              Text {
-                anchors.centerIn: parent
-                text: root.connected && root.svc && root.svc.camera && root.svc.camera.name ? "Starting camera…" : "No camera"
-                color: Qt.rgba(1, 1, 1, 0.5)  // the box is always black
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
-            MouseArea {  // drag pans, wheel zooms, double-click resets (the camera's framing, or the placeholder's while blocked)
-              id: panArea
-              anchors.fill: parent
-              enabled: root.framingEnabled && !!previewLoader.item
-              acceptedButtons: Qt.LeftButton
-              cursorShape: !enabled || !root.panEnabled ? Qt.ArrowCursor : (pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor)
-              property real startX: 0
-              property real startY: 0
-              property real panX0: 0
-              property real panY0: 0
-              property var pending: null
-              onPressed: function(mouse) { startX = mouse.x; startY = mouse.y; panX0 = root.panXNow; panY0 = root.panYNow }
-              onPositionChanged: function(mouse) {
-                if (!pressed || !root.panEnabled || !root.svc) return
-                var r = root.svc.panRange
-                var rx = r[0] || 0, ry = r[1] || 0
-                if (rx <= 0 && ry <= 0) return
-                // pan = the crop's place in its free range (-1..1); the range covers 2 * r * (preview size) px.
-                // The preview shows the output as apps get it: dragging the picture right moves the crop left
-                // (-1); when the output is mirrored the picture is flipped, so the sign flips too. Rotation
-                // needs no correction: pan applies to the rotated frame, which is what the preview shows.
-                var flipped = !root.blocked && ((!!root.s.mirror) !== (!!(root.svc && root.svc.previewMirror)))
-                var sx = flipped ? 1 : -1
-                var px = rx > 0 ? Math.max(-1, Math.min(1, panX0 + sx * (mouse.x - startX) / (rx * width))) : panX0
-                var py = ry > 0 ? Math.max(-1, Math.min(1, panY0 - (mouse.y - startY) / (ry * height))) : panY0
-                pending = { panX: Math.round(px * 1000) / 1000, panY: Math.round(py * 1000) / 1000 }
-                if (!panThrottle.running) { panThrottle.flush(); panThrottle.start() }  // ~20 Hz
-              }
-              onReleased: panThrottle.flush()
-              onDoubleClicked: root.setFraming({ zoom: 1, panX: 0, panY: 0 })
-              onWheel: function(wheel) {
-                var z = Math.round(Math.max(1, Math.min(4, root.zoomLive + (wheel.angleDelta.y > 0 ? 0.1 : -0.1))) * 10) / 10
-                if (z === root.zoomLive) return
-                root.zoomLive = z
-                zoomTouched.restart()
-                root.setFraming({ zoom: z })
-              }
-              Timer {
-                id: panThrottle
-                interval: 50
-                function flush() { if (panArea.pending) { root.setFraming(panArea.pending); panArea.pending = null } }
-                onTriggered: flush()
-              }
-            }
-            Rectangle {  // gesture the daemon currently sees, and what it will trigger
-              anchors.left: parent.left
-              anchors.bottom: parent.bottom
-              anchors.margins: Style.space(8)
-              visible: !!root.svc && !!root.s.reactions && root.svc.gesture !== "" && !badgeHide.running && !!previewLoader.item && previewLoader.item.ready
-              color: "#aa000000"
-              radius: Style.space(4)
-              width: gestureText.implicitWidth + Style.space(12)
-              height: gestureText.implicitHeight + Style.space(6)
-              Text {
-                id: gestureText
-                anchors.centerIn: parent
-                text: root.svc ? root.gestureTitle(root.svc.gesture) + " → " + root.effectTitle(root.svc.gesture) : ""
-                color: "#fff"
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
-            Rectangle {  // shutter button: snapshot of what apps see (after a 3 s countdown)
-              anchors.right: parent.right
-              anchors.bottom: parent.bottom
-              anchors.margins: Style.space(8)
-              visible: !!root.svc && root.snapCount === 0 && !!previewLoader.item && previewLoader.item.ready
-              color: snapArea.containsMouse ? "#cc000000" : "#aa000000"
-              radius: Style.space(4)
-              width: snapGlyph.implicitWidth + Style.space(12)
-              height: snapGlyph.implicitHeight + Style.space(6)
-              Text {
-                id: snapGlyph
-                anchors.centerIn: parent
-                text: "󰄀"
-                color: "#fff"
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-              MouseArea {
-                id: snapArea
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.snap()
-              }
-              PanelToolTip { visible: snapArea.containsMouse; text: "Snapshot · saved to ~/Pictures/Camera Effects and copied"; fontFamily: root.fontFamily }
-            }
-            Rectangle {  // countdown: a big centred number on a dim backdrop
-              anchors.centerIn: parent
-              visible: root.snapCount > 0
-              color: "#aa000000"
-              radius: Style.space(8)
-              width: Math.max(snapCountText.implicitHeight, snapCountText.implicitWidth) + Style.space(24)
-              height: width
-              Text {
-                id: snapCountText
-                anchors.centerIn: parent
-                text: root.snapCount > 0 ? String(root.snapCount) : ""
-                color: "#fff"
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.display * 2
-                font.bold: true
-              }
-            }
-            Rectangle {  // shutter flash when the snapshot is saved
-              id: snapFlashRect
-              anchors.fill: parent
-              color: "#ffffff"
-              opacity: 0
-              NumberAnimation { id: snapFlash; target: snapFlashRect; property: "opacity"; from: 0.85; to: 0; duration: 400; easing.type: Easing.OutQuad }
-            }
-          }
-          Note {
-            visible: previewBox.visible && root.previewActive && (root.centerStageOn || root.panEnabled)
-            text: root.centerStageOn ? "Center Stage frames automatically" : "Drag to pan · scroll to zoom"
-          }
-
-          // ---------- Camera ----------
-          Dropdown {
-            width: parent.width - root.trailInset
-            visible: !!root.svc && (root.multiCam ||
-                     (!!root.svc.camera && !!root.svc.camera.bus && !root.cams.some(function(c) { return c.bus === root.svc.camera.bus })))
-            showLabel: false
-            fontFamily: root.fontFamily
-            options: root.cameraOpts
-            value: root.svc && root.svc.camera && root.svc.camera.bus ? String(root.svc.camera.bus) : ""
-            onChanged: function(v) { if (root.svc) root.svc.selectCamera(v) }
-          }
-          SwitchRow {
-            visible: root.multiCam
-            label: "Same effects on every camera"
-            checked: root.svc ? root.svc.sameForAll : true
-            onToggled: if (root.svc) root.svc.setSameForAll(!root.svc.sameForAll)
-          }
-
-          Item { width: parent.width; height: Style.space(6) }
-          PanelSeparator { foreground: root.fg }
-          Item { width: parent.width; height: Style.space(4) }
-
-          // ---------- Video ----------
-          PanelSectionHeader {
-            text: root.multiCam && root.svc && !root.svc.sameForAll ? "VIDEO · " + root.shortName(root.svc.camera).toUpperCase() : "VIDEO"
-            foreground: root.fg
-            fontFamily: root.fontFamily
-          }
-          SwitchRow { label: "Center Stage"; checked: !!root.s.centerStage; onToggled: if (root.svc) root.svc.setSetting("centerStage", !root.s.centerStage) }
-          IntensityRow {  // how tight / how eagerly it follows: left = calm and wide, right = tight and snappy
-            visible: !!root.s.centerStage
-            value: root.s.centerStageIntensity !== undefined ? root.s.centerStageIntensity : 0.5
-            onReleased: function(v) { if (root.svc) root.svc.setSetting("centerStageIntensity", v) }
-          }
-          Item {  // Zoom: label · value · slider (right-click the slider resets; the preview's wheel steps it too)
-            width: parent.width
-            height: root.rowH
-            enabled: root.framingEnabled
-            opacity: enabled ? 1 : 0.5
-            Text {
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Zoom"
-              color: root.fg
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-            }
-            Text {
-              anchors.right: zoomSlider.left
-              anchors.rightMargin: Style.space(10)
-              anchors.verticalCenter: parent.verticalCenter
-              text: zoomSlider.liveValue.toFixed(1) + "×"
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-            PanelSlider {
-              id: zoomSlider
-              bar: root.bar
-              anchors.right: parent.right
-              anchors.rightMargin: root.trailInset
-              anchors.verticalCenter: parent.verticalCenter
-              width: Style.space(120)
-              minimum: 1; maximum: 4; step: 0.1
-              value: root.zoomNow
-              onReleased: function(v) { root.setFraming({ zoom: Math.round(v * 10) / 10 }) }
-              onRightClicked: root.setFraming({ zoom: 1 })
-            }
-          }
-          LabelDropdownRow {  // how the source is placed on the output (Center Stage frames on its own)
-            label: "Fit"
-            options: root.fitOpts
-            value: root.fitNow
-            enabled: root.framingEnabled && !root.centerStageOn
-            onChanged: function(v) { root.setFraming({ fit: v }) }
-          }
-          SwitchRow { label: "Portrait"; checked: !!root.s.portrait; onToggled: if (root.svc) root.svc.setSetting("portrait", !root.s.portrait) }
-          IntensityRow {
-            visible: !!root.s.portrait
-            value: root.s.portraitIntensity !== undefined ? root.s.portraitIntensity : 0.6
-            onReleased: function(v) { if (root.svc) root.svc.setSetting("portraitIntensity", v) }
-          }
-          SwitchRow { label: "Studio Light"; checked: !!root.s.studioLight; onToggled: if (root.svc) root.svc.setSetting("studioLight", !root.s.studioLight) }
-          IntensityRow {
-            visible: !!root.s.studioLight
-            value: root.s.studioLightIntensity !== undefined ? root.s.studioLightIntensity : 0.6
-            onReleased: function(v) { if (root.svc) root.svc.setSetting("studioLightIntensity", v) }
-          }
-          Item {  // Background: label · [swatch + hex] · mode dropdown
-            width: parent.width
-            height: root.rowH
-            Text {
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Background"
-              color: root.fg
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-            }
-            Row {
-              anchors.right: parent.right
-              anchors.rightMargin: root.trailInset
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(6)
-              Rectangle {  // live swatch of the colour in the field
-                visible: root.s.background === "color"
-                anchors.verticalCenter: parent.verticalCenter
-                width: Style.space(14); height: Style.space(14)
-                radius: Style.space(4)
-                color: colorField.valid ? colorField.text : "transparent"
-                border.width: 1
-                border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.35)
-              }
-              TextField {
-                id: colorField
-                readonly property bool valid: /^#[0-9a-fA-F]{6}$/.test(text)   // daemon accepts #RRGGBB only
-                visible: root.s.background === "color"
-                width: Style.space(96)
-                height: bgDropdown.height
-                verticalAlignment: TextInput.AlignVCenter
-                foreground: root.fg
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-                placeholderText: "#1e1e2e"
-                // Not a binding: state pushes arrive several times a second and would
-                // overwrite what is being typed. Follow the setting only while unfocused.
-                Component.onCompleted: text = root.s.backgroundColor || ""
-                Connections { target: root; function onSChanged() { if (!colorField.activeFocus) colorField.text = root.s.backgroundColor || "" } }
-                onEditingFinished: {
-                  var t = text.trim()
-                  if (t !== "" && t[0] !== "#") t = "#" + t
-                  if (/^#[0-9a-fA-F]{3}$/.test(t)) t = "#" + t[1] + t[1] + t[2] + t[2] + t[3] + t[3]
-                  if (root.svc && /^#[0-9a-fA-F]{6}$/.test(t)) { text = t.toLowerCase(); root.svc.setSetting("backgroundColor", text) }
-                }
-              }
-              Dropdown {
-                id: bgDropdown
-                width: Style.space(96)
-                showLabel: false
-                fontFamily: root.fontFamily
-                options: [ { value: "none", label: "None" }, { value: "color", label: "Color" }, { value: "image", label: "Image" } ]
-                value: root.s.background || "none"
-                onChanged: function(v) { if (root.svc) root.svc.setSetting("background", v) }
-              }
-            }
-          }
-          Item {  // Background colour: preset swatches + native picker (own row, indented like the sliders)
-            visible: root.s.background === "color"
-            width: parent.width
-            height: root.rowH
-            Row {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(20)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(6)
-              Repeater {
-                model: ["#000000", "#ffffff", "#1e1e2e", "#3b4252", "#1e5a8a", "#2e7d32", "#6a1b9a", "#b71c1c", "#e65100", "#00897b"]
-                delegate: Rectangle {
-                  required property string modelData
-                  width: Style.space(18); height: Style.space(18)
-                  radius: Style.space(4)
-                  color: modelData
-                  border.width: (root.s.backgroundColor || "").toLowerCase() === modelData ? 2 : 1
-                  border.color: (root.s.backgroundColor || "").toLowerCase() === modelData ? Color.accent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.35)
-                  MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: if (root.svc) root.svc.setSetting("backgroundColor", modelData) }
-                }
-              }
-            }
-            Button {
-              anchors.right: parent.right
-              anchors.rightMargin: root.trailInset
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Pick…"
-              foreground: root.fg
-              fontFamily: root.fontFamily
-              bordered: true
-              visible: !root.pickerMissing
-              onClicked: colorPickProc.begin(root.s.backgroundColor || "#1e1e2e")
-            }
-          }
-          Item {  // Background image: elided file name + chooser (own row, indented like the sliders)
-            visible: root.s.background === "image"
-            width: parent.width
-            height: root.rowH
-            Note {
-              visible: !root.pickerMissing
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(20)
-              anchors.right: chooseBtn.left
-              anchors.rightMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              elide: Text.ElideMiddle
-              font.pixelSize: Style.font.bodySmall
-              color: root.s.backgroundImage ? root.fg : root.dim
-              text: root.s.backgroundImage ? root.basename(root.s.backgroundImage) : "No image chosen"
-            }
-            TextField {  // fallback when there is no zenity to pick with
-              visible: root.pickerMissing
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(20)
-              anchors.right: chooseBtn.left
-              anchors.rightMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              foreground: root.fg
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              placeholderText: "/path/to/image.png"
-              text: root.s.backgroundImage || ""
-              onEditingFinished: if (root.svc) root.svc.setSetting("backgroundImage", text)
-            }
-            Button {
-              id: chooseBtn
-              anchors.right: parent.right
-              anchors.rightMargin: root.trailInset
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Choose…"
-              fontSize: Style.font.bodySmall
-              foreground: root.fg
-              fontFamily: root.fontFamily
-              bordered: true
-              enabled: !root.pickerMissing
-              opacity: enabled ? 1 : 0.5
-              onClicked: pickProc.begin("backgroundImage", "Background image", root.imageFilter)
-            }
-          }
-          LabelDropdownRow { label: "Filter"; options: root.filterOpts; value: root.s.filter || "none"; onChanged: function(v) { if (root.svc) root.svc.setSetting("filter", v) } }
-          LabelDropdownRow { label: "Effects"; options: root.funOpts; value: root.s.fun || "none"; onChanged: function(v) { if (root.svc) root.svc.setSetting("fun", v) } }
-          SwitchRow {  // switch = hand-gesture triggers; the strip below plays one now
-            label: "Reactions · hand gestures"
-            checked: !!root.s.reactions
-            onToggled: if (root.svc) root.svc.setSetting("reactions", !root.s.reactions)
-          }
+          // ---------- Left: camera · framing ----------
           Column {
-            width: parent.width
-            spacing: Style.space(2)
-            Row {
-              x: Style.space(20)
-              spacing: Style.space(6)
-              Repeater {
-                model: root.reactionList
-                delegate: Item {
-                  required property string modelData
-                  width: Style.space(24); height: Style.space(24)
-                  Text { anchors.centerIn: parent; text: root.glyph(modelData); font.pixelSize: Style.space(14) }
-                  MouseArea {
-                    id: reactArea
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    enabled: !!root.svc
-                    onClicked: if (root.svc) { root.svc.react(modelData); badgeHide.restart() }
-                    cursorShape: Qt.PointingHandCursor
-                  }
-                  Rectangle { anchors.fill: parent; radius: Style.space(4); color: root.fg; opacity: reactArea.containsMouse ? 0.12 : 0; z: -1 }
-                  PanelToolTip { visible: reactArea.containsMouse; text: root.hint(modelData); fontFamily: root.fontFamily }
-                }
-              }
-            }
-            Note {
-              x: Style.space(20)
-              width: parent.width - Style.space(20)
-              text: "Click to play"
-            }
-          }
-          LabelDropdownRow {  // clockwise, before everything else (the placeholder is not rotated)
-            label: "Rotate"
-            options: root.rotateOpts
-            value: String(root.s.rotate || 0)
-            enabled: !!root.svc && !root.blocked
-            onChanged: function(v) { if (root.svc) root.svc.setSetting("rotate", parseInt(v, 10)) }
-          }
-          SwitchRow { label: "Mirror preview (only here)"; checked: root.svc ? root.svc.previewMirror : true; onToggled: if (root.svc) root.svc.send({ cmd: "set", settings: { previewMirror: !root.svc.previewMirror } }) }
-          SwitchRow { label: "Mirror output (for everyone)"; checked: !!root.s.mirror; onToggled: if (root.svc) root.svc.setSetting("mirror", !root.s.mirror) }
+            id: leftCol
+            x: 0
+            width: Math.round((body.width - body.gap) * 0.48)
+            spacing: Style.space(6)
 
-          Item { width: parent.width; height: Style.space(6) }
-          PanelSeparator { foreground: root.fg }
-          Item { width: parent.width; height: Style.space(4) }
-
-          // ---------- Privacy ----------
-          PanelSectionHeader { text: "PRIVACY"; foreground: root.fg; fontFamily: root.fontFamily }
-          SwitchRow {  // privacy shutter: the webcam stays closed, apps get a placeholder
-            label: "Block camera"
-            checked: root.blocked
-            onToggled: if (root.svc) root.svc.setSetting("block", !root.blocked)
-          }
-          Item {  // what apps see while blocked: kind dropdown + file (own row, indented)
-            visible: root.blocked
-            width: parent.width
-            height: root.rowH
-            Note {
-              visible: root.blockKind !== "card" && !root.pickerMissing
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(20)
-              anchors.right: blockChoose.left
-              anchors.rightMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              elide: Text.ElideMiddle
-              font.pixelSize: Style.font.bodySmall
-              color: root.blockSourceNow && root.blockKindPick === "" ? root.fg : root.dim
-              text: root.blockSourceNow && root.blockKindPick === "" ? root.basename(root.blockSourceNow) : "No file chosen"
-            }
-            TextField {  // fallback when there is no zenity to pick with
-              visible: root.blockKind !== "card" && root.pickerMissing
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(20)
-              anchors.right: blockChoose.left
-              anchors.rightMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              foreground: root.fg
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              placeholderText: root.blockKind === "image" ? "/path/to/image.png" : "/path/to/video.mp4"
-              text: root.blockSourceNow
-              onEditingFinished: if (root.svc && text !== "") root.svc.setSetting("blockSource", text)
-            }
-            Button {
-              id: blockChoose
-              visible: root.blockKind !== "card"
-              anchors.right: blockKindDropdown.left
-              anchors.rightMargin: Style.space(6)
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Choose…"
-              fontSize: Style.font.bodySmall
-              foreground: root.fg
-              fontFamily: root.fontFamily
-              bordered: true
-              enabled: !root.pickerMissing
-              opacity: enabled ? 1 : 0.5
-              onClicked: pickProc.begin("blockSource", root.blockKind === "image" ? "Placeholder image" : "Placeholder video",
-                                        root.blockKind === "image" ? root.imageFilter : root.videoFilter)
-            }
+            PanelSectionHeader { text: "CAMERA"; foreground: root.fg; fontFamily: root.fontFamily }
+            // ---------- Camera ----------
             Dropdown {
-              id: blockKindDropdown
-              anchors.right: parent.right
-              anchors.rightMargin: root.trailInset
-              anchors.verticalCenter: parent.verticalCenter
-              width: Style.space(132)
+              width: parent.width - root.trailInset
+              visible: !!root.svc && (root.multiCam ||
+                       (!!root.svc.camera && !!root.svc.camera.bus && !root.cams.some(function(c) { return c.bus === root.svc.camera.bus })))
               showLabel: false
               fontFamily: root.fontFamily
-              options: [ { value: "card", label: "Camera-off card" }, { value: "image", label: "Image" }, { value: "video", label: "Video" } ]
-              value: root.blockKind
-              onChanged: function(v) {
-                if (!root.svc) return
-                if (v === "card") { root.blockKindPick = ""; root.svc.setSetting("blockSource", "") }
-                else if (v !== root.blockKindOf(root.blockSourceNow)) root.blockKindPick = v
-                else root.blockKindPick = ""
+              options: root.cameraOpts
+              value: root.svc && root.svc.camera && root.svc.camera.bus ? String(root.svc.camera.bus) : ""
+              onChanged: function(v) { if (root.svc) root.svc.selectCamera(v) }
+            }
+            SwitchRow {
+              visible: root.multiCam
+              label: "Same effects on every camera"
+              checked: root.svc ? root.svc.sameForAll : true
+              onToggled: if (root.svc) root.svc.setSameForAll(!root.svc.sameForAll)
+            }
+            Item {  // Zoom: label · value · slider (right-click the slider resets; the preview's wheel steps it too)
+              width: parent.width
+              height: root.rowH
+              enabled: root.framingEnabled
+              opacity: enabled ? 1 : 0.5
+              Text {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Zoom"
+                color: root.fg
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+              Text {
+                anchors.right: zoomSlider.left
+                anchors.rightMargin: Style.space(10)
+                anchors.verticalCenter: parent.verticalCenter
+                text: zoomSlider.liveValue.toFixed(1) + "×"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              PanelSlider {
+                id: zoomSlider
+                bar: root.bar
+                anchors.right: parent.right
+                anchors.rightMargin: root.trailInset
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(120)
+                minimum: 1; maximum: 4; step: 0.1
+                value: root.zoomNow
+                onReleased: function(v) { root.setFraming({ zoom: Math.round(v * 10) / 10 }) }
+                onRightClicked: root.setFraming({ zoom: 1 })
               }
             }
+            LabelDropdownRow {  // how the source is placed on the output (Center Stage frames on its own)
+              label: "Fit"
+              options: root.fitOpts
+              value: root.fitNow
+              enabled: root.framingEnabled && !root.centerStageOn
+              onChanged: function(v) { root.setFraming({ fit: v }) }
+            }
+            LabelDropdownRow {  // clockwise, before everything else (the placeholder is not rotated)
+              label: "Rotate"
+              options: root.rotateOpts
+              value: String(root.s.rotate || 0)
+              enabled: !!root.svc && !root.blocked
+              onChanged: function(v) { if (root.svc) root.svc.setSetting("rotate", parseInt(v, 10)) }
+            }
+            SwitchRow { label: "Mirror preview (only here)"; checked: root.svc ? root.svc.previewMirror : true; onToggled: if (root.svc) root.svc.send({ cmd: "set", settings: { previewMirror: !root.svc.previewMirror } }) }
+            SwitchRow { label: "Mirror output (for everyone)"; checked: !!root.s.mirror; onToggled: if (root.svc) root.svc.setSetting("mirror", !root.s.mirror) }
           }
-          SwitchRow {
-            label: root.multiCam ? "Hide all raw cameras from apps" : "Hide raw camera from apps"
-            checked: root.svc ? root.svc.hideRaw : false
-            enabled: !!root.svc && !root.svc.setupBusy
-            onToggled: if (root.svc) root.svc.runSetup("hide-all", !root.svc.hideRaw)
+
+          PanelSeparator {  // thin rule between the columns
+            x: leftCol.width + Math.floor((body.gap - width) / 2)
+            width: 1
+            height: body.implicitHeight
+            foreground: root.fg
           }
-          Repeater {  // per-camera switches (USB cameras only), when there is more than one
-            model: root.multiCam && root.svc && !root.svc.hideRaw ? root.hideableCams : []
-            delegate: SwitchRow {
-              required property var modelData
-              label: "Hide " + root.shortName(modelData)
-              indent: Style.space(16)
-              checked: !!modelData.hidden
+
+          // ---------- Right: video effects · privacy ----------
+          Column {
+            id: rightCol
+            x: leftCol.width + body.gap
+            width: body.width - x
+            spacing: Style.space(6)
+
+            // ---------- Video ----------
+            PanelSectionHeader {
+              text: root.multiCam && root.svc && !root.svc.sameForAll ? "VIDEO · " + root.shortName(root.svc.camera).toUpperCase() : "VIDEO"
+              foreground: root.fg
+              fontFamily: root.fontFamily
+            }
+            SwitchRow { label: "Center Stage"; checked: !!root.s.centerStage; onToggled: if (root.svc) root.svc.setSetting("centerStage", !root.s.centerStage) }
+            IntensityRow {  // how tight / how eagerly it follows: left = calm and wide, right = tight and snappy
+              visible: !!root.s.centerStage
+              value: root.s.centerStageIntensity !== undefined ? root.s.centerStageIntensity : 0.5
+              onReleased: function(v) { if (root.svc) root.svc.setSetting("centerStageIntensity", v) }
+            }
+            SwitchRow { label: "Portrait"; checked: !!root.s.portrait; onToggled: if (root.svc) root.svc.setSetting("portrait", !root.s.portrait) }
+            IntensityRow {
+              visible: !!root.s.portrait
+              value: root.s.portraitIntensity !== undefined ? root.s.portraitIntensity : 0.6
+              onReleased: function(v) { if (root.svc) root.svc.setSetting("portraitIntensity", v) }
+            }
+            SwitchRow { label: "Studio Light"; checked: !!root.s.studioLight; onToggled: if (root.svc) root.svc.setSetting("studioLight", !root.s.studioLight) }
+            IntensityRow {
+              visible: !!root.s.studioLight
+              value: root.s.studioLightIntensity !== undefined ? root.s.studioLightIntensity : 0.6
+              onReleased: function(v) { if (root.svc) root.svc.setSetting("studioLightIntensity", v) }
+            }
+            Item {  // Background: label · [swatch + hex] · mode dropdown
+              width: parent.width
+              height: root.rowH
+              Text {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Background"
+                color: root.fg
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+              Row {
+                anchors.right: parent.right
+                anchors.rightMargin: root.trailInset
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(6)
+                Rectangle {  // live swatch of the colour in the field
+                  visible: root.s.background === "color"
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Style.space(14); height: Style.space(14)
+                  radius: Style.space(4)
+                  color: colorField.valid ? colorField.text : "transparent"
+                  border.width: 1
+                  border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.35)
+                }
+                TextField {
+                  id: colorField
+                  readonly property bool valid: /^#[0-9a-fA-F]{6}$/.test(text)   // daemon accepts #RRGGBB only
+                  visible: root.s.background === "color"
+                  width: Style.space(96)
+                  height: bgDropdown.height
+                  verticalAlignment: TextInput.AlignVCenter
+                  foreground: root.fg
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  placeholderText: "#1e1e2e"
+                  // Not a binding: state pushes arrive several times a second and would
+                  // overwrite what is being typed. Follow the setting only while unfocused.
+                  Component.onCompleted: text = root.s.backgroundColor || ""
+                  Connections { target: root; function onSChanged() { if (!colorField.activeFocus) colorField.text = root.s.backgroundColor || "" } }
+                  onEditingFinished: {
+                    var t = text.trim()
+                    if (t !== "" && t[0] !== "#") t = "#" + t
+                    if (/^#[0-9a-fA-F]{3}$/.test(t)) t = "#" + t[1] + t[1] + t[2] + t[2] + t[3] + t[3]
+                    if (root.svc && /^#[0-9a-fA-F]{6}$/.test(t)) { text = t.toLowerCase(); root.svc.setSetting("backgroundColor", text) }
+                  }
+                }
+                Dropdown {
+                  id: bgDropdown
+                  width: Style.space(96)
+                  showLabel: false
+                  fontFamily: root.fontFamily
+                  options: [ { value: "none", label: "None" }, { value: "color", label: "Color" }, { value: "image", label: "Image" } ]
+                  value: root.s.background || "none"
+                  onChanged: function(v) { if (root.svc) root.svc.setSetting("background", v) }
+                }
+              }
+            }
+            Item {  // Background colour: preset swatches + native picker (own row, indented like the sliders)
+              visible: root.s.background === "color"
+              width: parent.width
+              height: root.rowH
+              Row {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(20)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(6)
+                Repeater {
+                  model: ["#000000", "#ffffff", "#1e1e2e", "#3b4252", "#1e5a8a", "#2e7d32", "#6a1b9a", "#b71c1c", "#e65100", "#00897b"]
+                  delegate: Rectangle {
+                    required property string modelData
+                    width: Style.space(18); height: Style.space(18)
+                    radius: Style.space(4)
+                    color: modelData
+                    border.width: (root.s.backgroundColor || "").toLowerCase() === modelData ? 2 : 1
+                    border.color: (root.s.backgroundColor || "").toLowerCase() === modelData ? Color.accent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.35)
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: if (root.svc) root.svc.setSetting("backgroundColor", modelData) }
+                  }
+                }
+              }
+              Button {
+                anchors.right: parent.right
+                anchors.rightMargin: root.trailInset
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Pick…"
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                bordered: true
+                visible: !root.pickerMissing
+                onClicked: colorPickProc.begin(root.s.backgroundColor || "#1e1e2e")
+              }
+            }
+            Item {  // Background image: elided file name + chooser (own row, indented like the sliders)
+              visible: root.s.background === "image"
+              width: parent.width
+              height: root.rowH
+              Note {
+                visible: !root.pickerMissing
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(20)
+                anchors.right: chooseBtn.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                elide: Text.ElideMiddle
+                font.pixelSize: Style.font.bodySmall
+                color: root.s.backgroundImage ? root.fg : root.dim
+                text: root.s.backgroundImage ? root.basename(root.s.backgroundImage) : "No image chosen"
+              }
+              TextField {  // fallback when there is no zenity to pick with
+                visible: root.pickerMissing
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(20)
+                anchors.right: chooseBtn.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                foreground: root.fg
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                placeholderText: "/path/to/image.png"
+                text: root.s.backgroundImage || ""
+                onEditingFinished: if (root.svc) root.svc.setSetting("backgroundImage", text)
+              }
+              Button {
+                id: chooseBtn
+                anchors.right: parent.right
+                anchors.rightMargin: root.trailInset
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Choose…"
+                fontSize: Style.font.bodySmall
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                bordered: true
+                enabled: !root.pickerMissing
+                opacity: enabled ? 1 : 0.5
+                onClicked: pickProc.begin("backgroundImage", "Background image", root.imageFilter)
+              }
+            }
+            LabelDropdownRow { label: "Filter"; options: root.filterOpts; value: root.s.filter || "none"; onChanged: function(v) { if (root.svc) root.svc.setSetting("filter", v) } }
+            LabelDropdownRow { label: "Effects"; options: root.funOpts; value: root.s.fun || "none"; onChanged: function(v) { if (root.svc) root.svc.setSetting("fun", v) } }
+            SwitchRow {  // switch = hand-gesture triggers; the strip below plays one now
+              label: "Reactions · hand gestures"
+              checked: !!root.s.reactions
+              onToggled: if (root.svc) root.svc.setSetting("reactions", !root.s.reactions)
+            }
+            Column {
+              width: parent.width
+              spacing: Style.space(2)
+              Row {
+                x: Style.space(20)
+                spacing: Style.space(6)
+                Repeater {
+                  model: root.reactionList
+                  delegate: Item {
+                    required property string modelData
+                    width: Style.space(24); height: Style.space(24)
+                    Text { anchors.centerIn: parent; text: root.glyph(modelData); font.pixelSize: Style.space(14) }
+                    MouseArea {
+                      id: reactArea
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      enabled: !!root.svc
+                      onClicked: if (root.svc) { root.svc.react(modelData); badgeHide.restart() }
+                      cursorShape: Qt.PointingHandCursor
+                    }
+                    Rectangle { anchors.fill: parent; radius: Style.space(4); color: root.fg; opacity: reactArea.containsMouse ? 0.12 : 0; z: -1 }
+                    PanelToolTip { visible: reactArea.containsMouse; text: root.hint(modelData); fontFamily: root.fontFamily }
+                  }
+                }
+              }
+              Note {
+                x: Style.space(20)
+                width: parent.width - Style.space(20)
+                text: "Click to play"
+              }
+            }
+
+            Item { width: parent.width; height: Style.space(6) }
+            PanelSeparator { foreground: root.fg }
+            Item { width: parent.width; height: Style.space(4) }
+
+            // ---------- Privacy ----------
+            PanelSectionHeader { text: "PRIVACY"; foreground: root.fg; fontFamily: root.fontFamily }
+            SwitchRow {  // privacy shutter: the webcam stays closed, apps get a placeholder
+              label: "Block camera"
+              checked: root.blocked
+              onToggled: if (root.svc) root.svc.setSetting("block", !root.blocked)
+            }
+            Item {  // what apps see while blocked: kind dropdown + file (own row, indented)
+              visible: root.blocked
+              width: parent.width
+              height: root.rowH
+              Note {
+                visible: root.blockKind !== "card" && !root.pickerMissing
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(20)
+                anchors.right: blockChoose.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                elide: Text.ElideMiddle
+                font.pixelSize: Style.font.bodySmall
+                color: root.blockSourceNow && root.blockKindPick === "" ? root.fg : root.dim
+                text: root.blockSourceNow && root.blockKindPick === "" ? root.basename(root.blockSourceNow) : "No file chosen"
+              }
+              TextField {  // fallback when there is no zenity to pick with
+                visible: root.blockKind !== "card" && root.pickerMissing
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(20)
+                anchors.right: blockChoose.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                foreground: root.fg
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                placeholderText: root.blockKind === "image" ? "/path/to/image.png" : "/path/to/video.mp4"
+                text: root.blockSourceNow
+                onEditingFinished: if (root.svc && text !== "") root.svc.setSetting("blockSource", text)
+              }
+              Button {
+                id: blockChoose
+                visible: root.blockKind !== "card"
+                anchors.right: blockKindDropdown.left
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Choose…"
+                fontSize: Style.font.bodySmall
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                bordered: true
+                enabled: !root.pickerMissing
+                opacity: enabled ? 1 : 0.5
+                onClicked: pickProc.begin("blockSource", root.blockKind === "image" ? "Placeholder image" : "Placeholder video",
+                                          root.blockKind === "image" ? root.imageFilter : root.videoFilter)
+              }
+              Dropdown {
+                id: blockKindDropdown
+                anchors.right: parent.right
+                anchors.rightMargin: root.trailInset
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(132)
+                showLabel: false
+                fontFamily: root.fontFamily
+                options: [ { value: "card", label: "Camera-off card" }, { value: "image", label: "Image" }, { value: "video", label: "Video" } ]
+                value: root.blockKind
+                onChanged: function(v) {
+                  if (!root.svc) return
+                  if (v === "card") { root.blockKindPick = ""; root.svc.setSetting("blockSource", "") }
+                  else if (v !== root.blockKindOf(root.blockSourceNow)) root.blockKindPick = v
+                  else root.blockKindPick = ""
+                }
+              }
+            }
+            SwitchRow {
+              label: root.multiCam ? "Hide all raw cameras from apps" : "Hide raw camera from apps"
+              checked: root.svc ? root.svc.hideRaw : false
               enabled: !!root.svc && !root.svc.setupBusy
-              onToggled: if (root.svc) root.svc.runSetup("hide-camera", modelData.key, !modelData.hidden)
+              onToggled: if (root.svc) root.svc.runSetup("hide-all", !root.svc.hideRaw)
+            }
+            Repeater {  // per-camera switches (USB cameras only), when there is more than one
+              model: root.multiCam && root.svc && !root.svc.hideRaw ? root.hideableCams : []
+              delegate: SwitchRow {
+                required property var modelData
+                label: "Hide " + root.shortName(modelData)
+                indent: Style.space(16)
+                checked: !!modelData.hidden
+                enabled: !!root.svc && !root.svc.setupBusy
+                onToggled: if (root.svc) root.svc.runSetup("hide-camera", modelData.key, !modelData.hidden)
+              }
             }
           }
         }
       }
 
-      // ---------- Footer ---------- (pinned below the scroll area, never clipped)
       Item {
         id: footerBlock
         anchors.left: parent.left
@@ -1009,7 +1082,7 @@ Panel {
         PanelSeparator {  // marks the scroll edge when the list overflows (the bar itself is transient)
           anchors.top: parent.top
           foreground: root.fg
-          visible: footerNote.visible && column.implicitHeight > scrollArea.height + 1  // +1: rounding slack
+          visible: footerNote.visible && scrollArea.overflows
         }
         Note {
           id: footerNote
