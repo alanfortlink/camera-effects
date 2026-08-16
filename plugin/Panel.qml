@@ -14,7 +14,9 @@ Panel {
   moduleName: "tank.camera"
   ipcTarget: "tank.camera"
 
-  readonly property var svc: bar && bar.shell ? (bar.shell.serviceFor("tank.camera") || bar.shell.ensureService("tank.camera")) : null
+  // The shell mounts our service at startup (kinds: service); calling
+  // ensureService() from a binding would mutate the registry it reads (loop).
+  readonly property var svc: bar && bar.shell ? bar.shell.serviceFor("tank.camera") : null
   readonly property bool inUse: svc ? svc.running : false
   readonly property bool connected: svc ? svc.connected : false
   readonly property var s: svc ? svc.settings : ({})
