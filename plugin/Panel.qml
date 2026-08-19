@@ -734,7 +734,7 @@ Panel {
               cursorShape: Qt.PointingHandCursor
               onClicked: root.snap()
             }
-            PanelToolTip { visible: snapArea.containsMouse; text: "Snapshot · saved to ~/Pictures/Camera Effects and copied"; fontFamily: root.fontFamily }
+            PanelToolTip { visible: snapArea.containsMouse; text: "Snapshot · saved and copied to the clipboard"; fontFamily: root.fontFamily }
           }
           Rectangle {  // countdown: a big centred number on a dim backdrop
             anchors.centerIn: parent
