@@ -1028,20 +1028,15 @@ int Daemon::run() {
       setState(panRange_, block_.panRange());
     }
     if (!want && captureOpen()) {
-      // v4l2loopback sources (e.g. IPU6/IPU7 via v4l2-relayd) are kept open
-      // when idle: the relayd's GStreamer pipeline pauses when nobody reads,
-      // and with exclusive_caps the device then shows OUTPUT-only caps, so
-      // the next reopen would fail ("starting camera" hang). Keeping the
-      // capture open holds the reader side, which keeps the writer streaming.
-      // Block camera and hide-raw still close it (privacy takes priority).
-      if (!useFile_ && cap_.isLoopback() && !block) {
-        // Held open but idle: write black to the output (nobody is watching)
-        // without closing the capture. The capture thread keeps draining
-        // frames so the relayd writer never pauses.
-        stopped = true; darkFrames_ = 0; setState(covered_, false);
-      } else {
-        captureClose(); resetTier(false); stopped = true; darkFrames_ = 0; setState(covered_, false);
-      }
+      // Release the capture so the physical camera (a USB webcam, or the
+      // IPU6/IPU7 sensor behind a v4l2-relayd loopback) is freed and its
+      // light goes off. v4l2-relayd keeps its writer streaming for a good
+      // while with no reader, so the next reopen succeeds at once; if it
+      // does eventually pause the device drops to OUTPUT-only caps and the
+      // reopen retries until the writer warms up again (the panel shows its
+      // "starting" spinner meanwhile). Holding the capture open to prevent
+      // that left the camera light on forever — privacy takes priority.
+      captureClose(); resetTier(false); stopped = true; darkFrames_ = 0; setState(covered_, false);
     }
     // "Starting" drives the panel's busy indicator: something wants frames but
     // the camera is still opening (a USB reopen costs a second or two).  Clear
@@ -1058,9 +1053,7 @@ int Daemon::run() {
       fprintf(stderr, "camera-effects-server: idle\n");
     }
     // running_ is true only when frames are actively wanted (an app is using
-    // the virtual camera, the preview is on, etc.). A loopback source held open
-    // to keep the relayd alive is NOT running: the effects pipeline sleeps while
-    // the capture thread continues polling in the background.
+    // the virtual camera, the preview is on, etc.) and the capture is open.
     setState(running_, (captureOpen() && want) || block_.active());
     if (running_ != wasRunning) { wasRunning = running_; frames = 0; fpsT0 = now; setState(fps_, 0.0); }
     auto countFrame = [&]() {

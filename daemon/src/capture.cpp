@@ -188,11 +188,6 @@ bool V4L2Capture::open(const std::string& path, int w, int h, int fps, std::stri
   fd_ = ::open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
   if (fd_ < 0) { if (err) *err = std::string("open: ") + strerror(errno); return false; }
   path_ = path;
-  v4l2_capability cap{};
-  if (xioctl(fd_, VIDIOC_QUERYCAP, &cap) == 0)
-    isLoopback_ = strncmp((const char*)cap.driver, "v4l2 loopback", 13) == 0;
-  else
-    isLoopback_ = false;
 
   // Prefer MJPEG (USB 2 cameras cannot do 1080p30 raw), then YUYV, then whatever.
   std::vector<unsigned> supported;
@@ -262,7 +257,6 @@ void V4L2Capture::close() {
     ::close(fd_);
     fd_ = -1;
   }
-  isLoopback_ = false;
 }
 
 bool V4L2Capture::decode(const unsigned char* data, size_t len, cv::Mat& bgr) {
