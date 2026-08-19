@@ -35,9 +35,13 @@ if [[ $MODE == --uninstall ]]; then
 fi
 
 # Build/runtime dependencies (all in the Omarchy/Arch repos).
+# pacman -T, not -Q: -Q matches installed package *names* only, so a dependency
+# already satisfied by a package that provides it under another name looks missing.
+# onnxruntime-rocm provides onnxruntime and conflicts with it, so the install below
+# would offer to replace a working accelerated build with the plain one.
 missing=()
 for p in gcc make pkgconf opencv onnxruntime pipewire qt6-multimedia v4l2loopback-dkms dkms; do
-  pacman -Q "$p" >/dev/null 2>&1 || missing+=("$p")
+  pacman -T "$p" >/dev/null 2>&1 || missing+=("$p")
 done
 # The dkms module needs the running kernel's headers; pick the package for this kernel flavour.
 krel=$(uname -r)
