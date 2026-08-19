@@ -350,6 +350,7 @@ private:
   bool hideRawActive_ = false;
   std::string runtimeDir_;
   int misses_ = 0;      // consecutive grab timeouts
+  clk::time_point openFailStart_{};  // when consecutive capture-open failures began (empty = none)
   cv::Size capOpened_;  // size the current capture was asked for (reopen when the wanted size changes)
   cv::Size capActual_;  // what the device actually delivers (shown in the state)
   cv::Mat yuyv_;        // output frame converted once for both writers
@@ -998,11 +999,25 @@ int Daemon::run() {
       if (openCapture(&err)) {
         setError("");
         misses_ = 0;
+        openFailStart_ = {};
         fprintf(stderr, "camera-effects-server: capturing %s %dx%d %s\n", current_.path.c_str(), useFile_ ? file_.width() : cap_.width(), useFile_ ? file_.height() : cap_.height(), useFile_ ? "file" : cap_.format().c_str());
       } else {
         if (error_ != err) fprintf(stderr, "camera-effects-server: capture: %s\n", err.c_str());
-        setError(err);
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        // After ~15 s of consecutive open failures, stop showing the "starting"
+        // spinner and surface a actionable error. The most common cause is a
+        // v4l2-relayd pipeline that has stalled: the loopback device then
+        // advertises OUTPUT-only caps and every open fails with "no capture
+        // formats."  Keep retrying slowly so the daemon recovers when the
+        // relay comes back (e.g. the service is restarted).
+        if (openFailStart_ == clk::time_point{}) openFailStart_ = now;
+        auto failElapsed = std::chrono::duration_cast<std::chrono::seconds>(now - openFailStart_).count();
+        if (failElapsed >= 15) {
+          setError("camera source not producing frames — try: systemctl restart v4l2-relayd@ipu7");
+          std::this_thread::sleep_for(std::chrono::seconds(5));
+        } else {
+          setError(err);
+          std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
       }
     }
     if (want && block) {
@@ -1012,10 +1027,29 @@ int Daemon::run() {
       setError(block_.error());
       setState(panRange_, block_.panRange());
     }
-    if (!want && captureOpen()) { captureClose(); resetTier(false); stopped = true; darkFrames_ = 0; setState(covered_, false); }
+    if (!want && captureOpen()) {
+      // v4l2loopback sources (e.g. IPU6/IPU7 via v4l2-relayd) are kept open
+      // when idle: the relayd's GStreamer pipeline pauses when nobody reads,
+      // and with exclusive_caps the device then shows OUTPUT-only caps, so
+      // the next reopen would fail ("starting camera" hang). Keeping the
+      // capture open holds the reader side, which keeps the writer streaming.
+      // Block camera and hide-raw still close it (privacy takes priority).
+      if (!useFile_ && cap_.isLoopback() && !block) {
+        // Held open but idle: write black to the output (nobody is watching)
+        // without closing the capture. The capture thread keeps draining
+        // frames so the relayd writer never pauses.
+        stopped = true; darkFrames_ = 0; setState(covered_, false);
+      } else {
+        captureClose(); resetTier(false); stopped = true; darkFrames_ = 0; setState(covered_, false);
+      }
+    }
     // "Starting" drives the panel's busy indicator: something wants frames but
-    // the camera is still opening (a USB reopen costs a second or two).
-    setState(starting_, want && !block && !captureOpen());
+    // the camera is still opening (a USB reopen costs a second or two).  Clear
+    // it once open failures have persisted past the grace period so the panel
+    // shows the error instead of an infinite spinner.
+    bool openGivenUp = openFailStart_ != clk::time_point{} &&
+                       std::chrono::duration_cast<std::chrono::seconds>(now - openFailStart_).count() >= 15;
+    setState(starting_, want && !block && !captureOpen() && !openGivenUp);
     if (stopped) {
       // Leave black behind so the next opener doesn't see a stale frame.
       cv::Mat black(cfg_.outH, cfg_.outW, CV_8UC3, cv::Scalar(0, 0, 0));
@@ -1023,7 +1057,11 @@ int Daemon::run() {
       pwOut_.clear();
       fprintf(stderr, "camera-effects-server: idle\n");
     }
-    setState(running_, captureOpen() || block_.active());
+    // running_ is true only when frames are actively wanted (an app is using
+    // the virtual camera, the preview is on, etc.). A loopback source held open
+    // to keep the relayd alive is NOT running: the effects pipeline sleeps while
+    // the capture thread continues polling in the background.
+    setState(running_, (captureOpen() && want) || block_.active());
     if (running_ != wasRunning) { wasRunning = running_; frames = 0; fpsT0 = now; setState(fps_, 0.0); }
     auto countFrame = [&]() {
       frames++;

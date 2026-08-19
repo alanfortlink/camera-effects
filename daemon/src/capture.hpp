@@ -85,6 +85,7 @@ public:
   int height() const { return height_; }
   std::string format() const { return fourcc_; }
   std::string path() const { return path_; }
+  bool isLoopback() const { return isLoopback_; }  // v4l2loopback device (kept open when idle)
   double decodeMs() const { return decodeMs_; }  // decode time of the last frame (excludes the wait)
 
 private:
@@ -95,6 +96,7 @@ private:
   unsigned pixfmt_ = 0;
   std::string fourcc_, path_;
   bool streaming_ = false;
+  bool isLoopback_ = false;
   double decodeMs_ = 0;
   bool decode(const unsigned char* data, size_t len, cv::Mat& bgr);
 };

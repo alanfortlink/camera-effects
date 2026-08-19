@@ -74,10 +74,17 @@ static std::string usbKeyFor(const std::string& node) {
   return "usb-" + vid + "-" + pid + (isSafeSerial(serial) ? "-" + serial : "");
 }
 
-// Open the node once and decide whether it is a real capture camera.
+// Open the node once and decide whether it is a usable camera.
 // Virtual (v4l2loopback) devices are accepted: an external source may feed one
 // (e.g. v4l2-relayd bridging an Intel IPU6/IPU7 camera). The plugin's own output
 // is excluded separately in scan() by device identity and label.
+//
+// With exclusive_caps=1, a v4l2loopback device shows CAPTURE capabilities only
+// while a writer is actively streaming. When the writer's pipeline is paused
+// (e.g. v4l2-relayd warming up, or between consumer sessions), the device shows
+// OUTPUT-only caps. We still accept it: the daemon will retry the open until
+// the writer is ready, and keeping the capture open once established prevents
+// the writer from pausing again.
 enum class ProbeResult { NoAccess, NotCamera, Camera };
 static ProbeResult probeCamera(const std::string& path, const std::string& node, CameraInfo& info) {
   int fd = ::open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
@@ -85,9 +92,20 @@ static ProbeResult probeCamera(const std::string& path, const std::string& node,
   v4l2_capability cap{};
   if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) { ::close(fd); return ProbeResult::NotCamera; }
   unsigned caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
+  bool isLoopback = strncmp((const char*)cap.driver, "v4l2 loopback", 13) == 0;
+  if (isLoopback) {
+    // A v4l2loopback device is a camera when it has CAPTURE caps (writer is
+    // streaming) and a potential camera when it only has OUTPUT caps (writer
+    // is paused). Either way, accept it — the open retries until ready. Skip
+    // metadata nodes (META_CAPTURE) and devices without streaming.
+    if ((caps & V4L2_CAP_META_CAPTURE) || !(caps & V4L2_CAP_STREAMING)) { ::close(fd); return ProbeResult::NotCamera; }
+    ::close(fd);
+    info = CameraInfo{ path, (const char*)cap.card, (const char*)cap.bus_info, "" };
+    return ProbeResult::Camera;
+  }
+  // Physical camera: must have CAPTURE + STREAMING, no META, and at least one
+  // decoder-supported pixel format (rejects raw MIPI ISYS nodes with only Bayer).
   if (!(caps & V4L2_CAP_VIDEO_CAPTURE) || !(caps & V4L2_CAP_STREAMING) || (caps & V4L2_CAP_META_CAPTURE)) { ::close(fd); return ProbeResult::NotCamera; }
-  // A node without any capture pixel format we can decode is a metadata, control
-  // or raw MIPI node (e.g. an Intel IPU ISYS capture node exposing only Bayer).
   bool hasSupported = false;
   for (int i = 0;; i++) {
     v4l2_fmtdesc fdsc{};
@@ -170,6 +188,11 @@ bool V4L2Capture::open(const std::string& path, int w, int h, int fps, std::stri
   fd_ = ::open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
   if (fd_ < 0) { if (err) *err = std::string("open: ") + strerror(errno); return false; }
   path_ = path;
+  v4l2_capability cap{};
+  if (xioctl(fd_, VIDIOC_QUERYCAP, &cap) == 0)
+    isLoopback_ = strncmp((const char*)cap.driver, "v4l2 loopback", 13) == 0;
+  else
+    isLoopback_ = false;
 
   // Prefer MJPEG (USB 2 cameras cannot do 1080p30 raw), then YUYV, then whatever.
   std::vector<unsigned> supported;
@@ -239,6 +262,7 @@ void V4L2Capture::close() {
     ::close(fd_);
     fd_ = -1;
   }
+  isLoopback_ = false;
 }
 
 bool V4L2Capture::decode(const unsigned char* data, size_t len, cv::Mat& bgr) {
