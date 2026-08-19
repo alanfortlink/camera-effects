@@ -9,7 +9,7 @@
 // small JPEG the daemon writes to the runtime dir while a preview is wanted:
 // the loopback lets a single reader negotiate the format, so a second reader
 // (the panel) would see nothing while an app streams. A snapshot request
-// saves the next output frame as a PNG under ~/Pictures/Camera Effects.
+// saves the next output frame as a PNG under the pictures directory.
 #include <fcntl.h>
 #include <linux/videodev2.h>
 #include <pwd.h>
@@ -63,6 +63,39 @@ std::string homeDir() {
 std::string xdgConfig() { const char* c = getenv("XDG_CONFIG_HOME"); return c && *c ? c : homeDir() + "/.config"; }
 std::string xdgData() { const char* c = getenv("XDG_DATA_HOME"); return c && *c ? c : homeDir() + "/.local/share"; }
 std::string xdgRuntime() { const char* c = getenv("XDG_RUNTIME_DIR"); return c && *c ? c : "/tmp"; }
+
+// The pictures directory. XDG_PICTURES_DIR is a user-dirs setting rather than an
+// exported variable, so read user-dirs.dirs when it is not in the environment;
+// a "$HOME/..." value there is expanded.
+std::string xdgPictures() {
+  const char* p = getenv("XDG_PICTURES_DIR");
+  if (p && *p) return p;
+  const std::string key = "XDG_PICTURES_DIR=";
+  std::ifstream f(xdgConfig() + "/user-dirs.dirs");
+  std::string line;
+  while (std::getline(f, line)) {
+    size_t k = line.find(key), hash = line.find('#');
+    if (k == std::string::npos || (hash != std::string::npos && hash < k)) continue;
+    std::string v = line.substr(k + key.size());
+    while (!v.empty() && (v.back() == '\r' || v.back() == ' ' || v.back() == '\t')) v.pop_back();
+    if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+    if (v.rfind("$HOME/", 0) == 0) v = homeDir() + v.substr(5);
+    if (!v.empty()) return v;
+  }
+  return homeDir() + "/Pictures";
+}
+
+// Snapshots go to "Camera Effects" under the pictures directory, unless that
+// directory exists and cannot be written — a read-only network mount, say — in
+// which case XDG data keeps the shutter working instead of failing every time.
+// A pictures directory that does not exist yet is still preferred: it gets
+// created on the first snapshot.
+std::string snapshotDir() {
+  const std::string pics = xdgPictures();
+  struct stat st{};
+  if (stat(pics.c_str(), &st) != 0 || access(pics.c_str(), W_OK | X_OK) == 0) return pics + "/Camera Effects";
+  return xdgData() + "/camera-effects/snapshots";
+}
 double nowSec() { return std::chrono::duration<double>(clk::now().time_since_epoch()).count(); }
 bool fileExists(const std::string& p) { struct stat st{}; return stat(p.c_str(), &st) == 0; }
 
@@ -828,7 +861,7 @@ void Daemon::removePreview() {
 std::string Daemon::saveSnapshotPng(const std::string& dir, const cv::Mat& bgr, std::string* err) {
   std::vector<uchar> png;
   if (bgr.empty() || !cv::imencode(".png", bgr, png, { cv::IMWRITE_PNG_COMPRESSION, 3 })) { *err = "PNG encode failed"; return ""; }
-  std::string parent = dir.substr(0, dir.rfind('/'));   // ~/Pictures may not exist yet either
+  std::string parent = dir.substr(0, dir.rfind('/'));   // the pictures directory may not exist yet either
   for (const std::string& d : { parent, dir }) {
     if (mkdir(d.c_str(), 0755) == 0) (void)!chown(d.c_str(), (uid_t)-1, getgid());
     else if (errno != EEXIST) { *err = "mkdir " + d + ": " + strerror(errno); return ""; }
@@ -924,7 +957,7 @@ int Daemon::run() {
   std::string sockPath = runtimeDir_ + "/ctl.sock";
   previewPath_ = runtimeDir_ + "/preview.jpg";
   previewTmp_ = previewPath_ + ".tmp";
-  snapDir_ = homeDir() + "/Pictures/Camera Effects";
+  snapDir_ = snapshotDir();
   // Single instance per session (the shell restarts us; a stray manual copy
   // must not fight over the loopback writer).
   int lockFd = open((runtimeDir_ + "/lock").c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);

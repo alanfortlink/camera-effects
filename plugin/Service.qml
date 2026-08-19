@@ -85,7 +85,7 @@ Item {
   // Every effect of the current camera back to the built-in defaults (the
   // global block / placeholder / preview-mirror settings are not touched).
   function reset() { return send({ cmd: "reset" }) }
-  // The daemon saves its next output frame as a PNG under ~/Pictures/Camera Effects
+  // The daemon saves its next output frame as a PNG under the pictures directory
   // and reports it in the state (lastSnapshot): see noteSnapshot for what happens then.
   function snapshot() { return send({ cmd: "snapshot" }) }
   function refresh() { return send({ cmd: "get" }) }
