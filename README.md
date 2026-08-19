@@ -104,7 +104,7 @@ Root is used only for the loopback device (created at boot by a systemd unit), t
 - No bar icon: `omarchy plugin enable alanfortlink.camera-effects`, or `omarchy-restart-shell`.
 - Panel says "Needs setup" or v4l2loopback won't load: reboot after a kernel update, or check `dkms status`.
 - Apps don't list the camera: check `systemctl status camera-effects-device` and `v4l2loopback-ctl list`, then re-run `./install.sh`.
-- Not supported yet: cameras that only work through libcamera (Intel IPU6), and Presenter Overlay.
+- Intel IPU6/IPU7 webcams: supported when bridged through `v4l2-relayd` to a v4l2loopback device (the default Omarchy setup on Dell XPS and similar laptops). The camera appears as "Hardware ISP Camera" in the panel's camera dropdown. Not supported: cameras that only work through libcamera without a relayd bridge, and Presenter Overlay.
 
 ## Disclaimer
 

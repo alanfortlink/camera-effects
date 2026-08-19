@@ -954,6 +954,10 @@ int Daemon::run() {
   cv::Mat frame;  // processing-side frame buffer (rotates with the capture slot)
   fprintf(stderr, "camera-effects-server: ready (socket %s)\n", sockPath.c_str());
 
+  // Exclude our own output loopback from the camera list: by label now (before
+  // it is opened), by device identity once it is (st_rdev, set below).
+  enumerator_.setExcluded(0, cfg_.label);
+
   while (!g_quit) {
     auto now = clk::now();
     if (!loop_.isOpen() && now - lastLoopCheck > std::chrono::seconds(2)) {
@@ -964,6 +968,10 @@ int Daemon::run() {
         setState(loopPath_, p);
         setError("");
         fprintf(stderr, "camera-effects-server: virtual camera %s (%dx%d)\n", p.c_str(), cfg_.outW, cfg_.outH);
+        // Record the output device identity so the enumerator can exclude it
+        // precisely (st_rdev) instead of by label alone.
+        struct stat lst{};
+        if (stat(p.c_str(), &lst) == 0) enumerator_.setExcluded(lst.st_rdev, cfg_.label);
         watcher_.start(p, [this](int n) { consumers_ = n; stateDirty_ = true; });
       } else setError(err);
     }
