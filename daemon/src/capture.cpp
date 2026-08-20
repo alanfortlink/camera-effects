@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <fstream>
 #include <map>
 #include <opencv2/imgcodecs.hpp>
@@ -33,6 +34,15 @@ static std::string fourccStr(unsigned f) {
 }
 
 std::mutex g_credMutex;
+
+// Pixel formats V4L2Capture can decode (MJPEG, YUYV, NV12, UYVY). Used by both
+// probeCamera (to reject raw MIPI nodes with only Bayer/unknown formats) and
+// V4L2Capture::open (to negotiate and validate the capture format).
+static const unsigned kSupportedPixFmts[] = { V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_UYVY };
+static bool isSupportedPixFmt(unsigned f) {
+  for (unsigned p : kSupportedPixFmts) if (p == f) return true;
+  return false;
+}
 
 // Identify a USB camera by vendor/product/serial from sysfs so udev rules and
 // settings can refer to the physical unit rather than /dev/videoN.
@@ -64,7 +74,17 @@ static std::string usbKeyFor(const std::string& node) {
   return "usb-" + vid + "-" + pid + (isSafeSerial(serial) ? "-" + serial : "");
 }
 
-// Open the node once and decide whether it is a real capture camera.
+// Open the node once and decide whether it is a usable camera.
+// Virtual (v4l2loopback) devices are accepted: an external source may feed one
+// (e.g. v4l2-relayd bridging an Intel IPU6/IPU7 camera). The plugin's own output
+// is excluded separately in scan() by device identity and label.
+//
+// With exclusive_caps=1, a v4l2loopback device shows CAPTURE capabilities only
+// while a writer is actively streaming. When the writer's pipeline is paused
+// (e.g. v4l2-relayd warming up, or between consumer sessions), the device shows
+// OUTPUT-only caps. We still accept it: the daemon will retry the open until
+// the writer is ready, and keeping the capture open once established prevents
+// the writer from pausing again.
 enum class ProbeResult { NoAccess, NotCamera, Camera };
 static ProbeResult probeCamera(const std::string& path, const std::string& node, CameraInfo& info) {
   int fd = ::open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
@@ -72,15 +92,29 @@ static ProbeResult probeCamera(const std::string& path, const std::string& node,
   v4l2_capability cap{};
   if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) { ::close(fd); return ProbeResult::NotCamera; }
   unsigned caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
+  bool isLoopback = strncmp((const char*)cap.driver, "v4l2 loopback", 13) == 0;
+  if (isLoopback) {
+    // A v4l2loopback device is a camera when it has CAPTURE caps (writer is
+    // streaming) and a potential camera when it only has OUTPUT caps (writer
+    // is paused). Either way, accept it — the open retries until ready. Skip
+    // metadata nodes (META_CAPTURE) and devices without streaming.
+    if ((caps & V4L2_CAP_META_CAPTURE) || !(caps & V4L2_CAP_STREAMING)) { ::close(fd); return ProbeResult::NotCamera; }
+    ::close(fd);
+    info = CameraInfo{ path, (const char*)cap.card, (const char*)cap.bus_info, "" };
+    return ProbeResult::Camera;
+  }
+  // Physical camera: must have CAPTURE + STREAMING, no META, and at least one
+  // decoder-supported pixel format (rejects raw MIPI ISYS nodes with only Bayer).
   if (!(caps & V4L2_CAP_VIDEO_CAPTURE) || !(caps & V4L2_CAP_STREAMING) || (caps & V4L2_CAP_META_CAPTURE)) { ::close(fd); return ProbeResult::NotCamera; }
-  // A node without any capture pixel format is a metadata/control node.
-  v4l2_fmtdesc fd_desc{};
-  fd_desc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  bool hasFmt = xioctl(fd, VIDIOC_ENUM_FMT, &fd_desc) == 0;
+  bool hasSupported = false;
+  for (int i = 0;; i++) {
+    v4l2_fmtdesc fdsc{};
+    fdsc.index = i; fdsc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(fd, VIDIOC_ENUM_FMT, &fdsc) < 0) break;
+    if (isSupportedPixFmt(fdsc.pixelformat)) { hasSupported = true; break; }
+  }
   ::close(fd);
-  if (!hasFmt) return ProbeResult::NotCamera;
-  // Loopback devices (ours or OBS's) are outputs of other software, not cameras.
-  if (strncmp((const char*)cap.driver, "v4l2 loopback", 13) == 0) return ProbeResult::NotCamera;
+  if (!hasSupported) return ProbeResult::NotCamera;
   info = CameraInfo{ path, (const char*)cap.card, (const char*)cap.bus_info, usbKeyFor(node) };
   return ProbeResult::Camera;
 }
@@ -104,16 +138,32 @@ std::vector<CameraInfo> CameraEnumerator::scan() {
   for (const auto& node : nodes) {
     std::string sys = "/sys/class/video4linux/" + node;
     std::string path = "/dev/" + node;
-    // Virtual (loopback) devices have no physical parent: skip without opening.
+    // The "device" symlink is absent on v4l2loopback nodes: treat that as
+    // virtual. Physical nodes (USB, PCI) always have it.
     char real[PATH_MAX];
-    if (!realpath((sys + "/device").c_str(), real) || strstr(real, "/devices/virtual/")) continue;
+    bool isVirtual;
+    if (realpath((sys + "/device").c_str(), real)) {
+      isVirtual = strstr(real, "/devices/virtual/") != nullptr;
+    } else {
+      isVirtual = true;
+      snprintf(real, sizeof real, "/devices/virtual/video4linux/%s", node.c_str());
+    }
     struct stat st{};
     if (stat(path.c_str(), &st) != 0 || !S_ISCHR(st.st_mode)) continue;
+    // Exclude the plugin's own output loopback: by device identity once it has
+    // been opened (st_rdev), and by card label as a fallback before that.
+    if (excludeRdev_ && st.st_rdev == excludeRdev_) continue;
+    std::string name = readSysAttr(sys + "/name");
+    if (!excludeLabel_.empty() && name == excludeLabel_) continue;
     // Identity of what sits behind /dev/videoN: reprobe only when it changes.
-    std::string ident = readSysAttr(sys + "/name") + "|" + real + "|" + std::to_string(st.st_rdev);
+    // Virtual (loopback) nodes are always reprobed: their capture caps toggle
+    // when a writer starts or stops, and the cache identity can't reflect that
+    // without opening the node. Physical nodes are cached to avoid waking them
+    // from autosuspend on idle rescans.
+    std::string ident = name + "|" + real + "|" + std::to_string(st.st_rdev);
     Probe pr;
     auto it = cache_.find(path);
-    if (it != cache_.end() && it->second.ident == ident) pr = it->second;
+    if (!isVirtual && it != cache_.end() && it->second.ident == ident) pr = it->second;
     else {
       pr.ident = ident;
       ProbeResult r = probeCamera(path, node, pr.info);
@@ -140,7 +190,6 @@ bool V4L2Capture::open(const std::string& path, int w, int h, int fps, std::stri
   path_ = path;
 
   // Prefer MJPEG (USB 2 cameras cannot do 1080p30 raw), then YUYV, then whatever.
-  const unsigned prefs[] = { V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_UYVY };
   std::vector<unsigned> supported;
   for (int i = 0;; i++) {
     v4l2_fmtdesc fdsc{};
@@ -149,7 +198,7 @@ bool V4L2Capture::open(const std::string& path, int w, int h, int fps, std::stri
     supported.push_back(fdsc.pixelformat);
   }
   unsigned chosen = 0;
-  for (unsigned p : prefs) if (std::find(supported.begin(), supported.end(), p) != supported.end()) { chosen = p; break; }
+  for (unsigned p : kSupportedPixFmts) if (std::find(supported.begin(), supported.end(), p) != supported.end()) { chosen = p; break; }
   if (!chosen && !supported.empty()) chosen = supported[0];
   if (!chosen) { if (err) *err = "no capture formats"; close(); return false; }
 
@@ -161,7 +210,7 @@ bool V4L2Capture::open(const std::string& path, int w, int h, int fps, std::stri
   if (xioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) { if (err) *err = std::string("S_FMT: ") + strerror(errno); close(); return false; }
   width_ = fmt.fmt.pix.width; height_ = fmt.fmt.pix.height; pixfmt_ = fmt.fmt.pix.pixelformat;
   fourcc_ = fourccStr(pixfmt_);
-  if (pixfmt_ != V4L2_PIX_FMT_MJPEG && pixfmt_ != V4L2_PIX_FMT_YUYV && pixfmt_ != V4L2_PIX_FMT_NV12 && pixfmt_ != V4L2_PIX_FMT_UYVY) {
+  if (!isSupportedPixFmt(pixfmt_)) {
     if (err) *err = "unsupported pixel format " + fourcc_;
     close();
     return false;

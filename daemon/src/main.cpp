@@ -350,6 +350,7 @@ private:
   bool hideRawActive_ = false;
   std::string runtimeDir_;
   int misses_ = 0;      // consecutive grab timeouts
+  clk::time_point openFailStart_{};  // when consecutive capture-open failures began (empty = none)
   cv::Size capOpened_;  // size the current capture was asked for (reopen when the wanted size changes)
   cv::Size capActual_;  // what the device actually delivers (shown in the state)
   cv::Mat yuyv_;        // output frame converted once for both writers
@@ -954,6 +955,10 @@ int Daemon::run() {
   cv::Mat frame;  // processing-side frame buffer (rotates with the capture slot)
   fprintf(stderr, "camera-effects-server: ready (socket %s)\n", sockPath.c_str());
 
+  // Exclude our own output loopback from the camera list: by label now (before
+  // it is opened), by device identity once it is (st_rdev, set below).
+  enumerator_.setExcluded(0, cfg_.label);
+
   while (!g_quit) {
     auto now = clk::now();
     if (!loop_.isOpen() && now - lastLoopCheck > std::chrono::seconds(2)) {
@@ -964,6 +969,10 @@ int Daemon::run() {
         setState(loopPath_, p);
         setError("");
         fprintf(stderr, "camera-effects-server: virtual camera %s (%dx%d)\n", p.c_str(), cfg_.outW, cfg_.outH);
+        // Record the output device identity so the enumerator can exclude it
+        // precisely (st_rdev) instead of by label alone.
+        struct stat lst{};
+        if (stat(p.c_str(), &lst) == 0) enumerator_.setExcluded(lst.st_rdev, cfg_.label);
         watcher_.start(p, [this](int n) { consumers_ = n; stateDirty_ = true; });
       } else setError(err);
     }
@@ -990,11 +999,25 @@ int Daemon::run() {
       if (openCapture(&err)) {
         setError("");
         misses_ = 0;
+        openFailStart_ = {};
         fprintf(stderr, "camera-effects-server: capturing %s %dx%d %s\n", current_.path.c_str(), useFile_ ? file_.width() : cap_.width(), useFile_ ? file_.height() : cap_.height(), useFile_ ? "file" : cap_.format().c_str());
       } else {
         if (error_ != err) fprintf(stderr, "camera-effects-server: capture: %s\n", err.c_str());
-        setError(err);
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        // After ~15 s of consecutive open failures, stop showing the "starting"
+        // spinner and surface a actionable error. The most common cause is a
+        // v4l2-relayd pipeline that has stalled: the loopback device then
+        // advertises OUTPUT-only caps and every open fails with "no capture
+        // formats."  Keep retrying slowly so the daemon recovers when the
+        // relay comes back (e.g. the service is restarted).
+        if (openFailStart_ == clk::time_point{}) openFailStart_ = now;
+        auto failElapsed = std::chrono::duration_cast<std::chrono::seconds>(now - openFailStart_).count();
+        if (failElapsed >= 15) {
+          setError("camera source not producing frames — try: systemctl restart v4l2-relayd@ipu7");
+          std::this_thread::sleep_for(std::chrono::seconds(5));
+        } else {
+          setError(err);
+          std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
       }
     }
     if (want && block) {
@@ -1004,10 +1027,24 @@ int Daemon::run() {
       setError(block_.error());
       setState(panRange_, block_.panRange());
     }
-    if (!want && captureOpen()) { captureClose(); resetTier(false); stopped = true; darkFrames_ = 0; setState(covered_, false); }
+    if (!want && captureOpen()) {
+      // Release the capture so the physical camera (a USB webcam, or the
+      // IPU6/IPU7 sensor behind a v4l2-relayd loopback) is freed and its
+      // light goes off. v4l2-relayd keeps its writer streaming for a good
+      // while with no reader, so the next reopen succeeds at once; if it
+      // does eventually pause the device drops to OUTPUT-only caps and the
+      // reopen retries until the writer warms up again (the panel shows its
+      // "starting" spinner meanwhile). Holding the capture open to prevent
+      // that left the camera light on forever — privacy takes priority.
+      captureClose(); resetTier(false); stopped = true; darkFrames_ = 0; setState(covered_, false);
+    }
     // "Starting" drives the panel's busy indicator: something wants frames but
-    // the camera is still opening (a USB reopen costs a second or two).
-    setState(starting_, want && !block && !captureOpen());
+    // the camera is still opening (a USB reopen costs a second or two).  Clear
+    // it once open failures have persisted past the grace period so the panel
+    // shows the error instead of an infinite spinner.
+    bool openGivenUp = openFailStart_ != clk::time_point{} &&
+                       std::chrono::duration_cast<std::chrono::seconds>(now - openFailStart_).count() >= 15;
+    setState(starting_, want && !block && !captureOpen() && !openGivenUp);
     if (stopped) {
       // Leave black behind so the next opener doesn't see a stale frame.
       cv::Mat black(cfg_.outH, cfg_.outW, CV_8UC3, cv::Scalar(0, 0, 0));
@@ -1015,7 +1052,9 @@ int Daemon::run() {
       pwOut_.clear();
       fprintf(stderr, "camera-effects-server: idle\n");
     }
-    setState(running_, captureOpen() || block_.active());
+    // running_ is true only when frames are actively wanted (an app is using
+    // the virtual camera, the preview is on, etc.) and the capture is open.
+    setState(running_, (captureOpen() && want) || block_.active());
     if (running_ != wasRunning) { wasRunning = running_; frames = 0; fpsT0 = now; setState(fps_, 0.0); }
     auto countFrame = [&]() {
       frames++;
