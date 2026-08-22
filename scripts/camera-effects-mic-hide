@@ -1,0 +1,173 @@
+#!/bin/bash
+# Hide the real microphones from apps, so "Microphone Effects" is the only one
+# they can pick. Unlike the camera side this needs no root: it is a WirePlumber
+# script + config fragment in the user's own config, applied by restarting the
+# user's WirePlumber.
+#
+#   camera-effects-mic-hide status              print "all", or one hidden node.name per line
+#   camera-effects-mic-hide all on|off          hide every microphone / fall back to the per-mic list
+#   camera-effects-mic-hide mic NODE on|off     hide one microphone
+#   camera-effects-mic-hide none                stop hiding anything at all (uninstall uses this)
+set -euo pipefail
+
+CONF_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber
+CONF=$CONF_DIR/wireplumber.conf.d/71-camera-effects-hide-mics.conf
+# WirePlumber looks for Lua scripts under its *data* dirs, not its config ones.
+SCRIPT_DST=${XDG_DATA_HOME:-$HOME/.local/share}/wireplumber/scripts/camera-effects-hide-mics.lua
+DATA=${XDG_DATA_HOME:-$HOME/.local/share}/camera-effects
+HERE=$(cd "$(dirname "$0")" && pwd)
+# The script ships next to this one after install.sh, or in the checkout.
+for c in "$DATA/wireplumber/camera-effects-hide-mics.lua" "$HERE/../wireplumber/camera-effects-hide-mics.lua"; do
+  [[ -f $c ]] && SCRIPT_SRC=$c && break
+done
+NODE=camera-effects-mic
+
+hidden_all() { [[ -f $CONF ]] && grep -qE '^[[:space:]]*all[[:space:]]*=[[:space:]]*true' "$CONF"; }
+hidden_nodes() {  # one node.name per line
+  [[ -f $CONF ]] || return 0
+  sed -n '/nodes[[:space:]]*=[[:space:]]*\[/,/\]/p' "$CONF" | grep -o '"[^"]*"' | tr -d '"'
+}
+
+case "${1:-status}" in
+  status)
+    if hidden_all; then echo all; else hidden_nodes; fi
+    exit 0
+    ;;
+  all)
+    # Turning "all" off falls back to whatever single microphones were hidden
+    # before, rather than silently forgetting them. Use `none` to drop the lot.
+    mapfile -t NODES < <(hidden_nodes)
+    if [[ ${2:-} == on ]]; then MODE=all
+    elif [[ -n ${NODES[0]:-} ]]; then MODE=list
+    else MODE=none; NODES=()
+    fi
+    ;;
+  none)
+    # Unconditional: every microphone visible again, nothing remembered. This
+    # is what uninstall calls — "all off" would keep any per-microphone rules,
+    # and after uninstall there would be no tool left to undo them.
+    MODE=none
+    NODES=()
+    ;;
+  mic)
+    name=${2:-}; state=${3:-off}
+    [[ -n $name ]] || { echo "usage: camera-effects-mic-hide mic NODE on|off" >&2; exit 2; }
+    # The name goes into a config file and comes back out through a quoted
+    # scan: anything exotic would produce a fragment WirePlumber cannot parse.
+    [[ $name =~ ^[A-Za-z0-9._:+@-]+$ ]] || { echo "error: refusing an odd node name: $name" >&2; exit 2; }
+    mapfile -t NODES < <(hidden_nodes)
+    keep=()
+    for n in "${NODES[@]:-}"; do [[ -n $n && $n != "$name" ]] && keep+=("$n"); done
+    [[ $state == on ]] && keep+=("$name")
+    NODES=("${keep[@]:-}")
+    MODE=list
+    # "hide all" is on: a single switch does not change that, but the list is
+    # still recorded so it is there when "all" goes off again.
+    hidden_all && MODE=all
+    ;;
+  *)
+    echo "usage: camera-effects-mic-hide [status|all on|off|mic NODE on|off|none]" >&2
+    exit 2
+    ;;
+esac
+
+# Nothing left to hide: drop the fragment (the script itself is harmless, but
+# without the fragment WirePlumber never loads it).
+UNCHANGED=0
+if [[ $MODE == none || ( $MODE == list && ${#NODES[@]} -eq 0 ) || ( $MODE == list && -z ${NODES[0]:-} ) ]]; then
+  [[ -f $CONF ]] || UNCHANGED=1   # nothing was hidden: do not disturb the session
+  rm -f "$CONF"
+else
+  [[ -n ${SCRIPT_SRC:-} ]] || { echo "error: camera-effects-hide-mics.lua not found (reinstall the plugin)" >&2; exit 1; }
+  mkdir -p "$CONF_DIR/wireplumber.conf.d" "$(dirname "$SCRIPT_DST")"
+  install -m 644 "$SCRIPT_SRC" "$SCRIPT_DST"
+  {
+    echo "# Written by Camera Effects (panel → Mic → Hide raw microphones). Delete this"
+    echo "# file and restart WirePlumber to make the real microphones visible again."
+    echo "wireplumber.components = ["
+    echo "  { name = camera-effects-hide-mics.lua, type = script/lua, provides = custom.camera-effects-hide-mics }"
+    echo "]"
+    echo "wireplumber.profiles = {"
+    # "required" is not bravado, it is the only flag that works: measured on
+    # WirePlumber 0.5.15, a custom component listed as "optional" here is never
+    # loaded at all (no error, no hook, microphones simply stay visible) —
+    # optional means "load if something asks for it", and nothing asks for
+    # ours. The cost is that a script that fails to load takes the session's
+    # audio with it, so: the Lua raises nothing (everything is inside pcall),
+    # install.sh refreshes the deployed copy on every update, uninstall removes
+    # it (`none`), and the restart below rolls the fragment back out if
+    # WirePlumber does not come up with it.
+    echo "  main = { custom.camera-effects-hide-mics = required }"
+    echo "}"
+    echo "camera-effects.hide-mics = {"
+    [[ $MODE == all ]] && echo "  all = true" || echo "  all = false"
+    echo "  nodes = ["
+    for n in "${NODES[@]:-}"; do [[ -n $n ]] && echo "    \"$n\""; done
+    echo "  ]"
+    echo "}"
+  } > "$CONF.$$.new"
+  # Rewriting an identical file would restart WirePlumber for nothing.
+  if [[ -f $CONF ]] && cmp -s "$CONF" "$CONF.$$.new"; then rm -f "$CONF.$$.new"; UNCHANGED=1; else mv "$CONF.$$.new" "$CONF"; fi
+fi
+
+# Nothing to apply — but the default source may still be pointing at our node
+# from an earlier run (the fragment can also be removed by hand, or by the
+# rollback below), so fall through to the restore at the end.
+if [[ $UNCHANGED == 1 ]]; then RESTART=0; else RESTART=1; fi
+
+# WirePlumber reads its config at startup only.
+if [[ $RESTART == 1 ]] && command -v systemctl >/dev/null && systemctl --user list-unit-files wireplumber.service >/dev/null 2>&1; then
+  before=$(systemctl --user show -p NRestarts --value wireplumber.service 2>/dev/null || echo 0)
+  systemctl --user restart wireplumber.service || true
+  # A Restart=on-failure unit reports "active" the moment it forks, so one
+  # check right after the restart would pass on a service that is already
+  # crash-looping. Watch it for a few seconds and count restarts instead.
+  ok=0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.5
+    systemctl --user is-active --quiet wireplumber.service || { ok=0; break; }
+    ok=1
+  done
+  after=$(systemctl --user show -p NRestarts --value wireplumber.service 2>/dev/null || echo 0)
+  [[ ${after:-0} -gt $(( ${before:-0} + 1 )) ]] && ok=0
+  if [[ $ok != 1 ]]; then
+    echo "error: WirePlumber did not start with the microphone rule; it has been removed again." >&2
+    rm -f "$CONF"
+    systemctl --user restart wireplumber.service || true
+    exit 1
+  fi
+elif [[ $RESTART == 1 ]]; then
+  # No systemd user unit: the fragment is written but nothing has read it yet,
+  # and we have no safe way to restart (or to roll back if it goes wrong), so
+  # say so loudly instead of pretending the switch took effect.
+  echo "WirePlumber is not a systemd user service here, so the change is only on disk." >&2
+  echo "Restart WirePlumber (or log out and back in) to apply it." >&2
+  exit 3
+fi
+
+# With the real microphones gone, the default one has to be ours or apps that
+# ask for "the default" get nothing. The previous default is kept so turning
+# hiding off puts it back rather than leaving apps pointed at our node.
+PREV=$DATA/previous-default-source
+if command -v pactl >/dev/null; then
+  if [[ -f $CONF ]]; then
+    old=$(pactl get-default-source 2>/dev/null || true)
+    [[ -n $old && $old != "$NODE" && ! -f $PREV ]] && { mkdir -p "$DATA"; printf '%s\n' "$old" > "$PREV"; }
+    for _ in 1 2 3 4 5 6; do
+      if pactl list short sources 2>/dev/null | grep -q "[[:space:]]$NODE[[:space:]]"; then
+        pactl set-default-source "$NODE" >/dev/null 2>&1 || true
+        break
+      fi
+      sleep 0.5
+    done
+  elif [[ -f $PREV ]]; then
+    old=$(cat "$PREV")
+    # Only if it is still there; otherwise leave the choice to WirePlumber.
+    # The note is kept until the restore has actually been attempted.
+    if [[ -n $old ]] && pactl list short sources 2>/dev/null | grep -q "^[0-9]*[[:space:]]*$old[[:space:]]"; then
+      pactl set-default-source "$old" >/dev/null 2>&1 || true
+    fi
+    rm -f "$PREV"
+  fi
+fi
+exit 0

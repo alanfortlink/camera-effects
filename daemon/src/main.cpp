@@ -38,6 +38,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <thread>
 
+#include "audio.hpp"
 #include "block.hpp"
 #include "capture.hpp"
 #include "effects.hpp"
@@ -129,6 +130,71 @@ void settingsFromJson(const json& j, Settings& s) {
   oneOf(Settings::ambienceNames(), s.ambience);
 }
 
+json micSettingsToJson(const MicSettings& s) {
+  return json{ { "enabled", s.enabled }, { "voiceIsolation", s.voiceIsolation }, { "voiceIsolationIntensity", s.voiceIsolationIntensity },
+               { "noiseGate", s.noiseGate }, { "noiseGateIntensity", s.noiseGateIntensity },
+               { "autoLevel", s.autoLevel }, { "autoLevelIntensity", s.autoLevelIntensity },
+               { "deEsser", s.deEsser }, { "deEsserIntensity", s.deEsserIntensity }, { "humFilter", s.humFilter },
+               { "highPass", s.highPass }, { "volume", s.volume },
+               { "tone", s.tone }, { "voice", s.voice }, { "space", s.space } };
+}
+
+void micSettingsFromJson(const json& j, MicSettings& s) {
+  if (!j.is_object()) return;
+  auto getb = [&](const char* k, bool& v) { if (j.contains(k) && j[k].is_boolean()) v = j[k]; };
+  auto getf = [&](const char* k, float& v) { if (j.contains(k) && j[k].is_number()) { float f = j[k].get<float>(); if (std::isfinite(f)) v = std::clamp(f, 0.f, 1.f); } };
+  auto gets = [&](const char* k, std::string& v) { if (j.contains(k) && j[k].is_string()) v = j[k]; };
+  getb("enabled", s.enabled);
+  getb("voiceIsolation", s.voiceIsolation); getf("voiceIsolationIntensity", s.voiceIsolationIntensity);
+  getb("noiseGate", s.noiseGate); getf("noiseGateIntensity", s.noiseGateIntensity);
+  getb("autoLevel", s.autoLevel); getf("autoLevelIntensity", s.autoLevelIntensity);
+  getb("deEsser", s.deEsser); getf("deEsserIntensity", s.deEsserIntensity);
+  getb("highPass", s.highPass); getb("humFilter", s.humFilter); getf("volume", s.volume);
+  gets("tone", s.tone); gets("voice", s.voice); gets("space", s.space);
+  auto oneOf = [](const std::vector<std::string>& names, std::string& v) { if (std::find(names.begin(), names.end(), v) == names.end()) v = "none"; };
+  oneOf(MicSettings::toneNames(), s.tone);
+  oneOf(MicSettings::voiceNames(), s.voice);
+  oneOf(MicSettings::spaceNames(), s.space);
+}
+
+// Which microphones the "hide raw microphones" WirePlumber fragment currently
+// hides (written by camera-effects-mic-hide; see wireplumber/). Parsed rather
+// than tracked so a change made outside the panel is picked up too.
+struct HiddenMics {
+  bool all = false;
+  std::vector<std::string> nodes;
+  bool operator==(const HiddenMics& o) const { return all == o.all && nodes == o.nodes; }
+  bool operator!=(const HiddenMics& o) const { return !(*this == o); }
+};
+
+HiddenMics readHiddenMics() {
+  HiddenMics h;
+  const char* cfgHome = getenv("XDG_CONFIG_HOME");
+  std::string path = (cfgHome && *cfgHome ? std::string(cfgHome) : homeDir() + "/.config") +
+                     "/wireplumber/wireplumber.conf.d/71-camera-effects-hide-mics.conf";
+  std::ifstream f(path);
+  if (!f) return h;
+  std::string line;
+  bool inNodes = false;
+  while (std::getline(f, line)) {
+    // Same shape the script writes ("  all = true"), not any line that happens
+    // to contain both words.
+    size_t k = line.find_first_not_of(" \t");
+    if (k != std::string::npos && line.compare(k, 3, "all") == 0) {
+      size_t eq = line.find('=', k + 3);
+      if (eq != std::string::npos && line.find("true", eq) != std::string::npos) h.all = true;
+    }
+    if (line.find("nodes") != std::string::npos && line.find('[') != std::string::npos) inNodes = true;
+    if (inNodes) {
+      size_t a = line.find('"');
+      size_t b = a == std::string::npos ? a : line.find('"', a + 1);
+      if (b != std::string::npos) h.nodes.push_back(line.substr(a + 1, b - a - 1));
+      if (line.find(']') != std::string::npos) inNodes = false;
+    }
+  }
+  return h;
+}
+
 // ---------------------------------------------------------------------------
 // Client mode: talk to a running daemon.
 
@@ -203,6 +269,16 @@ struct Config {
   Settings settings;            // global settings (used when sameForAll, and as the template for new cameras)
   bool sameForAll = true;
   std::map<std::string, Settings> settingsByCamera;  // bus -> settings
+  // Microphone effects (see audio.hpp / mic.hpp). Same shape as the camera's:
+  // one virtual device, a chosen real source, shared or per-source settings.
+  std::string micLabel = "Microphone Effects";
+  std::string micSource;        // node.name of the chosen mic ("" = whatever PipeWire calls the default)
+  bool micMuted = false;        // privacy: apps get silence from the virtual mic
+  bool micListen = true;        // play the mic back while the panel's Mic tab is open
+  std::string micResolved;      // last real mic "Default" resolved to (see selectedMic)
+  bool micSameForAll = true;
+  MicSettings micSettings;
+  std::map<std::string, MicSettings> micBySource;
   std::string modelsDir, assetsDir, configPath;
 };
 
@@ -238,6 +314,18 @@ void loadConfig(Config& c) {
     if (j.contains("settingsByCamera") && j["settingsByCamera"].is_object()) {
       for (auto& [bus, sj] : j["settingsByCamera"].items()) { Settings st = c.settings; settingsFromJson(sj, st); c.settingsByCamera[bus] = st; }
     }
+    if (j.contains("mic") && j["mic"].is_object()) {
+      const json& m = j["mic"];
+      if (m.contains("label") && m["label"].is_string()) c.micLabel = m["label"];
+      if (m.contains("source") && m["source"].is_string()) c.micSource = m["source"];
+      if (m.contains("muted") && m["muted"].is_boolean()) c.micMuted = m["muted"];
+      if (m.contains("listen") && m["listen"].is_boolean()) c.micListen = m["listen"];
+      if (m.contains("resolved") && m["resolved"].is_string()) c.micResolved = m["resolved"];
+      if (m.contains("sameForAll") && m["sameForAll"].is_boolean()) c.micSameForAll = m["sameForAll"];
+      if (m.contains("settings")) micSettingsFromJson(m["settings"], c.micSettings);
+      if (m.contains("settingsBySource") && m["settingsBySource"].is_object())
+        for (auto& [name, sj] : m["settingsBySource"].items()) { MicSettings st = c.micSettings; micSettingsFromJson(sj, st); c.micBySource[name] = st; }
+    }
   } catch (const std::exception& e) {
     fprintf(stderr, "config: %s\n", e.what());
   }
@@ -246,6 +334,8 @@ void loadConfig(Config& c) {
 void saveConfig(const Config& c) {
   json byCam = json::object();
   for (auto& [bus, st] : c.settingsByCamera) byCam[bus] = settingsToJson(st);
+  json micBySrc = json::object();
+  for (auto& [name, st] : c.micBySource) micBySrc[name] = micSettingsToJson(st);
   json j = { { "output", { { "width", c.outW }, { "height", c.outH }, { "fps", c.fps } } },
              { "capture", { { "width", c.capW }, { "height", c.capH } } },
              { "camera", c.preferredCamera },
@@ -255,7 +345,11 @@ void saveConfig(const Config& c) {
              { "blockFit", c.blockFraming.fit }, { "blockZoom", c.blockFraming.zoom }, { "blockPanX", c.blockFraming.panX }, { "blockPanY", c.blockFraming.panY },
              { "sameForAll", c.sameForAll },
              { "settings", settingsToJson(c.settings) },
-             { "settingsByCamera", byCam } };
+             { "settingsByCamera", byCam },
+             { "mic", { { "label", c.micLabel }, { "source", c.micSource }, { "muted", c.micMuted }, { "listen", c.micListen },
+                        { "resolved", c.micResolved },
+                        { "sameForAll", c.micSameForAll }, { "settings", micSettingsToJson(c.micSettings) },
+                        { "settingsBySource", micBySrc } } } };
   std::string dir = c.configPath.substr(0, c.configPath.rfind('/'));
   mkdir(dir.c_str(), 0755);
   std::string tmp = c.configPath + ".tmp";
@@ -277,6 +371,7 @@ private:
   EffectPipeline fx_;
   LoopbackWriter loop_;
   PipeWireOutput pwOut_;
+  AudioEngine audio_;
   std::atomic<bool> pwActive_{false};
   ConsumerWatcher watcher_;
   ControlServer server_;
@@ -348,6 +443,16 @@ private:
   void snapshotDone(const std::string& path, const std::string& error, const std::vector<int>& clients);
   static std::string saveSnapshotPng(const std::string& dir, const cv::Mat& bgr, std::string* err);
   bool hideRawActive_ = false;
+  // Microphone effects. micClients_ are the clients asking for the level meter
+  // (`micpreview on`), which is what holds the real mic open while no app uses
+  // the virtual one — the audio counterpart of previewClients_.
+  std::set<int> micClients_;
+  bool micMonitor_ = false;
+  std::string micStatus_ = "off";
+  HiddenMics hiddenMics_;
+  double hiddenMicsAt_ = 0;
+  MicSettings micLast_;
+  std::string micLastSource_;
   std::string runtimeDir_;
   int misses_ = 0;      // consecutive grab timeouts
   cv::Size capOpened_;  // size the current capture was asked for (reopen when the wanted size changes)
@@ -388,6 +493,13 @@ private:
   // Settings that apply to the current camera (global when sameForAll).
   Settings& effectiveSettings();
   std::string selectedBus();
+  // The same, for the microphone: the chosen source, or the one actually
+  // being read when the choice is "the default".
+  MicSettings& effectiveMicSettings(bool create = false);
+  std::string selectedMic();
+  json micJson();          // the "mic" object of the state (caller holds mu_)
+  void pushMic();          // hand the current mic settings to the audio engine (caller holds mu_)
+  bool micHidden(const std::string& node) const { return hiddenMics_.all || std::find(hiddenMics_.nodes.begin(), hiddenMics_.nodes.end(), node) != hiddenMics_.nodes.end(); }
   static bool cameraHidden(const CameraInfo& c) { return !c.key.empty() && fileExists("/etc/udev/rules.d/71-camera-effects-hide-" + c.key + ".rules"); }
   std::string handle(int client, const std::string& req);
   void clientClosed(int client);
@@ -413,6 +525,72 @@ Settings& Daemon::effectiveSettings() {
   auto it = cfg_.settingsByCamera.find(bus);
   if (it == cfg_.settingsByCamera.end()) it = cfg_.settingsByCamera.emplace(bus, cfg_.settings).first;
   return it->second;
+}
+
+std::string Daemon::selectedMic() {
+  if (!cfg_.micSource.empty()) return cfg_.micSource;
+  // With "Default" chosen, the name comes from whatever the capture stream was
+  // linked to — and that is empty while the microphone is closed. Remember the
+  // last answer, or per-microphone settings would silently fall back to the
+  // shared ones (and be written there) every time the mic is released.
+  std::string cur = audio_.currentSource().name;
+  if (!cur.empty() && cur != cfg_.micResolved) { cfg_.micResolved = cur; cfgDirty_ = true; }
+  return cfg_.micResolved;
+}
+
+MicSettings& Daemon::effectiveMicSettings(bool create) {
+  std::string name = selectedMic();
+  if (cfg_.micSameForAll || name.empty()) return cfg_.micSettings;
+  auto it = cfg_.micBySource.find(name);
+  if (it == cfg_.micBySource.end()) {
+    // Reading the state must not write config: this runs several times a
+    // second from micJson(), and a set for every microphone the default ever
+    // resolved to would pile up for ever.
+    if (!create) return cfg_.micSettings;
+    it = cfg_.micBySource.emplace(name, cfg_.micSettings).first;
+  }
+  return it->second;
+}
+
+void Daemon::pushMic() {
+  audio_.setMuted(cfg_.micMuted);
+  // The switch is remembered, but playing the microphone back only makes sense
+  // while someone is looking at the Mic tab (micpreview) — otherwise closing
+  // the panel would leave the speakers echoing.
+  audio_.setListen(cfg_.micListen && micMonitor_);
+  audio_.setSource(cfg_.micSource);
+  audio_.setSettings(effectiveMicSettings());
+  micLast_ = effectiveMicSettings();
+  micLastSource_ = selectedMic();
+}
+
+json Daemon::micJson() {
+  json srcs = json::array();
+  for (auto& s : audio_.sources())
+    srcs.push_back({ { "name", s.name }, { "description", s.description }, { "bluetooth", s.bluetooth }, { "hidden", micHidden(s.name) } });
+  MicSourceInfo cur = audio_.currentSource();
+  return json{ { "label", cfg_.micLabel },
+               { "node", AudioEngine::kNodeName },
+               { "status", micStatus_ },
+               { "sources", srcs },
+               { "source", { { "name", cur.name }, { "description", cur.description }, { "bluetooth", cur.bluetooth } } },
+               { "wanted", cfg_.micSource },
+               { "active", audio_.active() },
+               { "consumers", audio_.consumers() },
+               { "capturing", audio_.capturing() },
+               { "monitor", micMonitor_ },
+               { "muted", cfg_.micMuted },
+               { "listen", cfg_.micListen },
+               { "listening", audio_.listening() },
+               { "inLevel", audio_.inLevel() },
+               { "outLevel", audio_.outLevel() },
+               { "rate", audio_.rate() },
+               { "hideAll", hiddenMics_.all },
+               { "sameForAll", cfg_.micSameForAll },
+               { "settings", micSettingsToJson(effectiveMicSettings()) },
+               { "tones", MicSettings::toneNames() },
+               { "voices", MicSettings::voiceNames() },
+               { "spaces", MicSettings::spaceNames() } };
 }
 
 json Daemon::stateJson() {
@@ -452,6 +630,7 @@ json Daemon::stateJson() {
                { "blockFit", cfg_.blockFraming.fit }, { "blockZoom", cfg_.blockFraming.zoom }, { "blockPanX", cfg_.blockFraming.panX }, { "blockPanY", cfg_.blockFraming.panY },
                { "panRange", { panRange_.x, panRange_.y } },
                { "lastSnapshot", lastSnapshot_ },
+               { "mic", micJson() },
                { "error", error_ } };
   if (profile_) {
     const auto& f = framing_;
@@ -671,6 +850,12 @@ void Daemon::resetTier(bool keepTier) {
 void Daemon::clientClosed(int client) {
   std::lock_guard<std::mutex> lk(mu_);
   if (previewClients_.erase(client)) { previewOn_ = !previewClients_.empty(); stateDirty_ = true; }
+  if (micClients_.erase(client)) {
+    micMonitor_ = !micClients_.empty();
+    audio_.setMonitor(micMonitor_);
+    audio_.setListen(cfg_.micListen && micMonitor_);   // the panel went away: stop playing back
+    stateDirty_ = true;
+  }
   snapClients_.erase(std::remove(snapClients_.begin(), snapClients_.end(), client), snapClients_.end());  // the snapshot is still taken
 }
 
@@ -698,6 +883,21 @@ std::string Daemon::handle(int client, const std::string& req) {
           cfg_.sameForAll = v;
         }
         if (j.contains("camera") && j["camera"].is_string()) cfg_.preferredCamera = j["camera"];
+        // Microphone: the same shape as the camera's, under its own key.
+        if (j.contains("mic") && j["mic"].is_object()) {
+          const json& mj = j["mic"];
+          if (mj.contains("sameForAll") && mj["sameForAll"].is_boolean()) {
+            bool v = mj["sameForAll"];
+            if (!v && cfg_.micSameForAll && !selectedMic().empty()) cfg_.micBySource[selectedMic()] = cfg_.micSettings;
+            if (v && !cfg_.micSameForAll) cfg_.micSettings = effectiveMicSettings();
+            cfg_.micSameForAll = v;
+          }
+          if (mj.contains("source") && mj["source"].is_string()) cfg_.micSource = mj["source"];
+          if (mj.contains("muted") && mj["muted"].is_boolean()) cfg_.micMuted = mj["muted"];
+          if (mj.contains("listen") && mj["listen"].is_boolean()) cfg_.micListen = mj["listen"];
+          if (mj.contains("settings") && mj["settings"].is_object()) micSettingsFromJson(mj["settings"], effectiveMicSettings(true));
+          pushMic();
+        }
         if (j.contains("settings") && j["settings"].is_object()) {
           const json& sj = j["settings"];
           // Checked before anything is applied so a bad path changes nothing.
@@ -727,6 +927,25 @@ std::string Daemon::handle(int client, const std::string& req) {
         effectiveSettings() = Settings();
         saveConfigSoon();
       }
+      stateDirty_ = true;
+      return kOk;
+    }
+    if (cmd == "micreset") {  // this microphone's effects back to the defaults (mute / hiding are untouched)
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        effectiveMicSettings(true) = MicSettings();
+        pushMic();
+        saveConfigSoon();
+      }
+      stateDirty_ = true;
+      return kOk;
+    }
+    if (cmd == "micpreview") {  // per client: holds the real mic open for the level meter
+      std::lock_guard<std::mutex> lk(mu_);
+      if (boolField("on")) micClients_.insert(client); else micClients_.erase(client);
+      micMonitor_ = !micClients_.empty();
+      audio_.setMonitor(micMonitor_);
+      audio_.setListen(cfg_.micListen && micMonitor_);
       stateDirty_ = true;
       return kOk;
     }
@@ -937,6 +1156,17 @@ int Daemon::run() {
 
   if (!server_.start(sockPath, [this](int c, const std::string& r) { return handle(c, r); }, [this](int c) { clientClosed(c); }, &err)) { fprintf(stderr, "control socket: %s\n", err.c_str()); return 1; }
 
+  // Microphone effects: an Audio/Source node apps can pick, fed by the chosen
+  // real microphone. Independent of the camera pipeline (best effort too).
+  {
+    std::string ae;
+    if (!audio_.start(cfg_.micLabel, &ae)) fprintf(stderr, "camera-effects-server: microphone node unavailable: %s\n", ae.c_str());
+    setState(micStatus_, audio_.started() ? std::string("ok") : ae);
+    std::lock_guard<std::mutex> lk(mu_);
+    hiddenMics_ = readHiddenMics();
+    pushMic();
+  }
+
   // Native PipeWire camera node for portal-based apps (best effort).
   if (pwOut_.start(cfg_.outW, cfg_.outH, cfg_.fps, cfg_.label, [this](bool on) { pwActive_ = on; stateDirty_ = true; }, &err)) setState(pwStatus_, std::string("ok"));
   else { setState(pwStatus_, err); fprintf(stderr, "camera-effects-server: pipewire output unavailable: %s\n", err.c_str()); }
@@ -948,6 +1178,7 @@ int Daemon::run() {
   auto lastScan = clk::now() - std::chrono::seconds(10);
   auto lastPublish = clk::now();
   auto lastPwCheck = clk::now();
+  auto lastMicCheck = lastPwCheck;
   bool wasRunning = false;
   int frames = 0;
   auto fpsT0 = clk::now();
@@ -971,6 +1202,28 @@ int Daemon::run() {
     // PipeWire restarted / stream error: reconnect with backoff, show it meanwhile.
     if (now - lastPwCheck > std::chrono::seconds(1)) { lastPwCheck = now; setState(pwStatus_, pwOut_.maintain(nowSec())); }
     setState(hideRawActive_, fileExists("/etc/udev/rules.d/71-camera-effects-hide-raw.rules"));
+    // Four times a second is quick enough to follow an app picking up the
+    // virtual mic, and keeps stream (re)opens off the video loop's back.
+    if (now - lastMicCheck > std::chrono::milliseconds(250)) { lastMicCheck = now; setState(micStatus_, audio_.maintain(nowSec())); }
+    // Reading the hide-mics fragment is file I/O: do it before taking the lock
+    // the socket threads are waiting on.
+    bool haveHidden = false;
+    HiddenMics freshHidden;
+    if (nowSec() - hiddenMicsAt_ > 2) {   // only this thread touches hiddenMicsAt_
+      hiddenMicsAt_ = nowSec();
+      freshHidden = readHiddenMics();
+      haveHidden = true;
+    }
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      // The mic the settings apply to can change under us (the default source
+      // moved, or the chosen one came back): re-hand them to the engine.
+      if (selectedMic() != micLastSource_ || effectiveMicSettings() != micLast_) { pushMic(); stateDirty_ = true; }
+      if (haveHidden && freshHidden != hiddenMics_) { hiddenMics_ = freshHidden; stateDirty_ = true; }
+      // While the panel watches the level meter, the state carries live
+      // numbers: publish on the tick even when nothing else changed.
+      if (micMonitor_) stateDirty_ = true;
+    }
 
     flushConfig();
     failStaleSnapshot();
@@ -1119,6 +1372,7 @@ int Daemon::run() {
   }
   captureClose();
   block_.close();
+  audio_.stop();
   pwOut_.stop();
   watcher_.stop();
   if (snapThread_.joinable()) snapThread_.join();
@@ -1202,6 +1456,28 @@ int main(int argc, char** argv) {
     return cmdClient(sock, json{ { "cmd", "set" }, { "settings", s } }.dump(), true);
   }
   if (cmd == "camera" && argc > 2) return cmdClient(sock, json{ { "cmd", "set" }, { "camera", argv[2] } }.dump(), true);
+  if (cmd == "mic" && argc > 2) return cmdClient(sock, json{ { "cmd", "set" }, { "mic", { { "source", argv[2] } } } }.dump(), true);
+  if (cmd == "micset") {
+    // Same k=v parsing as `set`; muted / listen / source / sameForAll are the
+    // microphone's own keys, everything else is an effect setting.
+    json m = json::object(), fx = json::object();
+    for (int i = 2; i < argc; i++) {
+      std::string kv = argv[i];
+      auto eq = kv.find('=');
+      if (eq == std::string::npos) continue;
+      std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+      json val;
+      if (v == "true" || v == "false") val = (v == "true");
+      else if (!v.empty() && (isdigit(v[0]) || v[0] == '.' || (v[0] == '-' && v.size() > 1))) {
+        try { size_t used = 0; double d = std::stod(v, &used); if (used == v.size() && std::isfinite(d)) val = d; else val = v; }
+        catch (const std::exception&) { val = v; }
+      } else val = v;
+      if (k == "muted" || k == "listen" || k == "source" || k == "sameForAll") m[k] = val; else fx[k] = val;
+    }
+    if (!fx.empty()) m["settings"] = fx;
+    return cmdClient(sock, json{ { "cmd", "set" }, { "mic", m } }.dump(), true);
+  }
+  if (cmd == "micreset") return cmdClient(sock, R"({"cmd":"micreset"})", true);
   if (cmd == "preview") {
     // The preview is per connection: `on` holds the connection (and so the
     // pipeline and preview.jpg) until this process exits.
@@ -1213,7 +1489,8 @@ int main(int argc, char** argv) {
   if (cmd == "snap") return cmdClient(sock, R"({"cmd":"snapshot"})", true, false, "snapshot");  // prints the PNG path
   if (cmd == "profile") return cmdClient(sock, json{ { "cmd", "profile" }, { "on", argc > 2 && std::string(argv[2]) == "on" } }.dump(), true);
   if (cmd != "run") {
-    fprintf(stderr, "usage: camera-effects-server [run|status|set k=v...|reset|react NAME|camera BUS|snap|preview on (holds while running)|off|profile on|off|quit]\n");
+    fprintf(stderr, "usage: camera-effects-server [run|status|set k=v...|reset|react NAME|camera BUS|snap|preview on (holds while running)|off|"
+                    "mic NODE|micset k=v...|micreset|profile on|off|quit]\n");
     return 2;
   }
   signal(SIGINT, onSignal);

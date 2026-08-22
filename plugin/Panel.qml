@@ -5,12 +5,14 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Bar icon + popup panel for the Camera Effects (the macOS "Video Effects"
-// menu, Omarchy style): live preview (drag to pan, wheel to zoom), camera
-// picker, one row per effect (switches, the Zoom slider, Fit/Filter/Effects/
-// Rotate dropdowns), reactions, a snapshot button, and the privacy switches
-// (block camera, hide raw camera). All state lives in the camera-effects-server daemon (see
-// Service.qml); this file only renders and forwards.
+// Bar icon + popup panel for Camera Effects (the macOS "Video Effects" menu,
+// Omarchy style). Five tabs: Video (camera picker, framing), Look (portrait,
+// light, background, filter), Fun (face effects, ambience, reactions), Mic
+// (microphone picker, meters, listen, volume, presets and effects) and
+// Privacy (block the camera, hide the raw devices from apps). Above them sits
+// the live preview — drag to pan, wheel to zoom — which the Mic tab replaces
+// with its level meters. All state lives in the camera-effects-server daemon
+// (see Service.qml); this file only renders and forwards.
 Panel {
   id: root
   moduleName: "alanfortlink.camera-effects"
@@ -34,6 +36,7 @@ Panel {
   function closeForPopoutSwitch() { allowClose = true; popoutSwitchClosing = true; controller.hide(); Qt.callLater(function() { popoutSwitchClosing = false }) }
   property bool allowClose: false
   property bool resetConfirm: false
+  property bool micResetConfirm: false
   // The daemon wants frames but the camera is still opening (a USB reopen after
   // a Center Stage / capture-size change costs a second or two).
   readonly property bool busy: !!svc && svc.starting
@@ -42,6 +45,7 @@ Panel {
   readonly property bool inUse: svc ? svc.running : false
   readonly property bool connected: svc ? svc.connected : false
   readonly property var s: svc ? svc.settings : ({})
+  readonly property var m: svc ? svc.micSettings : ({})     // microphone effects
   readonly property var cams: svc ? svc.cameras : []
   readonly property bool multiCam: cams.length > 1
   readonly property bool alwaysShow: setting("alwaysShow", true)
@@ -69,7 +73,7 @@ Panel {
   property real zoomLive: 1
   onZoomNowChanged: if (!zoomTouched.running) zoomLive = zoomNow
   Timer { id: zoomTouched; interval: 400; onTriggered: root.zoomLive = root.zoomNow }
-  Component.onCompleted: zoomLive = zoomNow
+  Component.onCompleted: { zoomLive = zoomNow; activePreset = matchPreset() }
 
   // The preview is served by the daemon (a JPEG it writes while we ask for
   // it, see Preview.qml), not read from the virtual camera: consumers are
@@ -77,10 +81,20 @@ Panel {
   // the preview even with no app watching (svc.previewOn).
   readonly property bool previewActive: previewLoader.active
   onPreviewActiveChanged: if (svc) svc.setPreview(previewActive)
-  Component.onDestruction: if (svc && previewActive) svc.setPreview(false)
+  Component.onDestruction: {
+    if (svc && previewActive) svc.setPreview(false)
+    if (svc && micPreviewActive) svc.setMicPreview(false, root)
+  }
   readonly property int appCount: svc ? svc.consumers : 0
   readonly property bool appsConnected: appCount > 0
   readonly property bool previewOnly: !!svc && svc.previewOn && !appsConnected
+  // The microphone is only opened for the level meter while the Mic tab is on
+  // screen — the audio counterpart of previewActive.
+  readonly property bool micPreviewActive: opened && tab === "mic" && !!svc
+  // Opening the tab starts playing the microphone back if that is how the
+  // switch was left last time (the daemon remembers it and ties the playback
+  // to this same flag), so nothing is left echoing once the panel is closed.
+  onMicPreviewActiveChanged: if (svc) svc.setMicPreview(micPreviewActive, root)
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(fg, 1.45)
@@ -118,7 +132,8 @@ Panel {
     function onSnapshotTaken(path) { snapFlash.restart() }   // shutter feedback (also for a CLI/IPC snapshot while open)
   }
 
-  visible: alwaysShow || inUse
+  readonly property bool micMuted: !!svc && svc.micMuted
+  visible: alwaysShow || inUse || micMuted
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -151,6 +166,12 @@ Panel {
     function hide() { root.close() }
     function toggle() { root.toggle() }
     function snap() { root.snap() }   // omarchy-shell alanfortlink.camera-effects snap
+    // Mute without opening anything — the point of a virtual microphone is that
+    // one switch covers every app, so it deserves a key binding:
+    //   bind = , code:121, exec, omarchy-shell alanfortlink.camera-effects micMute
+    function micMute() { if (root.svc) root.svc.setMicMuted(!root.svc.micMuted) }
+    function micMuteOn() { if (root.svc) root.svc.setMicMuted(true) }
+    function micMuteOff() { if (root.svc) root.svc.setMicMuted(false) }
   }
 
   function basename(p) {
@@ -211,12 +232,212 @@ Panel {
   readonly property var cameraOpts: { var j = JSON.parse(camsJson); return cameraOptions(j[0], j[1]) }
   readonly property var hideableCams: JSON.parse(camsJson)[0].filter(function(c) { return !!c.key })
   readonly property var reactionList: JSON.parse(reactionsJson)
+  // Same trick as camsJson: derive the microphone lists from the JSON text so
+  // the delegates are not rebuilt on every state push.
+  readonly property string micsJson: JSON.stringify([svc ? svc.micSources : [], svc ? svc.micWanted : "",
+                                                     svc && svc.micSource ? svc.micSource : null])
+  readonly property var micList: JSON.parse(micsJson)[0]
+  readonly property bool multiMic: micList.length > 1
+  readonly property var micOpts: {
+    var j = JSON.parse(micsJson), list = j[0], cur = String(j[1] || "")
+    var opts = [ { value: "", label: "Default microphone" } ]
+    for (var i = 0; i < list.length; i++) opts.push({ value: String(list[i].name), label: micName(list[i]) })
+    if (cur !== "" && !list.some(function(c) { return String(c.name) === cur })) opts.push({ value: cur, label: cur + " (not here)" })
+    return opts
+  }
+  function micName(c) {
+    if (!c) return "microphone"
+    var n = String(c.description || c.name || "microphone")
+    return n.length > 30 ? n.slice(0, 29) + "…" : n
+  }
+  readonly property var toneOpts: labelledOpts(svc ? svc.micToneOptions : [],
+    { none: "None", warm: "Warm", bright: "Bright", clarity: "Clarity", podcast: "Podcast", telephone: "Telephone" })
+  readonly property var voiceOpts: labelledOpts(svc ? svc.micVoiceOptions : [],
+    { none: "None", deep: "Deep", chipmunk: "Chipmunk", robot: "Robot", alien: "Alien", megaphone: "Megaphone", monster: "Monster" })
+  readonly property var spaceOpts: labelledOpts(svc ? svc.micSpaceOptions : [],
+    { none: "None", room: "Room", hall: "Hall", cathedral: "Cathedral", echo: "Echo", underwater: "Underwater" })
+  // The daemon owns the list of valid values; this only prettifies the names
+  // (and falls back to the key for one it does not know yet).
+  function labelledOpts(names, labels) {
+    var list = names && names.length ? names : Object.keys(labels)
+    return list.map(function(n) { return { value: String(n), label: labels[n] || String(n) } })
+  }
+  // ---- microphone presets -------------------------------------------------
+  // A bundle of settings behind one chip. They cover the whole effect set (a
+  // preset that left a robot voice on would be a lie), so picking one is a
+  // complete answer and "Custom" simply means "none of these matches".
+  readonly property var intensityOwner: ({ voiceIsolationIntensity: "voiceIsolation", noiseGateIntensity: "noiseGate",
+                                           autoLevelIntensity: "autoLevel", deEsserIntensity: "deEsser" })
+  readonly property var presetList: [
+    { key: "clean", label: "Clean", set: { voiceIsolation: false, noiseGate: false, autoLevel: false, deEsser: false, humFilter: false,
+                                           highPass: true, tone: "none", voice: "none", space: "none" } },
+    { key: "voice", label: "Voice", set: { voiceIsolation: true, voiceIsolationIntensity: 0.6, noiseGate: false, autoLevel: false,
+                                           deEsser: false, humFilter: false, highPass: true, tone: "none", voice: "none", space: "none" } },
+    { key: "meeting", label: "Meeting", set: { voiceIsolation: true, voiceIsolationIntensity: 0.7, noiseGate: true, noiseGateIntensity: 0.55,
+                                               autoLevel: true, autoLevelIntensity: 0.6, deEsser: true, deEsserIntensity: 0.5,
+                                               humFilter: false, highPass: true, tone: "clarity", voice: "none", space: "none" } },
+    { key: "podcast", label: "Podcast", set: { voiceIsolation: true, voiceIsolationIntensity: 0.4, noiseGate: false, autoLevel: true,
+                                               autoLevelIntensity: 0.5, deEsser: true, deEsserIntensity: 0.6, humFilter: false,
+                                               highPass: true, tone: "podcast", voice: "none", space: "none" } },
+  ]
+  // Which preset the current settings *are*. Derived, not stored — so editing
+  // one switch lands on "Custom" by itself. Recomputed only when the settings
+  // actually change (state arrives several times a second).
+  readonly property string micSettingsKey: svc ? JSON.stringify(svc.micSettings) : ""
+  property string activePreset: "custom"
+  onMicSettingsKeyChanged: activePreset = matchPreset()
+  function matchPreset() {
+    var m = svc ? svc.micSettings : null
+    if (!m) return "custom"
+    for (var i = 0; i < presetList.length; i++) {
+      var p = presetList[i]
+      if (!p.set) continue
+      var hit = true
+      for (var k in p.set) {
+        var a = m[k], b = p.set[k]
+        // An intensity only counts while the effect it belongs to is on, so
+        // nudging a Strength slider does not silently drop you to "Custom"
+        // for a setting that is not even running.
+        if (typeof b === "number") {
+          var owner = intensityOwner[k]
+          if (owner && !m[owner]) continue
+          if (Math.abs((a === undefined ? -1 : a) - b) > 0.001) { hit = false; break }
+          continue
+        }
+        if ((a === undefined ? false : a) !== b) { hit = false; break }
+      }
+      if (hit) return p.key
+    }
+    return "custom"
+  }
+  function applyPreset(key) {
+    if (!svc) return
+    for (var i = 0; i < presetList.length; i++) {
+      if (presetList[i].key !== key || !presetList[i].set) continue
+      var patch = {}
+      for (var k in presetList[i].set) patch[k] = presetList[i].set[k]
+      patch.enabled = true   // picking a preset is asking for effects
+      svc.setMic({ settings: patch })
+      return
+    }
+  }
+  // What is on, in as few words as the header can hold.
+  function labelFor(opts, v) {
+    for (var i = 0; i < opts.length; i++) if (opts[i].value === v) return opts[i].label
+    return v
+  }
+  // The summaries stay readable with the master switch off (the row dims
+  // instead) — a tab that shows nothing and accepts nothing is not an off
+  // state, it is a dead end. The rumble filter is deliberately not listed: it
+  // is on in every preset and by default, so saying so distinguishes nothing.
+  function cleanupSummary() {
+    var m = svc ? svc.micSettings : ({})
+    if (!m) return "None"
+    var on = []
+    if (m.voiceIsolation) on.push("Voice isolation")
+    if (m.noiseGate) on.push("Noise gate")
+    if (m.autoLevel) on.push("Auto level")
+    if (m.deEsser) on.push("De-esser")
+    if (m.humFilter) on.push("Hum filter")
+    // The rumble filter is on by default and in every preset, so it is not
+    // worth a word — unless it has been switched off, which is worth knowing.
+    if (!on.length) return m.highPass === false ? "Rumble filter off" : "None"
+    return on.length > 2 ? on[0] + " +" + (on.length - 1) : on.join(", ")
+  }
+  function characterSummary() {
+    var m = svc ? svc.micSettings : ({})
+    if (!m) return "None"
+    var on = []
+    if (m.tone && m.tone !== "none") on.push(labelFor(toneOpts, m.tone))
+    if (m.voice && m.voice !== "none") on.push(labelFor(voiceOpts, m.voice))
+    if (m.space && m.space !== "none") on.push(labelFor(spaceOpts, m.space))
+    return on.length ? on.join(" · ") : "None"
+  }
+  // The master row says which preset this is, or "Custom" — the summaries
+  // below it already spell out the detail, twice is enough.
+  function presetLabel(key) {   // presetList entries are key/label, not value/label
+    for (var i = 0; i < presetList.length; i++) if (presetList[i].key === key) return presetList[i].label
+    return key
+  }
+  function effectsSummary() {
+    if (!svc || !svc.micSettings) return ""
+    if (activePreset !== "custom") return presetLabel(activePreset)
+    return "Custom"
+  }
+  // Whether the microphone is doing anything at all, for the tab strip's dot.
+  readonly property bool micEffectsOn: {
+    var m = svc ? svc.micSettings : null
+    if (!m || !m.enabled) return false
+    return !!(m.voiceIsolation || m.noiseGate || m.autoLevel || m.deEsser || m.humFilter ||
+              (m.tone && m.tone !== "none") || (m.voice && m.voice !== "none") || (m.space && m.space !== "none"))
+  }
+  property bool cleanupOpen: false
+  property bool characterOpen: false
+
+  // "Auto" next to the Volume slider: listen to the microphone for a few
+  // seconds and set the gain so the loudest thing heard lands a little under
+  // the top of the meter. The level it watches is the one before the effects,
+  // which is exactly what the volume multiplies.
+  property bool autoGainRunning: false
+  property real autoGainPeak: 0
+  property int autoGainLeft: 0
+  readonly property real autoGainTarget: 0.6   // peak, not RMS: leaves headroom
+  function startAutoGain() {
+    if (!svc || autoGainRunning) return
+    autoGainPeak = 0
+    autoGainNote = ""
+    autoGainLeft = 4
+    autoGainRunning = true
+    autoGainTimer.start()
+  }
+  property string autoGainNote: ""
+  Timer { id: autoGainNoteClear; interval: 2500; onTriggered: root.autoGainNote = "" }
+  function finishAutoGain() {
+    autoGainRunning = false
+    if (!svc) return
+    if (autoGainPeak < 0.01) {   // silence: say so rather than appear to do nothing
+      autoGainNote = "heard nothing"
+      autoGainNoteClear.restart()
+      return
+    }
+    var gain = autoGainTarget / autoGainPeak
+    var v = 0.5 + (20 * Math.log(gain) / Math.LN10) / 36
+    svc.setMicSetting("volume", Math.max(0, Math.min(1, Math.round(v * 20) / 20)))
+  }
+  Timer {
+    id: autoGainTimer
+    interval: 1000
+    repeat: true
+    onTriggered: {
+      root.autoGainLeft -= 1
+      if (root.autoGainLeft <= 0) { stop(); root.finishAutoGain() }
+    }
+  }
+  Connections {   // sample the meter as the daemon pushes it
+    target: root.svc
+    enabled: root.autoGainRunning
+    function onMicInChanged() { if (root.svc.micIn > root.autoGainPeak) root.autoGainPeak = root.svc.micIn }
+  }
+
+  function micFooter() {
+    if (!svc || !connected) return ""
+    // "off" is the daemon's word for "not opened yet", which is the normal
+    // state for the second it takes this tab to open the microphone.
+    if (svc.micMuted) return "Muted · apps hear silence"
+    if (svc.micStatus !== "" && svc.micStatus !== "ok" && svc.micStatus !== "off") return "Microphone problem: " + svc.micStatus
+    if (svc.micConsumers > 0) return "In use by " + svc.micConsumers + " app" + (svc.micConsumers > 1 ? "s" : "")
+    if (svc.micListening) return "Listening · playing through your speakers"
+    return "Idle · select “" + svc.micLabel + "” in your apps"
+  }
   function footer() {
     if (!svc || !connected) return ""
     var res = svc.state.output ? " · " + svc.state.output.width + "×" + svc.state.output.height : ""
     // Keep it under ~50 monospace caption characters so it never elides.
     var apps = svc.consumerApps || []
-    var use = appCount > 0 ? "In use by " + (apps.length ? apps.join(", ") : appCount + " app" + (appCount > 1 ? "s" : ""))
+    // Cap the list: the resolution is appended after it, and an unbounded
+    // join would push the more durable half out through the elide.
+    var named = apps.length > 2 ? apps.slice(0, 2).join(", ") + " +" + (apps.length - 2) : apps.join(", ")
+    var use = appCount > 0 ? "In use by " + (apps.length ? named : appCount + " app" + (appCount > 1 ? "s" : ""))
             : previewOnly && inUse ? (blocked ? "Preview only · camera blocked" : "Preview only · camera on while open") : "Idle"
     return use + res
   }
@@ -225,11 +446,15 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰄀"
-    active: root.appsConnected
+    // Red for both live states, the way a recording light works: an app is
+    // reading the camera, or the microphone is muted — the one state you can
+    // reach from a key binding and then forget about.
+    text: root.micMuted ? "\uf131" : "󰄀"
+    active: root.appsConnected || root.micMuted
     useActiveColor: true
-    activeColor: Color.accent
-    tooltipText: (root.appsConnected ? (root.blocked ? "Camera blocked — apps get the placeholder" : "Camera in use — effects")
+    activeColor: Color.urgent
+    tooltipText: (root.micMuted ? "Microphone muted"
+                : root.appsConnected ? (root.blocked ? "Camera blocked — apps get the placeholder" : "Camera in use — effects")
                                      : (root.blocked ? "Camera blocked" : "Camera effects")) + " · right-click: Portrait"
     onPressed: function(b) {
       if (b === Qt.RightButton && root.svc) root.svc.setSetting("portrait", !root.s.portrait)
@@ -297,20 +522,45 @@ Panel {
     property bool checked: false
     property bool enabled: !!root.svc
     property real indent: 0
+    property bool strong: false   // a row that carries its own weight: card + bold label
+    property string summary: ""   // dim caption before the switch: what this row amounts to
     signal toggled()
     width: parent ? parent.width : 200
     height: root.rowH
     opacity: enabled ? 1 : 0.5
+    Rectangle {  // first child: everything below paints on top of it
+      visible: sw.strong
+      anchors.fill: parent
+      radius: Style.space(8)
+      color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, sw.checked ? 0.13 : 0.05)
+      border.width: 1
+      border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, sw.checked ? 0.3 : 0.12)
+    }
+    Text {
+      id: swSummary
+      anchors.right: swToggle.left
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      visible: sw.summary !== ""
+      text: sw.summary
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+      width: Math.min(implicitWidth, sw.width * 0.5)
+      horizontalAlignment: Text.AlignRight
+    }
     Text {
       anchors.left: parent.left
-      anchors.leftMargin: sw.indent
-      anchors.right: swToggle.left
+      anchors.leftMargin: sw.indent + (sw.strong ? Style.space(10) : 0)
+      anchors.right: sw.summary !== "" ? swSummary.left : swToggle.left
       anchors.rightMargin: Style.space(8)
       anchors.verticalCenter: parent.verticalCenter
       text: sw.label
       color: root.fg
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
+      font.bold: sw.strong
       elide: Text.ElideRight
     }
     ToggleSwitch {
@@ -337,6 +587,8 @@ Panel {
   component IntensityRow: Item {
     id: intensity
     property real value: 0.6
+    property string label: ""       // a bare track tells nobody what more means
+    property real indent: Style.space(20)
     signal released(real v)
     width: parent ? parent.width : 200
     height: root.rowH * 0.8
@@ -348,11 +600,35 @@ Panel {
       function flush() { if (intensity.pending >= 0) { intensity.released(intensity.pending); intensity.pending = -1 } }
       onTriggered: flush()
     }
+    Text {
+      anchors.left: parent.left
+      anchors.leftMargin: intensity.indent
+      anchors.verticalCenter: parent.verticalCenter
+      visible: intensity.label !== ""
+      text: intensity.label
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+    Text {
+      anchors.right: intensitySlider.left
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      visible: intensity.label !== ""
+      text: Math.round(intensitySlider.liveValue * 100) + "%"
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
     PanelSlider {
+      id: intensitySlider
       bar: root.bar
-      anchors.fill: parent
-      anchors.leftMargin: Style.space(20)
+      anchors.right: parent.right
       anchors.rightMargin: root.trailInset
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.left: parent.left
+      anchors.leftMargin: intensity.label === "" ? Style.space(20) : Style.space(120)
+      height: parent.height
       minimum: 0.05; maximum: 1; step: 0.05
       value: intensity.value
       onMoved: function(v) {
@@ -360,6 +636,140 @@ Panel {
         if (!liveThrottle.running) { liveThrottle.flush(); liveThrottle.start() }
       }
       onReleased: function(v) { liveThrottle.stop(); intensity.pending = -1; intensity.released(v) }
+    }
+  }
+
+  // A section that folds away, with what is on inside it written on the header
+  // — the summary is the point: it answers "what is this doing" without asking
+  // anyone to open anything.
+  component SectionHeader: Item {
+    id: sec
+    property string label: ""
+    property string summary: ""
+    property bool open: false
+    property bool dimmed: false   // what is inside is switched off — still readable, still openable
+    signal toggled()
+    width: parent ? parent.width : 200
+    height: root.rowH
+    opacity: dimmed ? 0.55 : 1
+    PanelSectionHeader {
+      id: secLabel
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      foreground: root.fg
+      fontFamily: root.fontFamily
+      text: sec.label.toUpperCase()
+    }
+    Text {
+      anchors.left: secLabel.right
+      anchors.leftMargin: Style.space(10)
+      anchors.right: chevron.left
+      anchors.rightMargin: Style.space(6)
+      anchors.verticalCenter: parent.verticalCenter
+      horizontalAlignment: Text.AlignRight
+      text: sec.summary
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+    }
+    Text {
+      id: chevron
+      anchors.right: parent.right
+      anchors.rightMargin: root.trailInset
+      anchors.verticalCenter: parent.verticalCenter
+      text: sec.open ? "▾" : "▸"
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+    }
+    MouseArea {
+      anchors.fill: parent
+      cursorShape: Qt.PointingHandCursor
+      onClicked: sec.toggled()
+    }
+  }
+
+  // A row of chips: every option visible and one click to try it, with the
+  // preview (or the microphone) never covered by a popup list — which is the
+  // whole reason these are not dropdowns.
+  component ChipGrid: Column {
+    id: chips
+    property string label: ""
+    property var options: []
+    property string value: "none"
+    property bool enabled: true
+    signal picked(string v)
+    width: parent ? parent.width : 200
+    spacing: Style.space(4)
+    opacity: enabled ? 1 : 0.5
+    Text {
+      text: chips.label
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+    Flow {
+      width: chips.width - root.trailInset
+      spacing: Style.space(4)
+      Repeater {
+        model: chips.options
+        delegate: Button {
+          required property var modelData
+          text: modelData.label
+          fontSize: Style.font.bodySmall
+          fontFamily: root.fontFamily
+          foreground: root.fg
+          bordered: true
+          // (Button bolds its label when selected. The panel's font is
+          // monospaced, so the chip keeps its width and the row does not
+          // reflow under the pointer that just clicked it.)
+          selected: chips.value === modelData.value
+          enabled: chips.enabled
+          onClicked: chips.picked(modelData.value)
+        }
+      }
+    }
+  }
+
+  // One level meter row: caption on the left, a bar that follows the daemon's
+  // peak on the right. The bar is the microphone's "preview".
+  component LevelBar: Item {
+    id: meter
+    property string label: ""
+    property real value: 0        // 0..1 peak
+    property bool live: false     // the microphone is actually open
+    property color barColor: Color.accent
+    width: parent ? parent.width : 200
+    height: root.rowH * 0.7
+    Text {
+      id: meterLabel
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(40)
+      text: meter.label
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+    Rectangle {
+      id: track
+      anchors.left: meterLabel.right
+      anchors.leftMargin: Style.space(6)
+      anchors.right: parent.right
+      anchors.rightMargin: root.trailInset
+      anchors.verticalCenter: parent.verticalCenter
+      height: Style.space(8)
+      radius: height / 2
+      color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.15)
+      Rectangle {
+        // Square root of the peak: quiet speech still moves the bar visibly.
+        width: Math.max(0, Math.min(1, meter.live ? Math.sqrt(meter.value) : 0)) * track.width
+        height: parent.height
+        radius: height / 2
+        color: meter.value > 0.97 ? "#e05555" : meter.barColor
+        Behavior on width { NumberAnimation { duration: 90 } }
+      }
     }
   }
 
@@ -436,10 +846,11 @@ Panel {
                                 + tabStrip.height + scopeNote.blockH + Style.space(8)
                                 + body.implicitHeight + footerBlock.height
 
-  // The settings live in four tabs; the panel remembers the last one for as
+  // The settings live in five tabs; the panel remembers the last one for as
   // long as it stays loaded (nothing persisted: a fresh panel starts on Video).
   readonly property var tabs: [ { key: "video", label: "Video" }, { key: "look", label: "Look" },
-                                { key: "fun", label: "Fun" }, { key: "privacy", label: "Privacy" } ]
+                                { key: "fun", label: "Fun" }, { key: "mic", label: "Mic" },
+                                { key: "privacy", label: "Privacy" } ]
   property string tab: "video"
 
   KeyboardPanel {
@@ -459,10 +870,13 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.resetConfirm   // the dialog owns the keyboard while it is up
+      blocked: root.resetConfirm || root.micResetConfirm   // the dialog owns the keyboard while it is up
       onCloseRequested: root.userClose()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      Keys.onPressed: function(event) { if (resetDialog.handleKey(event)) event.accepted = true }
+      Keys.onPressed: function(event) {
+        if (resetDialog.handleKey(event)) event.accepted = true
+        else if (micResetDialog.handleKey(event)) event.accepted = true
+      }
 
       // Reset asks first: it clears every effect of the selected camera.
       ConfirmDialog {
@@ -476,6 +890,19 @@ Panel {
         fontFamily: root.fontFamily
         onCanceled: root.resetConfirm = false
         onConfirmed: { root.resetConfirm = false; if (root.svc) root.svc.reset() }
+      }
+
+      ConfirmDialog {
+        id: micResetDialog
+        anchors.fill: parent
+        z: 10
+        opened: root.micResetConfirm
+        message: "Reset this microphone's effects and volume?"
+        confirmText: "Reset"
+        foreground: root.fg
+        fontFamily: root.fontFamily
+        onCanceled: root.micResetConfirm = false
+        onConfirmed: { root.micResetConfirm = false; if (root.svc) root.svc.micReset() }
       }
 
       // ---------- Fixed top: hero · setup · preview ----------
@@ -556,7 +983,9 @@ Panel {
           radius: Style.cornerRadius
           color: "#000000"
           clip: true
-          visible: root.connected && root.svc && root.svc.loopback !== ""
+          // Not on the Mic tab: nothing there is about the picture, and the
+          // preview is what holds the camera open.
+          visible: root.connected && root.svc && root.svc.loopback !== "" && root.tab !== "mic"
 
           Loader {
             id: previewLoader
@@ -776,7 +1205,7 @@ Panel {
         text: root.centerStageOn ? "Center Stage frames automatically" : "Drag to pan · scroll to zoom"
       }
 
-      // ---------- Tabs: Video · Look · Fun · Privacy ----------
+      // ---------- Tabs: Video · Look · Fun · Mic · Privacy ----------
       Item {
         id: tabStrip
         anchors.top: previewNote.bottom
@@ -813,6 +1242,16 @@ Panel {
                 font.pixelSize: Style.font.body
                 font.bold: tabItem.current
               }
+              Rectangle {  // a dot when that tab is doing something you cannot see from here
+                anchors.left: tabLabel.right
+                anchors.leftMargin: Style.space(3)
+                anchors.top: tabLabel.top
+                anchors.topMargin: Style.space(2)
+                width: Style.space(4); height: width
+                radius: width / 2
+                color: root.micMuted ? Color.urgent : Color.accent
+                visible: tabItem.modelData.key === "mic" && (root.micEffectsOn || root.micMuted) && !tabItem.current
+              }
               Rectangle {  // 2px accent underline under the active label
                 anchors.bottom: parent.bottom
                 anchors.horizontalCenter: parent.horizontalCenter
@@ -842,12 +1281,12 @@ Panel {
         anchors.top: tabStrip.bottom
         anchors.topMargin: visible ? Style.space(4) : 0
         height: visible ? Math.ceil(noteMetrics.height) : 0
-        visible: root.multiCam && !!root.svc && !root.svc.sameForAll && root.tab !== "privacy"
+        visible: root.multiCam && !!root.svc && !root.svc.sameForAll && root.tab !== "privacy" && root.tab !== "mic"
         text: root.svc ? "Settings for " + root.shortName(root.svc.camera) : ""
       }
 
       // ---------- Tab content ----------
-      // All four Columns stay built so switching tabs is instant; only the
+      // All five Columns stay built so switching tabs is instant; only the
       // active one is visible, and only its height counts towards the card
       // (an invisible Column is skipped by its parent's layout).
       ScrollView {
@@ -877,6 +1316,7 @@ Panel {
           implicitHeight: videoCol.visible ? videoCol.implicitHeight
                         : lookCol.visible ? lookCol.implicitHeight
                         : funCol.visible ? funCol.implicitHeight
+                        : micCol.visible ? micCol.implicitHeight
                         : privacyCol.implicitHeight
 
           // ---------- Video: camera · framing ----------
@@ -1246,6 +1686,353 @@ Panel {
             }
           }
 
+          // ---------- Mic: microphone · effects · privacy ----------
+          // The same story as the camera, for audio: pick the real microphone,
+          // apply effects, and every app picks "Microphone Effects" instead.
+          Column {
+            id: micCol
+            width: body.width
+            visible: root.tab === "mic"
+            spacing: Style.space(6)
+
+            Dropdown {  // like the camera's: only worth a row when there is a choice
+              width: parent.width - root.trailInset
+              visible: root.multiMic || (!!root.svc && root.svc.micWanted !== "")
+              showLabel: false
+              fontFamily: root.fontFamily
+              options: root.micOpts
+              value: root.svc ? root.svc.micWanted : ""
+              onChanged: function(v) { if (root.svc) root.svc.selectMic(v) }
+            }
+            Note {  // only when the dropdown above is not already saying it
+              visible: !!root.svc && root.svc.micWanted === "" && !!root.svc.micSource && !!root.svc.micSource.description
+              text: root.svc && root.svc.micSource ? "Using " + root.svc.micSource.description : ""
+              width: parent.width - root.trailInset
+            }
+            SwitchRow {
+              visible: root.multiMic
+              label: "Same effects on every microphone"
+              checked: root.svc ? root.svc.micSameForAll : true
+              onToggled: if (root.svc) root.svc.setMicSameForAll(!root.svc.micSameForAll)
+            }
+            Note {  // a headset mic only works in the call profile, and that costs playback quality
+              visible: !!root.svc && !!root.svc.micSource && !!root.svc.micSource.bluetooth
+              text: "Bluetooth: playback drops to call quality while this microphone is open."
+              wrapMode: Text.WordWrap
+              width: parent.width - root.trailInset
+            }
+            Column {  // levels: what the microphone hears, and what apps get
+              width: parent.width
+              spacing: Style.space(2)
+              LevelBar {
+                label: "Before"
+                value: root.svc ? root.svc.micIn : 0
+                live: !!root.svc && root.svc.micCapturing
+                barColor: root.fg
+              }
+              LevelBar {
+                label: "After"
+                value: root.svc ? root.svc.micOut : 0
+                live: !!root.svc && root.svc.micCapturing && !root.svc.micMuted
+              }
+              Note { text: root.micFooter(); width: parent.width - root.trailInset }
+            }
+            SwitchRow {  // privacy shutter for the microphone: apps get silence
+              label: "Mute microphone"
+              checked: !!root.svc && root.svc.micMuted
+              onToggled: if (root.svc) root.svc.setMicMuted(!root.svc.micMuted)
+            }
+            SwitchRow {  // hear what apps get, through the speakers
+              label: "Listen to this microphone"
+              strong: true
+              checked: !!root.svc && root.svc.micListen
+              enabled: !!root.svc && !root.svc.micMuted
+              onToggled: if (root.svc) root.svc.setMicListen(!root.svc.micListen)
+            }
+            Note {  // one line in every state: a note that changes height moves the rows under the pointer
+              text: root.svc && root.svc.micMuted ? "Muted — unmute to hear yourself."
+                  : root.svc && root.svc.micListen ? "Use headphones — speakers will echo."
+                  : "Hear what apps hear · only while this tab is open"
+              width: parent.width - root.trailInset
+            }
+            Item {  // Volume: label · value · slider (right-click resets to 0 dB).
+              // The microphone's own gain, not an effect: it works with the
+              // effects switched off, which is why it sits above them.
+              width: parent.width
+              height: root.rowH
+              enabled: !!root.svc
+              opacity: enabled ? 1 : 0.5
+              Text {
+                id: volumeLabel
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Volume"
+                color: root.fg
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+              Button {  // set it from what the microphone actually hears
+                anchors.left: volumeLabel.right
+                anchors.leftMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Auto"
+                fontSize: Style.font.caption
+                fontFamily: root.fontFamily
+                foreground: root.fg
+                bordered: true
+                enabled: !!root.svc && root.svc.micCapturing && !root.svc.micMuted && !root.autoGainRunning
+                opacity: enabled ? 1 : 0.5
+                tooltipText: "Talk normally for a few seconds; the volume is set from what is heard"
+                onClicked: root.startAutoGain()
+              }
+              Text {
+                anchors.right: volSlider.left
+                anchors.rightMargin: Style.space(10)
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.autoGainRunning ? "say something… " + root.autoGainLeft
+                     : root.autoGainNote !== "" ? root.autoGainNote
+                     : (volSlider.liveValue >= 0.5 ? "+" : "") + Math.round((volSlider.liveValue - 0.5) * 36) + " dB"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              PanelSlider {
+                id: volSlider
+                bar: root.bar
+                anchors.right: parent.right
+                anchors.rightMargin: root.trailInset
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(120)
+                minimum: 0; maximum: 1; step: 0.05
+                value: root.m.volume !== undefined ? root.m.volume : 0.5
+                property real pending: -1
+                Timer {
+                  id: volThrottle
+                  interval: 50
+                  repeat: false
+                  function flush() { if (volSlider.pending >= 0) { if (root.svc) root.svc.setMicSetting("volume", volSlider.pending); volSlider.pending = -1 } }
+                  onTriggered: flush()
+                }
+                onMoved: function(v) {
+                  volSlider.pending = v
+                  if (!volThrottle.running) { volThrottle.flush(); volThrottle.start() }
+                }
+                onReleased: function(v) { volThrottle.stop(); volSlider.pending = -1; if (root.svc) root.svc.setMicSetting("volume", v) }
+                onRightClicked: if (root.svc) root.svc.setMicSetting("volume", 0.5)
+              }
+            }
+
+            SwitchRow {  // master: the card names what is on without opening anything
+              label: "Microphone effects"
+              summary: root.m.enabled ? root.effectsSummary() : ""
+              strong: true
+              checked: !!root.m.enabled
+              onToggled: if (root.svc) root.svc.setMicSetting("enabled", !root.m.enabled)
+            }
+            Column {  // one click to a sound that works; the sections are the "I care" path
+              width: parent.width
+              spacing: Style.space(4)
+              opacity: root.m.enabled ? 1 : 0.55   // off dims the tab; it never blanks it
+              Text {
+                text: root.activePreset === "custom" ? "Preset · custom" : "Preset"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              Flow {
+                width: parent.width - root.trailInset
+                spacing: Style.space(4)
+                Repeater {
+                  model: root.presetList
+                  delegate: Button {
+                    required property var modelData
+                    text: modelData.label
+                    fontSize: Style.font.bodySmall
+                    fontFamily: root.fontFamily
+                    foreground: root.fg
+                    bordered: true
+                    // Picking a preset switches the effects on: this row works
+                    // with the master off, so you can look before you commit.
+                    selected: root.activePreset === modelData.key
+                    enabled: !!root.svc
+                    onClicked: root.applyPreset(modelData.key)
+                  }
+                }
+              }
+            }
+
+            SectionHeader {  // the plumbing: what the microphone needs to sound clean
+              label: "Cleanup"
+              summary: root.cleanupSummary()
+              open: root.cleanupOpen
+              dimmed: !root.m.enabled
+              onToggled: root.cleanupOpen = !root.cleanupOpen
+            }
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+              visible: root.cleanupOpen
+              SwitchRow {  // spectral noise suppression: fans, keyboards, the street
+                label: "Voice isolation"
+                indent: Style.space(10)
+                enabled: !!root.svc && !!root.m.enabled
+                checked: !!root.m.voiceIsolation
+                onToggled: if (root.svc) root.svc.setMicSetting("voiceIsolation", !root.m.voiceIsolation)
+              }
+              IntensityRow {
+                visible: !!root.m.voiceIsolation && !!root.m.enabled
+                label: "Strength"
+                indent: Style.space(10)
+                value: root.m.voiceIsolationIntensity !== undefined ? root.m.voiceIsolationIntensity : 0.6
+                onReleased: function(v) { if (root.svc) root.svc.setMicSetting("voiceIsolationIntensity", v) }
+              }
+              Note {  // it analyses 43 ms at a time; that is what makes it work
+                visible: !!root.m.voiceIsolation && !!root.m.enabled
+                text: "Adds about 40 ms of delay while it is on."
+                x: Style.space(10)
+                width: parent.width - root.trailInset - Style.space(10)
+              }
+              SwitchRow {  // silence between sentences
+                label: "Noise gate"
+                indent: Style.space(10)
+                enabled: !!root.svc && !!root.m.enabled
+                checked: !!root.m.noiseGate
+                onToggled: if (root.svc) root.svc.setMicSetting("noiseGate", !root.m.noiseGate)
+              }
+              IntensityRow {
+                visible: !!root.m.noiseGate && !!root.m.enabled
+                label: "Strength"
+                indent: Style.space(10)
+                value: root.m.noiseGateIntensity !== undefined ? root.m.noiseGateIntensity : 0.4
+                onReleased: function(v) { if (root.svc) root.svc.setMicSetting("noiseGateIntensity", v) }
+              }
+              SwitchRow {  // compressor + makeup: near and far sound alike
+                label: "Auto level"
+                indent: Style.space(10)
+                enabled: !!root.svc && !!root.m.enabled
+                checked: !!root.m.autoLevel
+                onToggled: if (root.svc) root.svc.setMicSetting("autoLevel", !root.m.autoLevel)
+              }
+              IntensityRow {
+                visible: !!root.m.autoLevel && !!root.m.enabled
+                label: "Strength"
+                indent: Style.space(10)
+                value: root.m.autoLevelIntensity !== undefined ? root.m.autoLevelIntensity : 0.6
+                onReleased: function(v) { if (root.svc) root.svc.setMicSetting("autoLevelIntensity", v) }
+              }
+              SwitchRow {  // sibilance: turns down "s" and "t" without dulling the voice
+                label: "De-esser"
+                indent: Style.space(10)
+                enabled: !!root.svc && !!root.m.enabled
+                checked: !!root.m.deEsser
+                onToggled: if (root.svc) root.svc.setMicSetting("deEsser", !root.m.deEsser)
+              }
+              IntensityRow {
+                visible: !!root.m.deEsser && !!root.m.enabled
+                label: "Strength"
+                indent: Style.space(10)
+                value: root.m.deEsserIntensity !== undefined ? root.m.deEsserIntensity : 0.5
+                onReleased: function(v) { if (root.svc) root.svc.setMicSetting("deEsserIntensity", v) }
+              }
+              SwitchRow {
+                label: "Rumble filter"
+                indent: Style.space(10)
+                enabled: !!root.svc && !!root.m.enabled
+                checked: !!root.m.highPass
+                onToggled: if (root.svc) root.svc.setMicSetting("highPass", !root.m.highPass)
+              }
+              SwitchRow {  // 50/60 Hz mains buzz from a ground loop or a nearby transformer
+                label: "Hum filter"
+                indent: Style.space(10)
+                enabled: !!root.svc && !!root.m.enabled
+                checked: !!root.m.humFilter
+                onToggled: if (root.svc) root.svc.setMicSetting("humFilter", !root.m.humFilter)
+              }
+            }
+
+            SectionHeader {  // the character: everything you can hear yourself doing
+              label: "Character"
+              summary: root.characterSummary()
+              open: root.characterOpen
+              dimmed: !root.m.enabled
+              onToggled: root.characterOpen = !root.characterOpen
+            }
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+              visible: root.characterOpen
+              ChipGrid {
+                label: "Tone"
+                options: root.toneOpts
+                value: root.m.tone || "none"
+                enabled: !!root.svc && !!root.m.enabled
+                onPicked: function(v) { if (root.svc) root.svc.setMicSetting("tone", v) }
+              }
+              ChipGrid {
+                label: "Voice"
+                options: root.voiceOpts
+                value: root.m.voice || "none"
+                enabled: !!root.svc && !!root.m.enabled
+                onPicked: function(v) { if (root.svc) root.svc.setMicSetting("voice", v) }
+              }
+              ChipGrid {
+                label: "Space"
+                options: root.spaceOpts
+                value: root.m.space || "none"
+                enabled: !!root.svc && !!root.m.enabled
+                onPicked: function(v) { if (root.svc) root.svc.setMicSetting("space", v) }
+              }
+            }
+
+            PanelSeparator { foreground: root.fg }
+
+            SwitchRow {
+              // Disabled while disconnected: the switch shows what the daemon
+              // read from the WirePlumber fragment, and with no daemon it would
+              // read "off" for microphones that are in fact hidden — one click
+              // from there hides them harder instead of bringing them back.
+              label: root.multiMic ? "Hide all raw microphones from apps" : "Hide raw microphone from apps"
+              checked: !!root.svc && root.svc.micHideAll
+              enabled: !!root.svc && root.connected && !root.svc.setupBusy
+              onToggled: if (root.svc) root.svc.runMicHide("all", !root.svc.micHideAll)
+            }
+            Repeater {  // per-microphone switches, when there is more than one
+              model: root.multiMic && root.svc && !root.svc.micHideAll ? root.micList : []
+              delegate: SwitchRow {
+                required property var modelData
+                label: "Hide " + root.micName(modelData)
+                indent: Style.space(16)
+                checked: !!modelData.hidden
+                enabled: !!root.svc && root.connected && !root.svc.setupBusy
+                onToggled: if (root.svc) root.svc.runMicHide("mic", modelData.name, !modelData.hidden)
+              }
+            }
+            Note {
+              text: "Hiding restarts audio and makes “" + (root.svc ? root.svc.micLabel : "Microphone Effects") + "” your default microphone."
+              wrapMode: Text.WordWrap
+              width: parent.width - root.trailInset
+            }
+            PanelSeparator { foreground: root.fg }
+
+            Item {  // every microphone effect back to the built-in defaults
+              width: parent.width
+              height: root.rowH
+              Button {
+                anchors.right: parent.right
+                anchors.rightMargin: root.trailInset
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Reset effects"
+                fontSize: Style.font.bodySmall
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                bordered: true
+                enabled: !!root.svc
+                opacity: enabled ? 1 : 0.5
+                onClicked: root.micResetConfirm = true
+              }
+            }
+          }
+
           // ---------- Privacy: block camera · hide the raw cameras ----------
           Column {
             id: privacyCol
@@ -1323,9 +2110,13 @@ Panel {
               }
             }
             SwitchRow {
+              // Disabled while disconnected: the switch shows what the daemon
+              // read from the system, and with no daemon it reads "off" for
+              // devices that are in fact hidden — one click from there hides
+              // them harder instead of bringing them back.
               label: root.multiCam ? "Hide all raw cameras from apps" : "Hide raw camera from apps"
               checked: root.svc ? root.svc.hideRaw : false
-              enabled: !!root.svc && !root.svc.setupBusy
+              enabled: !!root.svc && root.connected && !root.svc.setupBusy
               onToggled: if (root.svc) root.svc.runSetup("hide-all", !root.svc.hideRaw)
             }
             Repeater {  // per-camera switches (USB cameras only), when there is more than one
@@ -1335,10 +2126,11 @@ Panel {
                 label: "Hide " + root.shortName(modelData)
                 indent: Style.space(16)
                 checked: !!modelData.hidden
-                enabled: !!root.svc && !root.svc.setupBusy
+                enabled: !!root.svc && root.connected && !root.svc.setupBusy
                 onToggled: if (root.svc) root.svc.runSetup("hide-camera", modelData.key, !modelData.hidden)
               }
             }
+
           }
         }
       }
