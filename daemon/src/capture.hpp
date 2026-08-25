@@ -20,13 +20,16 @@ struct CameraInfo {
   std::string bus;      // bus_info (stable across reboots for the same port)
   std::string key;      // "usb-<vid>-<pid>[-<serial>]" for USB cameras (used for per-camera hide rules), else ""
                         // vid/pid are 4 hex digits; the serial is included only if it is [A-Za-z0-9._]{1,64}
+  bool loopback = false;
+  bool captureReady = true;  // loopback currently advertises CAPTURE caps
 };
 
 // Enumerates capture-capable cameras: physical webcams and v4l2loopback
 // devices fed by an external source (e.g. an Intel IPU6/IPU7 camera bridged
-// through v4l2-relayd). Skips metadata, non-capture nodes and raw MIPI nodes
-// whose pixel formats the decoder can't handle. The plugin's own output
-// loopback is excluded by device identity and label to prevent a feedback loop.
+// through v4l2-relayd). OUTPUT-only loopbacks are retained for explicit retry,
+// while metadata, other non-capture nodes and raw MIPI nodes whose pixel
+// formats the decoder can't handle are skipped. The plugin's own output is
+// excluded by device identity and label to prevent a feedback loop.
 //
 // Physical nodes are opened (VIDIOC_QUERYCAP) only the first time they are
 // seen, so idle rescans do not wake cameras from autosuspend. Virtual
@@ -39,7 +42,7 @@ public:
   // it has been opened, and by card label as a fallback before that. The label
   // alone is not a reliable boundary (labels can collide and are limited to 32
   // bytes), so both are checked.
-  void setExcluded(dev_t rdev, const std::string& label) { excludeRdev_ = rdev; excludeLabel_ = label; }
+  void setExcluded(dev_t rdev, const std::string& label);
   std::vector<CameraInfo> scan();
 
 private:

@@ -100,7 +100,8 @@ static ProbeResult probeCamera(const std::string& path, const std::string& node,
     // metadata nodes (META_CAPTURE) and devices without streaming.
     if ((caps & V4L2_CAP_META_CAPTURE) || !(caps & V4L2_CAP_STREAMING)) { ::close(fd); return ProbeResult::NotCamera; }
     ::close(fd);
-    info = CameraInfo{ path, (const char*)cap.card, (const char*)cap.bus_info, "" };
+    info = CameraInfo{ path, (const char*)cap.card, (const char*)cap.bus_info, "", true,
+                       (caps & V4L2_CAP_VIDEO_CAPTURE) != 0 };
     return ProbeResult::Camera;
   }
   // Physical camera: must have CAPTURE + STREAMING, no META, and at least one
@@ -117,6 +118,12 @@ static ProbeResult probeCamera(const std::string& path, const std::string& node,
   if (!hasSupported) return ProbeResult::NotCamera;
   info = CameraInfo{ path, (const char*)cap.card, (const char*)cap.bus_info, usbKeyFor(node) };
   return ProbeResult::Camera;
+}
+
+void CameraEnumerator::setExcluded(dev_t rdev, const std::string& label) {
+  std::lock_guard<std::mutex> credLk(g_credMutex);
+  excludeRdev_ = rdev;
+  excludeLabel_ = label;
 }
 
 std::vector<CameraInfo> CameraEnumerator::scan() {
