@@ -127,6 +127,7 @@ Root is used only for the loopback device (created at boot by a systemd unit), t
 - No bar icon: `omarchy plugin enable alanfortlink.camera-effects`, or `omarchy-restart-shell`.
 - Panel says "Needs setup" or v4l2loopback won't load: reboot after a kernel update, or check `dkms status`.
 - Apps don't list the camera: check `systemctl status camera-effects-device` and `v4l2loopback-ctl list`, then re-run `./install.sh`.
+- Intel IPU6/IPU7 webcams: supported when bridged through `v4l2-relayd` to a v4l2loopback device (the default Omarchy setup on Dell XPS and similar laptops). The camera appears as "Hardware ISP Camera" in the panel's camera dropdown. Not supported: cameras that only work through libcamera without a relayd bridge, and Presenter Overlay.
 - Bluetooth headset mic: the daemon asks WirePlumber for the headset (HSP/HFP) profile while it reads one, so your headphones drop to call quality for as long as the microphone is open — including while you are only listening or watching the level meter. It goes back to A2DP a couple of seconds after the mic is released.
 - Microphone Effects missing from an app: check `pactl list short sources | grep camera-effects-mic`, and remember that apps started before the daemon may need reopening.
 - No microphone in apps that start before the panel does: hiding the real microphones is a WirePlumber setting, so it applies from login, while "Microphone Effects" only exists once the shell (and with it the daemon) is up. Reopen the app, or leave hiding off if you have apps that autostart.

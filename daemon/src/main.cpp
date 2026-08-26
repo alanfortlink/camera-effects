@@ -455,6 +455,10 @@ private:
   std::string micLastSource_;
   std::string runtimeDir_;
   int misses_ = 0;      // consecutive grab timeouts
+  clk::time_point openFailStart_{};  // when consecutive capture-open failures began (empty = none)
+  clk::time_point nextOpenAttempt_{};  // retry backoff without blocking the main loop
+  std::string openFailSource_;
+  bool openFailLoopback_ = false;
   cv::Size capOpened_;  // size the current capture was asked for (reopen when the wanted size changes)
   cv::Size capActual_;  // what the device actually delivers (shown in the state)
   cv::Mat yuyv_;        // output frame converted once for both writers
@@ -505,7 +509,7 @@ private:
   void clientClosed(int client);
   void rescanCameras();
   CameraInfo pickCamera();
-  bool openCapture(std::string* err);
+  bool openCapture(std::string* err, CameraInfo* attempted);
   bool captureOpen() const;
   void captureClose();
   bool captureGrab(cv::Mat& f, int ms);
@@ -516,7 +520,9 @@ private:
 std::string Daemon::selectedBus() {
   if (!current_.bus.empty()) return current_.bus;
   for (auto& c : cameras_) if (!cfg_.preferredCamera.empty() && (c.bus == cfg_.preferredCamera || c.path == cfg_.preferredCamera)) return c.bus;
-  return cameras_.empty() ? "" : cameras_[0].bus;
+  for (auto& c : cameras_) if (!c.loopback) return c.bus;
+  for (auto& c : cameras_) if (c.captureReady) return c.bus;
+  return "";
 }
 
 Settings& Daemon::effectiveSettings() {
@@ -672,7 +678,13 @@ void Daemon::rescanCameras() {
 CameraInfo Daemon::pickCamera() {
   std::lock_guard<std::mutex> lk(mu_);
   for (auto& c : cameras_) if (!cfg_.preferredCamera.empty() && (c.bus == cfg_.preferredCamera || c.path == cfg_.preferredCamera)) return c;
-  return cameras_.empty() ? CameraInfo{} : cameras_[0];
+  // OUTPUT-only loopbacks may be stalled relay sources worth retaining for an
+  // explicit selection, but must not become the implicit camera (for example,
+  // an idle OBS Virtual Camera). Prefer hardware, then a loopback that is
+  // currently being fed and therefore advertises CAPTURE capabilities.
+  for (auto& c : cameras_) if (!c.loopback) return c;
+  for (auto& c : cameras_) if (c.captureReady) return c;
+  return CameraInfo{};
 }
 
 // Center Stage captures at the (larger) capture size so it has room to zoom;
@@ -687,13 +699,15 @@ cv::Size Daemon::wantedCapture() {
   return outSz;
 }
 
-bool Daemon::openCapture(std::string* err) {
+bool Daemon::openCapture(std::string* err, CameraInfo* attempted) {
+  *attempted = CameraInfo{};
   std::string pref;
   { std::lock_guard<std::mutex> lk(mu_); pref = cfg_.preferredCamera; }
   cv::Size want = wantedCapture();
   // A file source (dev/testing) must be a readable regular file: a FIFO or a
   // directory would wedge or spin the OpenCV/FFmpeg opener.
   if (!pref.empty() && pref[0] == '/' && pref.rfind("/dev/", 0) != 0 && blockSourceValid(pref)) {
+    attempted->path = pref;
     if (!file_.open(pref, cfg_.fps, err)) return false;
     useFile_ = true;
     std::lock_guard<std::mutex> lk(mu_);
@@ -703,6 +717,7 @@ bool Daemon::openCapture(std::string* err) {
     useFile_ = false;
     CameraInfo c = pickCamera();
     if (c.path.empty()) { *err = "no camera found"; return false; }
+    *attempted = c;
     if (!cap_.open(c.path, want.width, want.height, cfg_.fps, err)) return false;
     std::lock_guard<std::mutex> lk(mu_);
     current_ = c; capOpened_ = want; capActual_ = cv::Size(cap_.width(), cap_.height());
@@ -1154,6 +1169,10 @@ int Daemon::run() {
   else if (!err.empty()) fprintf(stderr, "models (degraded): %s\n", err.c_str());
   fx_.setSettings(cfg_.settings);
 
+  // Exclude our own output loopback before the IPC thread can request a scan:
+  // by label now, then by device identity once it is opened below.
+  enumerator_.setExcluded(0, cfg_.label);
+
   if (!server_.start(sockPath, [this](int c, const std::string& r) { return handle(c, r); }, [this](int c) { clientClosed(c); }, &err)) { fprintf(stderr, "control socket: %s\n", err.c_str()); return 1; }
 
   // Microphone effects: an Audio/Source node apps can pick, fed by the chosen
@@ -1195,6 +1214,10 @@ int Daemon::run() {
         setState(loopPath_, p);
         setError("");
         fprintf(stderr, "camera-effects-server: virtual camera %s (%dx%d)\n", p.c_str(), cfg_.outW, cfg_.outH);
+        // Record the output device identity so the enumerator can exclude it
+        // precisely (st_rdev) instead of by label alone.
+        struct stat lst{};
+        if (stat(p.c_str(), &lst) == 0) enumerator_.setExcluded(lst.st_rdev, cfg_.label);
         watcher_.start(p, [this](int n) { consumers_ = n; stateDirty_ = true; });
       } else setError(err);
     }
@@ -1233,21 +1256,47 @@ int Daemon::run() {
     { std::lock_guard<std::mutex> lk(mu_); preview = previewOn_; snap = snapPending_; block = cfg_.block; blockSrc = cfg_.blockSource; blockFraming = cfg_.blockFraming; }
     bool want = (loop_.isOpen() && consumers_ > 0) || pwActive_ || preview || snap;  // a pending snapshot runs the pipeline like a preview client
     if (!preview) removePreview();
+    if (!want) {
+      openFailStart_ = nextOpenAttempt_ = {};
+      openFailSource_.clear();
+      openFailLoopback_ = false;
+    }
     // Blocked: the physical camera stays closed (light off) whatever the
     // consumers do; they get the placeholder from block_ instead, on the same
     // on-demand terms.
     bool stopped = false;
     if (block && captureOpen()) { captureClose(); resetTier(false); fprintf(stderr, "camera-effects-server: blocked: camera released\n"); }
     if (block_.active() && (!block || !want)) { block_.close(); setError(""); stopped = !want; }
-    if (want && !block && !captureOpen()) {
-      if (openCapture(&err)) {
+    if (want && !block && !captureOpen() && now >= nextOpenAttempt_) {
+      CameraInfo attempted;
+      if (openCapture(&err, &attempted)) {
         setError("");
         misses_ = 0;
+        openFailStart_ = {};
+        nextOpenAttempt_ = {};
+        openFailSource_.clear();
+        openFailLoopback_ = false;
         fprintf(stderr, "camera-effects-server: capturing %s %dx%d %s\n", current_.path.c_str(), useFile_ ? file_.width() : cap_.width(), useFile_ ? file_.height() : cap_.height(), useFile_ ? "file" : cap_.format().c_str());
       } else {
         if (error_ != err) fprintf(stderr, "camera-effects-server: capture: %s\n", err.c_str());
-        setError(err);
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (openFailStart_ == clk::time_point{} || openFailSource_ != attempted.path) {
+          openFailStart_ = now;
+          openFailSource_ = attempted.path;
+          openFailLoopback_ = attempted.loopback;
+        }
+        auto failElapsed = std::chrono::duration_cast<std::chrono::seconds>(now - openFailStart_).count();
+        // A loopback that remains OUTPUT-only usually means its relay writer
+        // has stalled. Give that source actionable guidance after the grace
+        // period, but preserve the real open error for physical cameras and
+        // file sources. Retry timestamps keep IPC, publishing and shutdown
+        // responsive during both the short and long backoffs.
+        if (openFailLoopback_ && failElapsed >= 15) {
+          setError("camera source not producing frames — try: systemctl restart v4l2-relayd@ipu7");
+          nextOpenAttempt_ = now + std::chrono::seconds(5);
+        } else {
+          setError(err);
+          nextOpenAttempt_ = now + std::chrono::milliseconds(500);
+        }
       }
     }
     if (want && block) {
@@ -1257,10 +1306,24 @@ int Daemon::run() {
       setError(block_.error());
       setState(panRange_, block_.panRange());
     }
-    if (!want && captureOpen()) { captureClose(); resetTier(false); stopped = true; darkFrames_ = 0; setState(covered_, false); }
+    if (!want && captureOpen()) {
+      // Release the capture so the physical camera (a USB webcam, or the
+      // IPU6/IPU7 sensor behind a v4l2-relayd loopback) is freed and its
+      // light goes off. v4l2-relayd keeps its writer streaming for a good
+      // while with no reader, so the next reopen succeeds at once; if it
+      // does eventually pause the device drops to OUTPUT-only caps and the
+      // reopen retries until the writer warms up again (the panel shows its
+      // "starting" spinner meanwhile). Holding the capture open to prevent
+      // that left the camera light on forever — privacy takes priority.
+      captureClose(); resetTier(false); stopped = true; darkFrames_ = 0; setState(covered_, false);
+    }
     // "Starting" drives the panel's busy indicator: something wants frames but
-    // the camera is still opening (a USB reopen costs a second or two).
-    setState(starting_, want && !block && !captureOpen());
+    // the camera is still opening (a USB reopen costs a second or two).  Clear
+    // it once open failures have persisted past the grace period so the panel
+    // shows the error instead of an infinite spinner.
+    bool openGivenUp = openFailLoopback_ && openFailStart_ != clk::time_point{} &&
+                       std::chrono::duration_cast<std::chrono::seconds>(now - openFailStart_).count() >= 15;
+    setState(starting_, want && !block && !captureOpen() && !openGivenUp);
     if (stopped) {
       // Leave black behind so the next opener doesn't see a stale frame.
       cv::Mat black(cfg_.outH, cfg_.outW, CV_8UC3, cv::Scalar(0, 0, 0));
@@ -1268,7 +1331,9 @@ int Daemon::run() {
       pwOut_.clear();
       fprintf(stderr, "camera-effects-server: idle\n");
     }
-    setState(running_, captureOpen() || block_.active());
+    // running_ is true only when frames are actively wanted (an app is using
+    // the virtual camera, the preview is on, etc.) and the capture is open.
+    setState(running_, (captureOpen() && want) || block_.active());
     if (running_ != wasRunning) { wasRunning = running_; frames = 0; fpsT0 = now; setState(fps_, 0.0); }
     auto countFrame = [&]() {
       frames++;
