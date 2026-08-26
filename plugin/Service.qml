@@ -43,6 +43,85 @@ Item {
   readonly property string gesture: state.gesture || ""
   readonly property var reactionNames: state.reactions || ["hearts", "thumbsup", "thumbsdown", "balloons", "confetti", "fireworks", "rain", "lasers"]
   readonly property bool deviceMissing: error.indexOf("virtual camera device missing") !== -1
+  // ---- microphone effects (the daemon's "mic" object) ----
+  readonly property var mic: state.mic || ({})
+  readonly property var micSettings: mic.settings || ({})       // effective settings for the current microphone
+  readonly property var micSources: mic.sources || []           // real microphones PipeWire knows about
+  readonly property var micSource: mic.source || ({})           // the one being read now
+  readonly property string micWanted: mic.wanted || ""          // the chosen one ("" = system default)
+  readonly property string micLabel: mic.label || "Microphone Effects"
+  readonly property string micStatus: mic.status || ""
+  readonly property int micConsumers: mic.consumers || 0
+  readonly property bool micCapturing: !!mic.capturing          // the real microphone is open
+  readonly property bool micMuted: !!mic.muted
+  readonly property bool micListen: !!mic.listen                // the remembered switch position
+  readonly property bool micListening: !!mic.listening          // the playback stream is really running
+  readonly property bool micHideAll: !!mic.hideAll              // every real microphone hidden from apps
+  readonly property bool micSameForAll: mic.sameForAll !== false
+  readonly property real micIn: mic.inLevel || 0                // 0..1 peak before the effects
+  readonly property real micOut: mic.outLevel || 0              // and after them
+  readonly property var micToneOptions: mic.tones || []
+  readonly property var micVoiceOptions: mic.voices || []
+  readonly property var micSpaceOptions: mic.spaces || []
+
+  function setMic(patch) { return send({ cmd: "set", mic: patch }) }
+  function setMicSetting(key, value) { var p = {}; p[key] = value; return setMic({ settings: p }) }
+  function selectMic(nodeName) { return setMic({ source: nodeName }) }
+  function setMicMuted(v) { return setMic({ muted: !!v }) }
+  // Hear yourself: the daemon plays the processed microphone to the default
+  // sink while the panel's Mic tab is open (micpreview), and remembers the
+  // switch across restarts — so this only has to set it.
+  function setMicListen(v) { return setMic({ listen: !!v }) }
+  function setMicSameForAll(v) { return setMic({ sameForAll: !!v }) }
+  function micReset() { return send({ cmd: "micreset" }) }
+  // Like the camera preview: while a panel shows the level meter the daemon
+  // holds the real microphone open even with no app using the virtual one.
+  // The bar is per screen, so several panels share this service — count them,
+  // or closing one would release the microphone under the other.
+  property bool micPreviewWanted: false
+  property var micPreviewHolders: ({})
+  function setMicPreview(on, who) {
+    var key = who === undefined ? "panel" : String(who)
+    var h = micPreviewHolders
+    if (on) h[key] = true; else delete h[key]
+    micPreviewHolders = h
+    var want = false
+    for (var k in h) { want = true; break }
+    if (want === micPreviewWanted) return true
+    micPreviewWanted = want
+    return send({ cmd: "micpreview", on: micPreviewWanted })
+  }
+
+  // Hiding the real microphones is a WirePlumber script + config fragment in
+  // the user's own config (no root, unlike the camera's udev rules), applied
+  // by restarting the user's WirePlumber.
+  //   runMicHide("all", true|false)        hide/unhide every microphone
+  //   runMicHide("mic", nodeName, on)      hide/unhide one
+  readonly property string micHideScript: libDir + "/camera-effects-mic-hide"
+  function runMicHide(what, a, b) {
+    if (micHideProc.running) return
+    if (!installed) { setupOutput = "camera-effects is still installing; try again in a moment."; return }
+    var args
+    if (what === "all") args = ["all", a ? "on" : "off"]
+    else if (what === "mic") args = ["mic", String(a), b ? "on" : "off"]
+    else return
+    setupOutput = ""
+    busyText = "Applying…"
+    micHideProc.command = [micHideScript].concat(args)
+    micHideProc.running = true
+  }
+  Process {
+    id: micHideProc
+    property string errText: ""
+    stderr: StdioCollector { onStreamFinished: micHideProc.errText = String(text).trim() }
+    onExited: function(code) {
+      root.busyText = ""
+      root.setupOutput = code === 0 ? "" : (errText !== "" ? errText : "could not change the microphone rules (" + code + ")")
+      errText = ""
+      Qt.callLater(root.refresh)
+    }
+  }
+
   // Last snapshot the daemon saved: { path, time[, error] } (null until one is taken).
   readonly property var lastSnapshot: state.lastSnapshot || null
   signal snapshotTaken(string path)   // a new one was saved (the panel flashes its preview)
@@ -114,7 +193,7 @@ Item {
                          "camera-effects-setup-run", privilegedSetupScript, setupScript].concat(args)
     setupProc.running = true
   }
-  property bool setupBusy: setupProc.running || installProc.running
+  property bool setupBusy: setupProc.running || installProc.running || micHideProc.running
   // setupOutput carries only what the user must act on (a failure, a cancelled
   // prompt). Progress lives in busyText and disappears on its own: a finished
   // build or setup must not leave a wall of shell output in the panel.
@@ -327,6 +406,7 @@ Item {
       onConnectionStateChanged: {
         root.sockConnectedChanged()
         if (connected && root.previewWanted) root.setPreview(true)
+        if (connected && root.micPreviewWanted) root.setMicPreview(true)
         if (!connected) {
           root.state = ({})
           root.snapSeen = -1

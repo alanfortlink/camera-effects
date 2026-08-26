@@ -20,7 +20,25 @@ privileged() {  # run the setup script as root: silently if sudo allows it, else
 }
 
 if [[ $MODE == --uninstall ]]; then
-  # The root half first (it un-hides the webcams and removes the device); if it did not
+  # Un-hide the microphones first and whatever else happens: it needs no
+  # password, and if it were left until after the root half (which can be
+  # cancelled at the polkit prompt) a cancelled uninstall could leave the
+  # session with no microphone at all — the real ones hidden and the virtual
+  # one about to be deleted. It is a no-op when nothing was hidden.
+  # "none", not "all off": the latter keeps any per-microphone rules, and once
+  # this script has finished there is no tool left to undo them.
+  [[ -x $LIB/camera-effects-mic-hide ]] && "$LIB/camera-effects-mic-hide" none >/dev/null 2>&1 || true
+  # And take the fragment out directly, whatever happened above: it names the
+  # Lua as a *required* component, so deleting the script while the fragment
+  # survives would stop WirePlumber from starting at the next login — no audio
+  # devices at all. Fragment first, script second, never the other way round.
+  WP_CONF=${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber/wireplumber.conf.d/71-camera-effects-hide-mics.conf
+  if [[ -f $WP_CONF ]]; then
+    rm -f "$WP_CONF"
+    systemctl --user restart wireplumber.service >/dev/null 2>&1 || true
+  fi
+  rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/wireplumber/scripts/camera-effects-hide-mics.lua"
+  # Then the root half (it un-hides the webcams and removes the device); if it did not
   # run, the user half stays too, so the user can retry rather than lose the tools.
   if ! privileged uninstall; then
     echo "error: the root part was NOT removed (cancelled or failed); your webcams may still be hidden." >&2
@@ -71,11 +89,26 @@ if ! make -C "$HERE/daemon" BUILD="$BUILD" -j"$(nproc)" >"$LOG" 2>&1; then
 fi
 
 echo "› installing to $LIB, $DATA"
-install -d "$LIB" "$DATA/models" "$DATA/assets" "$BIN"
+install -d "$LIB" "$DATA/models" "$DATA/assets" "$DATA/wireplumber" "$BIN"
 install -m 755 "$BUILD/camera-effects-server" "$LIB/camera-effects-server"
 install -m 755 "$SETUP" "$LIB/camera-effects-setup"
+install -m 755 "$HERE/scripts/camera-effects-mic-hide" "$LIB/camera-effects-mic-hide"
 install -m 644 "$HERE"/models/*.onnx "$DATA/models/"
 install -m 644 "$HERE"/assets/*.png "$DATA/assets/"
+# Loaded by WirePlumber only while the panel's "hide raw microphones" switch is on.
+install -m 644 "$HERE"/wireplumber/*.lua "$DATA/wireplumber/"
+# WirePlumber loads its own copy under the data dir, put there when the switch
+# was turned on. Refresh it too, or an update leaves the old script running —
+# and WirePlumber refuses to start if that script ever stops working.
+WP_SCRIPTS=${XDG_DATA_HOME:-$HOME/.local/share}/wireplumber/scripts
+if [[ -f $WP_SCRIPTS/camera-effects-hide-mics.lua ]]; then
+  # A syntax error here would stop WirePlumber from starting at the next login.
+  if command -v luac >/dev/null && ! luac -p "$HERE/wireplumber/camera-effects-hide-mics.lua" >/dev/null 2>&1; then
+    echo "error: wireplumber/camera-effects-hide-mics.lua does not parse; keeping the installed copy" >&2
+  else
+    install -m 644 "$HERE"/wireplumber/camera-effects-hide-mics.lua "$WP_SCRIPTS/camera-effects-hide-mics.lua"
+  fi
+fi
 ln -sfn "$LIB/camera-effects-server" "$BIN/camera-effects-server"
 # Remember which checkout commit this build came from (the shell plugin rebuilds
 # automatically after `omarchy plugin update` when this no longer matches).
