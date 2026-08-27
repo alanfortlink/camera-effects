@@ -126,7 +126,7 @@ void CameraEnumerator::setExcluded(dev_t rdev, const std::string& label) {
   excludeLabel_ = label;
 }
 
-std::vector<CameraInfo> CameraEnumerator::scan() {
+std::vector<CameraInfo> CameraEnumerator::scan(bool refreshVirtual) {
   std::vector<CameraInfo> out;
   DIR* d = opendir("/sys/class/video4linux");
   if (!d) return out;
@@ -163,14 +163,17 @@ std::vector<CameraInfo> CameraEnumerator::scan() {
     std::string name = readSysAttr(sys + "/name");
     if (!excludeLabel_.empty() && name == excludeLabel_) continue;
     // Identity of what sits behind /dev/videoN: reprobe only when it changes.
-    // Virtual (loopback) nodes are always reprobed: their capture caps toggle
-    // when a writer starts or stops, and the cache identity can't reflect that
-    // without opening the node. Physical nodes are cached to avoid waking them
-    // from autosuspend on idle rescans.
+    // A loopback's capture caps toggle when its writer starts or stops, which
+    // the identity cannot reflect without opening the node, so those are
+    // reprobed whenever the caller asks (it is looking for a source, or the
+    // panel just opened). Otherwise the cache stands: an idle daemon has no
+    // reason to keep opening a camera (autosuspend) or someone else's loopback
+    // (a reader appearing every few seconds can hold their pipeline awake).
     std::string ident = name + "|" + real + "|" + std::to_string(st.st_rdev);
     Probe pr;
     auto it = cache_.find(path);
-    if (!isVirtual && it != cache_.end() && it->second.ident == ident) pr = it->second;
+    bool cached = it != cache_.end() && it->second.ident == ident;
+    if (cached && !(isVirtual && refreshVirtual)) pr = it->second;
     else {
       pr.ident = ident;
       ProbeResult r = probeCamera(path, node, pr.info);

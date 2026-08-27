@@ -507,7 +507,7 @@ private:
   static bool cameraHidden(const CameraInfo& c) { return !c.key.empty() && fileExists("/etc/udev/rules.d/71-camera-effects-hide-" + c.key + ".rules"); }
   std::string handle(int client, const std::string& req);
   void clientClosed(int client);
-  void rescanCameras();
+  void rescanCameras(bool refreshVirtual = true);
   CameraInfo pickCamera();
   bool openCapture(std::string* err, CameraInfo* attempted);
   bool captureOpen() const;
@@ -667,8 +667,8 @@ void Daemon::publishState() {
   server_.broadcast(j.dump());
 }
 
-void Daemon::rescanCameras() {
-  std::vector<CameraInfo> cams = enumerator_.scan();
+void Daemon::rescanCameras(bool refreshVirtual) {
+  std::vector<CameraInfo> cams = enumerator_.scan(refreshVirtual);
   std::lock_guard<std::mutex> lk(mu_);
   if (cams.size() != cameras_.size()) stateDirty_ = true;
   else for (size_t i = 0; i < cams.size(); i++) if (cams[i].path != cameras_[i].path) { stateDirty_ = true; break; }
@@ -1199,6 +1199,7 @@ int Daemon::run() {
   auto lastPwCheck = clk::now();
   auto lastMicCheck = lastPwCheck;
   bool wasRunning = false;
+  bool wasLooking = false;   // edge-detect the moment we start hunting for a source (see the scan below)
   int frames = 0;
   auto fpsT0 = clk::now();
   cv::Mat frame;  // processing-side frame buffer (rotates with the capture slot)
@@ -1221,7 +1222,6 @@ int Daemon::run() {
         watcher_.start(p, [this](int n) { consumers_ = n; stateDirty_ = true; });
       } else setError(err);
     }
-    if (now - lastScan > std::chrono::seconds(running_ ? 10 : 4)) { lastScan = now; rescanCameras(); }
     // PipeWire restarted / stream error: reconnect with backoff, show it meanwhile.
     if (now - lastPwCheck > std::chrono::seconds(1)) { lastPwCheck = now; setState(pwStatus_, pwOut_.maintain(nowSec())); }
     setState(hideRawActive_, fileExists("/etc/udev/rules.d/71-camera-effects-hide-raw.rules"));
@@ -1255,6 +1255,19 @@ int Daemon::run() {
     Framing blockFraming;
     { std::lock_guard<std::mutex> lk(mu_); preview = previewOn_; snap = snapPending_; block = cfg_.block; blockSrc = cfg_.blockSource; blockFraming = cfg_.blockFraming; }
     bool want = (loop_.isOpen() && consumers_ > 0) || pwActive_ || preview || snap;  // a pending snapshot runs the pipeline like a preview client
+    // Loopbacks are reprobed only while we are actually looking for a source:
+    // there is no reason for an idle daemon to keep opening virtual cameras
+    // that belong to OBS or to another relayd bridge. The moment we start
+    // looking, though, their capabilities have to be fresh -- a relayd loopback
+    // that was not streaming at the last probe is cached OUTPUT-only, and
+    // waiting out the periodic tick would report "no camera found" for several
+    // seconds after an app connects -- so the transition scans immediately.
+    bool looking = want && !block && !captureOpen();
+    if ((looking && !wasLooking) || now - lastScan > std::chrono::seconds(running_ ? 10 : 4)) {
+      lastScan = now;
+      rescanCameras(looking);
+    }
+    wasLooking = looking;
     if (!preview) removePreview();
     if (!want) {
       openFailStart_ = nextOpenAttempt_ = {};

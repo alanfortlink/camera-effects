@@ -31,11 +31,13 @@ struct CameraInfo {
 // formats the decoder can't handle are skipped. The plugin's own output is
 // excluded by device identity and label to prevent a feedback loop.
 //
-// Physical nodes are opened (VIDIOC_QUERYCAP) only the first time they are
-// seen, so idle rescans do not wake cameras from autosuspend. Virtual
-// (loopback) nodes are always reprobed: their capture caps appear and
-// disappear when a writer starts or stops, which the cache identity cannot
-// reflect without opening the node, and they have no autosuspend to worry about.
+// Nodes are opened (VIDIOC_QUERYCAP) only the first time they are seen, so
+// idle rescans do not wake cameras from autosuspend and do not keep opening
+// loopbacks that belong to other software (OBS, another v4l2-relayd bridge).
+// A loopback's capture caps do toggle when its writer starts or stops, which
+// the cache identity cannot see without opening the node, so `refreshVirtual`
+// reprobes them: the daemon sets it while it is looking for a source, and the
+// panel forces it with an explicit rescan when it opens.
 class CameraEnumerator {
 public:
   // Exclude the plugin's own output device: by device identity (st_rdev) once
@@ -43,11 +45,11 @@ public:
   // alone is not a reliable boundary (labels can collide and are limited to 32
   // bytes), so both are checked.
   void setExcluded(dev_t rdev, const std::string& label);
-  std::vector<CameraInfo> scan();
+  std::vector<CameraInfo> scan(bool refreshVirtual);
 
 private:
   struct Probe { std::string ident; bool isCamera = false; CameraInfo info; };
-  std::map<std::string, Probe> cache_;  // /dev/videoN -> result of the last probe (physical nodes only)
+  std::map<std::string, Probe> cache_;  // /dev/videoN -> result of the last probe
   dev_t excludeRdev_ = 0;    // st_rdev of the plugin's output loopback (0 = none known yet)
   std::string excludeLabel_;  // card label of the plugin's output loopback
 };
