@@ -273,7 +273,11 @@ Item {
     stdout: StdioCollector { onStreamFinished: installProc.tailText = String(text).trim() }
     onExited: function(code) {
       root.busyText = ""
-      if (code === 0) { root.setupOutput = ""; restartTimer.restart(); rootCheckProc.running = true }
+      // No restart here: while cameras are hidden the daemon runs the privileged
+      // copy, which this build has not refreshed yet. Restarting now would launch
+      // the stale one again and report the same failure. rootCheckProc restarts
+      // once the root half is current (or was not needed).
+      if (code === 0) { root.setupOutput = ""; rootCheckProc.running = true }
       else root.setupOutput = "Build failed (" + code + "). Log: " + root.installLog + "\n" + tailText
       tailText = ""
       probeProc.running = true   // re-check the binary rather than trusting the exit code
@@ -290,7 +294,12 @@ Item {
       'if ls /etc/udev/rules.d/71-camera-effects-hide-*.rules >/dev/null 2>&1; then [ -r "$root/camera-effects-server" ] || exit 1; cmp -s "$lib/camera-effects-server" "$root/camera-effects-server" || exit 1; fi; ' +
       'exit 0',
       "camera-effects-rootcheck", root.libDir]
-    onExited: function(code) { if (code !== 0 || root.deviceMissing) root.runSetup("install") }
+    onExited: function(code) {
+      if (code !== 0 || root.deviceMissing) { root.runSetup("install"); return }   // setupProc restarts the daemon
+      root.busyText = ""
+      restartTimer.interval = 1000
+      restartTimer.restart()
+    }
   }
   // Auto-update: after `omarchy plugin update` the shell reloads this plugin, so
   // on start we compare the checkout with what install.sh last installed and
@@ -307,17 +316,43 @@ Item {
   // Is the daemon binary there? Answers the "exit 127" question: not installed
   // yet (wait for install()) or installed but not startable (back off, tell the user).
   property bool probeAfterExit: false
+  // A system update that moves a library the daemon links against (onnxruntime
+  // renames its symbol version every release, opencv bumps its soname) leaves an
+  // installed binary that no longer loads. Rebuilding is the fix and needs no
+  // password, so do it ourselves — but only once per session, or a build that
+  // does not fix it would loop.
+  property bool rebuiltForLoadError: false
   Process {
     id: probeProc
-    command: ["sh", "-c", 'test -x "$1"', "probe", root.daemonBinary]
+    // 1 = no build installed, 2 = the privileged copy the launcher prefers is not
+    // the one we built (only refreshing it as root helps), 0 = ours is what runs.
+    command: ["sh", "-c",
+      'test -x "$1" || exit 1; ' +
+      'ls /etc/udev/rules.d/71-camera-effects-hide-*.rules >/dev/null 2>&1 || exit 0; ' +
+      '[ -r "$2" ] || exit 0; cmp -s "$1" "$2" || exit 2; exit 0',
+      "probe", root.daemonBinary, root.privilegedBinary]
     onExited: function(code) {
-      root.installed = code === 0
+      root.installed = code !== 1
       var afterExit = root.probeAfterExit
       root.probeAfterExit = false
       if (!root.installed || daemon.running) return
       if (afterExit) {
+        // A system update moves a library out from under the installed binary
+        // (onnxruntime renames its symbol version every release, opencv bumps
+        // its soname) and it stops loading. Fix it without making the user work
+        // out which half is stale — but only once per session, so a repair that
+        // does not help falls through to the message instead of looping.
+        if (!root.rebuiltForLoadError) {
+          root.rebuiltForLoadError = true
+          if (code === 2) { root.runSetup("install"); return }
+          root.busyText = "Rebuilding after a system update…"
+          root.install()
+          return
+        }
         root.restarts += 1
-        root.daemonError = "daemon cannot start (exit 127: a library changed after an update, or a stale privileged copy) — rebuild it"
+        root.daemonError = code === 2
+          ? "daemon cannot start: the privileged copy is out of date — approve the password prompt, or run: sudo " + root.privilegedSetupScript + " install " + root.daemonBinary + " " + root.setupScript
+          : "daemon cannot start (exit 127: a library changed after an update, or a stale privileged copy) — rebuild it"
         restartTimer.interval = Math.min(10000, 1000 + root.restarts * 1000)
       }
       restartTimer.restart()
