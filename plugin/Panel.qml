@@ -1573,10 +1573,7 @@ Panel {
                 // when it re-appears and is not focused.
                 Component.onCompleted: text = root.s.backgroundImage || ""
                 onEditingFinished: if (root.svc) root.svc.setSetting("backgroundImage", text)
-                Connections {
-                  target: root.s
-                  function onBackgroundChanged() { if (!parent.activeFocus) parent.text = root.s.backgroundImage || "" }
-                }
+                Connections { target: root; function onSChanged() { if (!parent.activeFocus) parent.text = root.s.backgroundImage || "" } }
               }
               Button {
                 id: chooseBtn
@@ -1625,10 +1622,7 @@ Panel {
                 // when it re-appears and is not focused.
                 Component.onCompleted: text = root.s.backgroundVideo || ""
                 onEditingFinished: if (root.svc) root.svc.setSetting("backgroundVideo", text)
-                Connections {
-                  target: root.s
-                  function onBackgroundChanged() { if (!parent.activeFocus) parent.text = root.s.backgroundVideo || "" }
-                }
+                Connections { target: root; function onSChanged() { if (!parent.activeFocus) parent.text = root.s.backgroundVideo || "" } }
               }
               Button {
                 id: chooseVideoBtn
