@@ -1568,8 +1568,12 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 placeholderText: "/path/to/image.png"
-                text: root.s.backgroundImage || ""
+                // Not bound: the daemon pushes state ~150 ms while running, which
+                // would reset the field mid-typing. Pre-fill once and resync only
+                // when it re-appears and is not focused.
+                Component.onCompleted: text = root.s.backgroundImage || ""
                 onEditingFinished: if (root.svc) root.svc.setSetting("backgroundImage", text)
+                Connections { target: root; function onSChanged() { if (!parent.activeFocus) parent.text = root.s.backgroundImage || "" } }
               }
               Button {
                 id: chooseBtn
@@ -1613,8 +1617,12 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 placeholderText: "/path/to/video.mp4"
-                text: root.s.backgroundVideo || ""
+                // Not bound: the daemon pushes state ~150 ms while running, which
+                // would reset the field mid-typing. Pre-fill once and resync only
+                // when it re-appears and is not focused.
+                Component.onCompleted: text = root.s.backgroundVideo || ""
                 onEditingFinished: if (root.svc) root.svc.setSetting("backgroundVideo", text)
+                Connections { target: root; function onSChanged() { if (!parent.activeFocus) parent.text = root.s.backgroundVideo || "" } }
               }
               Button {
                 id: chooseVideoBtn
@@ -2072,8 +2080,15 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 placeholderText: root.blockKind === "image" ? "/path/to/image.png" : "/path/to/video.mp4"
-                text: root.blockSourceNow
+                // Not bound: the daemon pushes state ~150 ms while running, which
+                // would reset the field mid-typing. Pre-fill once and resync only
+                // when block state changes and the field is not focused.
+                Component.onCompleted: text = root.blockSourceNow
                 onEditingFinished: if (root.svc && text !== "") root.svc.setSetting("blockSource", text)
+                Connections {
+                  target: root
+                  function onBlockSourceNowChanged() { if (!parent.activeFocus) parent.text = root.blockSourceNow }
+                }
               }
               Button {
                 id: blockChoose
