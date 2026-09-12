@@ -120,11 +120,16 @@ The same daemon publishes the microphone: a PipeWire `Audio/Source` node apps pi
 
 The panel talks to the daemon over a unix socket in `$XDG_RUNTIME_DIR/camera-effects/`, and settings live in `~/.config/camera-effects/config.json`.
 
+### Replacement bars
+
+On Omarchy 4.0.3+, widgets rendered by a third-party replacement bar receive a service-less entry facade: their live service objects are available only when the trusted built-in bar hosts them, otherwise the replacement bar could request and retain any configured widget's service. Because the daemon is multi-client, the widget simply opens its own control connection to the same socket when no service is reachable — preview, settings and commands work identically either way.
+
 Root is used only for the loopback device (created at boot by a systemd unit), the hide-raw udev rules and, when hiding is on, a root-owned copy of the daemon in `/usr/local/lib/camera-effects/`.
 
 ## Troubleshooting
 
 - No bar icon: `omarchy plugin enable alanfortlink.camera-effects`, or `omarchy-restart-shell`.
+- Under a replacement bar the panel reconnects to the daemon on its own (one connection per open panel); if it ever shows "needs setup" anyway, check the daemon socket with `ls $XDG_RUNTIME_DIR/camera-effects/ctl.sock`.
 - Panel says "Needs setup" or v4l2loopback won't load: reboot after a kernel update, or check `dkms status`.
 - Apps don't list the camera: check `systemctl status camera-effects-device` and `v4l2loopback-ctl list`, then re-run `./install.sh`.
 - Intel IPU6/IPU7 webcams: supported when bridged through `v4l2-relayd` to a v4l2loopback device (the default Omarchy setup on Dell XPS and similar laptops). The camera appears as "Hardware ISP Camera" in the panel's camera dropdown. Not supported: cameras that only work through libcamera without a relayd bridge, and Presenter Overlay.

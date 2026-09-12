@@ -2,176 +2,138 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Headless service: owns the camera-effects-server daemon (starts it, restarts it if it dies)
-// and keeps a control connection to it. Everything the panel shows comes from
-// the daemon's state pushes; everything the panel changes goes through set().
+// Headless service: owns the camera-effects-server daemon (starts it, restarts
+// it if it dies) and connects to it through an embedded Client. Everything the
+// panel shows comes from the daemon's state pushes; everything the panel
+// changes goes through set().
+//
+// Panels under the built-in bar reach this service via shell.serviceFor and
+// read the aliased surface below — exactly the surface a panel under a
+// replacement bar gets from its own Client instance. One shared connection
+// here (the caller of setMicPreview with its own key), so closing one panel
+// does not release the microphone under the other.
 Item {
   id: root
 
   property var shell: null
   property var manifest: null
 
-  // ---- daemon state (mirrors the JSON pushed by camera-effects-server) ----
-  property var state: ({})
-  readonly property bool connected: sockConnected
-  readonly property bool covered: !!state.covered      // frames arrive but they are black (lens cover?)
-  readonly property bool starting: !!state.starting   // camera opening/reopening: the panel shows a busy indicator
-  readonly property bool running: !!state.running          // camera is being read + processed right now
-  readonly property int consumers: state.consumers || 0     // apps holding the virtual camera open
-  readonly property var consumerApps: state.consumerApps || []   // their process names
-  readonly property bool previewOn: !!state.previewOn       // some client (our panel) is watching the preview: pipeline runs, preview.jpg is written
-  readonly property var settings: state.settings || ({})   // effective settings for the current camera
-  readonly property bool sameForAll: state.sameForAll !== false
-  readonly property var cameras: state.cameras || []
-  readonly property var camera: state.camera || ({})
-  readonly property string loopback: state.loopback || ""
-  readonly property string loopbackLabel: state.loopbackLabel || "Camera Effects"
-  readonly property string error: state.error || ""
-  readonly property bool hideRaw: !!state.hideRaw
-  readonly property bool previewMirror: state.previewMirror !== false   // panel-only self-view mirroring
-  readonly property bool block: !!state.block                // camera blocked: placeholder instead of the webcam (global)
-  readonly property string blockSource: state.blockSource || ""  // "" = built-in card, else an image/video path
-  // Framing of the placeholder image/video (the camera's own zoom/pan/fit live in `settings`).
-  readonly property real blockZoom: state.blockZoom !== undefined ? state.blockZoom : 1
-  readonly property real blockPanX: state.blockPanX || 0
-  readonly property real blockPanY: state.blockPanY || 0
-  readonly property string blockFit: state.blockFit || "cover"
-  // Pan room of what is shown now, per axis, as a fraction of the output size
-  // (0 = nothing to pan): the preview's drag maps pixels through it.
-  readonly property var panRange: state.panRange || [0, 0]
-  readonly property int fps: state.fps || 0
-  readonly property string gesture: state.gesture || ""
-  readonly property var reactionNames: state.reactions || ["hearts", "thumbsup", "thumbsdown", "balloons", "confetti", "fireworks", "rain", "lasers"]
-  readonly property bool deviceMissing: error.indexOf("virtual camera device missing") !== -1
+  // The single control connection the built-in bar's panels share: everything
+  // panel-facing in this file is an alias or wrapper over it.
+  Client { id: client }
+
+  // ---- shared paths (single source: the Client's, Service and Client agree) ----
+  readonly property alias runtimeDir: client.runtimeDir
+  readonly property alias socketPath: client.socketPath
+  readonly property alias previewPath: client.previewPath
+  readonly property alias homeDir: client.homeDir
+  readonly property alias libDir: client.libDir
+  readonly property alias setupScript: client.setupScript
+  readonly property alias daemonBinary: client.daemonBinary
+  readonly property alias privilegedBinary: client.privilegedBinary
+  readonly property alias privilegedSetupScript: client.privilegedSetupScript
+  readonly property alias micHideScript: client.micHideScript
+  readonly property alias repoDir: client.repoDir
+  readonly property alias cacheDir: client.cacheDir
+  readonly property alias installLog: client.installLog
+
+  // ---- panel-facing state surface (aliases the embedded Client) ----
+  property alias state: client.state
+  readonly property alias connected: client.connected
+  readonly property alias covered: client.covered      // frames arrive but they are black (lens cover?)
+  readonly property alias starting: client.starting     // camera opening/reopening: the panel shows a busy indicator
+  readonly property alias running: client.running       // camera is being read + processed right now
+  readonly property alias consumers: client.consumers   // apps holding the virtual camera open
+  readonly property alias consumerApps: client.consumerApps
+  readonly property alias previewOn: client.previewOn   // some client (our panel) is watching the preview
+  readonly property alias settings: client.settings     // effective settings for the current camera
+  readonly property alias sameForAll: client.sameForAll
+  readonly property alias cameras: client.cameras
+  readonly property alias camera: client.camera
+  readonly property alias loopback: client.loopback
+  readonly property alias loopbackLabel: client.loopbackLabel
+  readonly property alias error: client.error
+  readonly property alias hideRaw: client.hideRaw
+  readonly property alias previewMirror: client.previewMirror
+  readonly property alias block: client.block            // camera blocked: placeholder instead of the webcam (global)
+  readonly property alias blockSource: client.blockSource
+  readonly property alias blockZoom: client.blockZoom
+  readonly property alias blockPanX: client.blockPanX
+  readonly property alias blockPanY: client.blockPanY
+  readonly property alias blockFit: client.blockFit
+  readonly property alias panRange: client.panRange
+  readonly property alias fps: client.fps
+  readonly property alias gesture: client.gesture
+  readonly property alias reactionNames: client.reactionNames
+  readonly property alias deviceMissing: client.deviceMissing
   // ---- microphone effects (the daemon's "mic" object) ----
-  readonly property var mic: state.mic || ({})
-  readonly property var micSettings: mic.settings || ({})       // effective settings for the current microphone
-  readonly property var micSources: mic.sources || []           // real microphones PipeWire knows about
-  readonly property var micSource: mic.source || ({})           // the one being read now
-  readonly property string micWanted: mic.wanted || ""          // the chosen one ("" = system default)
-  readonly property string micLabel: mic.label || "Microphone Effects"
-  readonly property string micStatus: mic.status || ""
-  readonly property int micConsumers: mic.consumers || 0
-  readonly property bool micCapturing: !!mic.capturing          // the real microphone is open
-  readonly property bool micMuted: !!mic.muted
-  readonly property bool micListen: !!mic.listen                // the remembered switch position
-  readonly property bool micListening: !!mic.listening          // the playback stream is really running
-  readonly property bool micHideAll: !!mic.hideAll              // every real microphone hidden from apps
-  readonly property bool micSameForAll: mic.sameForAll !== false
-  readonly property real micIn: mic.inLevel || 0                // 0..1 peak before the effects
-  readonly property real micOut: mic.outLevel || 0              // and after them
-  readonly property var micToneOptions: mic.tones || []
-  readonly property var micVoiceOptions: mic.voices || []
-  readonly property var micSpaceOptions: mic.spaces || []
+  readonly property alias mic: client.mic
+  readonly property alias micSettings: client.micSettings
+  readonly property alias micSources: client.micSources
+  readonly property alias micSource: client.micSource
+  readonly property alias micWanted: client.micWanted
+  readonly property alias micLabel: client.micLabel
+  readonly property alias micStatus: client.micStatus
+  readonly property alias micConsumers: client.micConsumers
+  readonly property alias micCapturing: client.micCapturing
+  readonly property alias micMuted: client.micMuted
+  readonly property alias micListen: client.micListen
+  readonly property alias micListening: client.micListening
+  readonly property alias micHideAll: client.micHideAll
+  readonly property alias micSameForAll: client.micSameForAll
+  readonly property alias micIn: client.micIn
+  readonly property alias micOut: client.micOut
+  readonly property alias micToneOptions: client.micToneOptions
+  readonly property alias micVoiceOptions: client.micVoiceOptions
+  readonly property alias micSpaceOptions: client.micSpaceOptions
 
-  function setMic(patch) { return send({ cmd: "set", mic: patch }) }
-  function setMicSetting(key, value) { var p = {}; p[key] = value; return setMic({ settings: p }) }
-  function selectMic(nodeName) { return setMic({ source: nodeName }) }
-  function setMicMuted(v) { return setMic({ muted: !!v }) }
-  // Hear yourself: the daemon plays the processed microphone to the default
-  // sink while the panel's Mic tab is open (micpreview), and remembers the
-  // switch across restarts — so this only has to set it.
-  function setMicListen(v) { return setMic({ listen: !!v }) }
-  function setMicSameForAll(v) { return setMic({ sameForAll: !!v }) }
-  function micReset() { return send({ cmd: "micreset" }) }
-  // Like the camera preview: while a panel shows the level meter the daemon
-  // holds the real microphone open even with no app using the virtual one.
-  // The bar is per screen, so several panels share this service — count them,
-  // or closing one would release the microphone under the other.
-  property bool micPreviewWanted: false
-  property var micPreviewHolders: ({})
-  function setMicPreview(on, who) {
-    var key = who === undefined ? "panel" : String(who)
-    var h = micPreviewHolders
-    if (on) h[key] = true; else delete h[key]
-    micPreviewHolders = h
-    var want = false
-    for (var k in h) { want = true; break }
-    if (want === micPreviewWanted) return true
-    micPreviewWanted = want
-    return send({ cmd: "micpreview", on: micPreviewWanted })
-  }
+  // ---- commands (forwards to the shared connection) ----
+  function send(obj) { return client.send(obj) }
+  function set(patch) { return client.set(patch) }
+  function setSetting(key, value) { return client.setSetting(key, value) }
+  function setSameForAll(v) { return client.setSameForAll(v) }
+  function selectCamera(busOrPath) { return client.selectCamera(busOrPath) }
+  function react(name) { return client.react(name) }
+  function rescan() { return client.rescan() }
+  function reset() { return client.reset() }
+  function snapshot() { return client.snapshot() }
+  function refresh() { return client.refresh() }
+  function setPreview(on) { return client.setPreview(on) }
+  function setMic(patch) { return client.setMic(patch) }
+  function setMicSetting(key, value) { return client.setMicSetting(key, value) }
+  function selectMic(nodeName) { return client.selectMic(nodeName) }
+  function setMicMuted(v) { return client.setMicMuted(v) }
+  function setMicListen(v) { return client.setMicListen(v) }
+  function setMicSameForAll(v) { return client.setMicSameForAll(v) }
+  function micReset() { return client.micReset() }
+  // One shared connection: the holder count lives on the embedded Client.
+  function setMicPreview(on, who) { return client.setMicPreview(on, who) }
+  // Hiding microphones is a WirePlumber script in the user's config (no root).
+  function runMicHide(what, a, b) { return client.runMicHide(what, a, b) }
 
-  // Hiding the real microphones is a WirePlumber script + config fragment in
-  // the user's own config (no root, unlike the camera's udev rules), applied
-  // by restarting the user's WirePlumber.
-  //   runMicHide("all", true|false)        hide/unhide every microphone
-  //   runMicHide("mic", nodeName, on)      hide/unhide one
-  readonly property string micHideScript: libDir + "/camera-effects-mic-hide"
-  function runMicHide(what, a, b) {
-    if (micHideProc.running) return
-    if (!installed) { setupOutput = "camera-effects is still installing; try again in a moment."; return }
-    var args
-    if (what === "all") args = ["all", a ? "on" : "off"]
-    else if (what === "mic") args = ["mic", String(a), b ? "on" : "off"]
-    else return
-    setupOutput = ""
-    busyText = "Applying…"
-    micHideProc.command = [micHideScript].concat(args)
-    micHideProc.running = true
+  // A fresh snapshot (asked for by us, the CLI or IPC alike) surfaces here so
+  // the panel flashes its preview; the widget does the copy + notification.
+  signal snapshotTaken(string path)
+  signal snapshotFailed(string error)
+  Connections {
+    target: client
+    function onSnapshotTaken(path) { root.snapshotTaken(path) }
+    function onSnapshotFailed(error) { root.snapshotFailed(error) }
   }
-  Process {
-    id: micHideProc
-    property string errText: ""
-    stderr: StdioCollector { onStreamFinished: micHideProc.errText = String(text).trim() }
-    onExited: function(code) {
-      root.busyText = ""
-      root.setupOutput = code === 0 ? "" : (errText !== "" ? errText : "could not change the microphone rules (" + code + ")")
-      errText = ""
-      Qt.callLater(root.refresh)
-    }
-  }
+  readonly property alias sockConnected: client.sockConnected
 
-  // Last snapshot the daemon saved: { path, time[, error] } (null until one is taken).
-  readonly property var lastSnapshot: state.lastSnapshot || null
-  signal snapshotTaken(string path)   // a new one was saved (the panel flashes its preview)
+  // ---- daemon lifecycle (owned by this service, not by Client) ----
   property string daemonLog: ""
   property int restarts: 0
   // Set when the daemon binary is present but cannot start (exit 127: a library
   // missing after a system update, a stale privileged copy); cleared once it talks to us.
   property string daemonError: ""
-
-  readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/camera-effects"
-  readonly property string socketPath: runtimeDir + "/ctl.sock"
-  readonly property string previewPath: runtimeDir + "/preview.jpg"   // written by the daemon while previewWanted (see Preview.qml)
-  readonly property string homeDir: Quickshell.env("HOME") || ""
-  readonly property string libDir: homeDir + "/.local/lib/camera-effects"
-  readonly property string setupScript: libDir + "/camera-effects-setup"
-  readonly property string daemonBinary: libDir + "/camera-effects-server"
-  readonly property string privilegedBinary: "/usr/local/lib/camera-effects/camera-effects-server"
-  // Root-owned copy of the setup script (installed by `camera-effects-setup install`).
-  // Preferred for pkexec so that what runs as root is not user-writable.
-  readonly property string privilegedSetupScript: "/usr/local/lib/camera-effects/camera-effects-setup"
-  // The plugin checkout (this file lives in <repo>/plugin/).
-  readonly property string repoDir: decodeURIComponent(String(Qt.resolvedUrl("..")).replace(/^file:\/\//, "").replace(/\/$/, ""))
-  readonly property string cacheDir: (Quickshell.env("XDG_CACHE_HOME") || (homeDir + "/.cache")) + "/camera-effects"
-  readonly property string installLog: cacheDir + "/install.log"
   property bool installed: false   // daemon binary present in ~/.local/lib
-
-  // ---- commands ----
-  function send(obj) {
-    if (!sockConnected) return false
-    sock.write(JSON.stringify(obj) + "\n")
-    sock.flush()
-    return true
-  }
-  function set(patch) { return send({ cmd: "set", settings: patch }) }
-  function setSetting(key, value) { var p = {}; p[key] = value; return set(p) }
-  function setSameForAll(v) { return send({ cmd: "set", sameForAll: !!v }) }
-  function selectCamera(busOrPath) { return send({ cmd: "set", camera: busOrPath }) }
-  function react(name) { return send({ cmd: "react", name: name }) }
-  function rescan() { return send({ cmd: "rescan" }) }
-  // Every effect of the current camera back to the built-in defaults (the
-  // global block / placeholder / preview-mirror settings are not touched).
-  function reset() { return send({ cmd: "reset" }) }
-  // The daemon saves its next output frame as a PNG under ~/Pictures/Camera Effects
-  // and reports it in the state (lastSnapshot): see noteSnapshot for what happens then.
-  function snapshot() { return send({ cmd: "snapshot" }) }
-  function refresh() { return send({ cmd: "get" }) }
-  // The preview is per control connection (it ends when the connection does):
-  // remember it so a reconnect asks again.
-  property bool previewWanted: false
-  function setPreview(on) { previewWanted = !!on; return send({ cmd: "preview", on: previewWanted }) }
+  property bool setupBusy: setupProc.running || installProc.running
+  // setupOutput carries only what the user must act on (a failure, a cancelled
+  // prompt). Progress lives in busyText and disappears on its own.
+  property string setupOutput: ""
+  property string busyText: ""
 
   // Privileged operations go through pkexec so the shell's polkit agent asks
   // for the password.
@@ -193,46 +155,6 @@ Item {
                          "camera-effects-setup-run", privilegedSetupScript, setupScript].concat(args)
     setupProc.running = true
   }
-  property bool setupBusy: setupProc.running || installProc.running || micHideProc.running
-  // setupOutput carries only what the user must act on (a failure, a cancelled
-  // prompt). Progress lives in busyText and disappears on its own: a finished
-  // build or setup must not leave a wall of shell output in the panel.
-  property string setupOutput: ""
-  property string busyText: ""
-
-  // ---- snapshots ----
-  // A state whose lastSnapshot.time moved is a fresh one (a snapshot asked for
-  // by us, the CLI or IPC alike): copy the PNG to the clipboard and say so.
-  // The first state after a (re)connect only records the time: it may carry a
-  // snapshot from before we were listening. snapSeen < 0 = not adopted yet.
-  property real snapSeen: -1
-  function noteSnapshot(msg) {
-    var snap = msg.lastSnapshot
-    var t = snap && snap.time ? snap.time : 0
-    var fresh = snapSeen >= 0 && t !== snapSeen && !!snap
-    snapSeen = t
-    if (!fresh) return
-    if (snap.error) { notify("Snapshot failed", String(snap.error)); return }
-    snapshotTaken(String(snap.path))
-    var name = String(snap.path).slice(String(snap.path).lastIndexOf("/") + 1)
-    snapProc.running = false   // a copy still in flight (two snapshots back to back) is superseded
-    snapProc.command = ["sh", "-c",
-      'wl-copy --type image/png < "$1"; ' +
-      'if command -v omarchy-notification-send >/dev/null 2>&1; then exec omarchy-notification-send "Camera Effects" "$2"; fi; ' +
-      'exec notify-send "Camera Effects" "$2"',
-      "camera-effects-snapshot", String(snap.path), "Snapshot copied to clipboard · " + name]
-    snapProc.running = true
-  }
-  function notify(title, body) {
-    if (notifyProc.running) return
-    notifyProc.command = ["sh", "-c",
-      'if command -v omarchy-notification-send >/dev/null 2>&1; then exec omarchy-notification-send "$1" "$2"; fi; exec notify-send "$1" "$2"',
-      "camera-effects-notify", title, body]
-    notifyProc.running = true
-  }
-  Process { id: snapProc }
-  Process { id: notifyProc }
-
   Process {
     id: setupProc
     property string outText: ""
@@ -418,64 +340,9 @@ Item {
   // Reset the backoff once the daemon has been alive for a while.
   Timer { interval: 60000; running: daemon.running; repeat: false; onTriggered: root.restarts = 0 }
 
-  // ---- control connection ----
-  // Quickshell's Socket cannot recover from a refused connection (the inner
-  // QLocalSocket never emits `disconnected`, so `connected = true` is a no-op
-  // afterwards). Recreate the Socket object for every attempt instead.
-  property var sock: null
-  readonly property bool sockConnected: sock ? sock.connected === true : false
-
-  Component {
-    id: sockComp
-    Socket {
-      path: root.socketPath
-      connected: true
-      parser: SplitParser {
-        onRead: function(line) {
-          try {
-            var msg = JSON.parse(line)
-            if (msg && msg.type === "state") { root.state = msg; if (root.daemonError !== "") root.daemonError = ""; root.noteSnapshot(msg) }
-          } catch (e) { /* reply we don't care about */ }
-        }
-      }
-      onConnectionStateChanged: {
-        root.sockConnectedChanged()
-        if (connected && root.previewWanted) root.setPreview(true)
-        if (connected && root.micPreviewWanted) root.setMicPreview(true)
-        if (!connected) {
-          root.state = ({})
-          root.snapSeen = -1
-          if (root.orphanQuit) { root.orphanQuit = false; restartTimer.interval = 1000; restartTimer.restart() }
-          reconnectTimer.restart()
-        }
-      }
-      onError: function(err) { reconnectTimer.restart() }
-    }
-  }
-
-  function connectSocket() {
-    if (sock) { sock.destroy(); sock = null }
-    sock = sockComp.createObject(root)
-    sockConnectedChanged()
-  }
-
-  Timer {
-    id: reconnectTimer
-    interval: 800
-    repeat: false
-    onTriggered: if (!root.sockConnected) root.connectSocket()
-  }
-  Timer {
-    interval: 3000
-    running: !root.sockConnected
-    repeat: true
-    onTriggered: if (!root.sockConnected) root.connectSocket()
-  }
-
   Component.onCompleted: {
     probeProc.running = true
     daemon.running = true
-    connectSocket()
     updateCheckProc.running = true
   }
   Component.onDestruction: {

@@ -41,7 +41,17 @@ Panel {
   // a Center Stage / capture-size change costs a second or two).
   readonly property bool busy: !!svc && svc.starting
 
-  readonly property var svc: bar && bar.shell ? bar.shell.serviceFor("alanfortlink.camera-effects") : null
+  // The service is reachable via shell.serviceFor only while the built-in bar
+  // hosts us (a replacement bar's facade has shell = null). In that case the
+  // binding falls back to our own Client: the keepLoaded service still runs the
+  // daemon, which is multi-client, so the widget just opens its own control
+  // connection — the full state/commands surface is identical either way (see
+  // Client.qml). The client is a plain child so the fallback never has to
+  // create an object inside the binding.
+  Client { id: localClient }
+  readonly property var svc: (bar && bar.shell && bar.shell.serviceFor)
+      ? (bar.shell.serviceFor("alanfortlink.camera-effects") || localClient)
+      : localClient
   readonly property bool inUse: svc ? svc.running : false
   readonly property bool connected: svc ? svc.connected : false
   readonly property var s: svc ? svc.settings : ({})
@@ -129,7 +139,33 @@ Panel {
       if (root.svc && root.svc.gesture !== "" && !!root.s.reactions) gestureFire.restart()
       else gestureFire.stop()
     }
-    function onSnapshotTaken(path) { snapFlash.restart() }   // shutter feedback (also for a CLI/IPC snapshot while open)
+    function onSnapshotTaken(path) { root.onSnapshot(path) }   // shutter feedback (also for a CLI/IPC snapshot while open)
+    function onSnapshotFailed(error) { root.onSnapshotFailed(error) }
+  }
+
+  // A fresh snapshot surfaces from the service (built-in bar) or our Client
+  // (replacement bar); either way the *action* — copy the PNG to the clipboard
+  // and notify — happens here in the widget, so a headless service connection
+  // can never double-handle it.
+  Process { id: snapProc }
+  Process { id: notifyProc }
+  function onSnapshot(path) {
+    snapFlash.restart()
+    var name = String(path).slice(String(path).lastIndexOf("/") + 1)
+    snapProc.running = false   // a copy still in flight (two snapshots back to back) is superseded
+    snapProc.command = ["sh", "-c",
+      'wl-copy --type image/png < "$1"; ' +
+      'if command -v omarchy-notification-send >/dev/null 2>&1; then exec omarchy-notification-send "Camera Effects" "$2"; fi; ' +
+      'exec notify-send "Camera Effects" "$2"',
+      "camera-effects-snapshot", String(path), "Snapshot copied to clipboard · " + name]
+    snapProc.running = true
+  }
+  function onSnapshotFailed(error) {
+    if (notifyProc.running) return
+    notifyProc.command = ["sh", "-c",
+      'if command -v omarchy-notification-send >/dev/null 2>&1; then exec omarchy-notification-send "$1" "$2"; fi; exec notify-send "$1" "$2"',
+      "camera-effects-notify", "Camera Effects", String(error || "Snapshot failed")]
+    notifyProc.running = true
   }
 
   readonly property bool micMuted: !!svc && svc.micMuted
