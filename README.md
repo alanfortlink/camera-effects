@@ -23,7 +23,7 @@ Thanks to [@prettyletto](https://github.com/prettyletto) for sending me this vid
 - **Filters** (mono, sepia, warm, cool, vivid, soft, sharpen, vintage) and **Effects** (sunglasses, top hat, crown, cat, halo and more).
 - **Reactions** such as hearts, confetti, balloons and fireworks, played with a click or by holding a hand gesture at the camera.
 - Manual framing: zoom, drag-to-pan, fit mode, rotate and mirror.
-- **Snapshots** with a 3·2·1 countdown, saved to `~/Pictures/Camera Effects/` and copied to the clipboard.
+- **Snapshots** with a 3·2·1 countdown, saved to `Camera Effects/` in your pictures directory and copied to the clipboard.
 - **Privacy**: block the camera with a card, image or video, or hide the raw webcam so apps only see Camera Effects.
 - Several webcams? Pick the source in the panel and keep shared or per-camera settings.
 - **Microphone effects**: pick the mic, set its volume (±18 dB, effects or not, or **Auto** to set it from what the mic actually hears), then a preset (Clean, Voice, Meeting, Podcast) or the individual effects: Voice Isolation (spectral noise suppression, ~40 ms of delay while it is on), a noise gate, auto level, a de-esser, a rumble filter, a 50/60 Hz hum filter, tone presets (warm, bright, clarity, podcast, telephone), voice changers (deep, chipmunk, robot, alien, megaphone, monster) and space (room, hall, cathedral, echo, underwater), with Before/After level meters.
